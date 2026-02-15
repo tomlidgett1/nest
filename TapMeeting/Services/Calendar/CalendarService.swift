@@ -45,7 +45,8 @@ final class CalendarService {
                 startDate: startDate,
                 endDate: endDate,
                 attendeeCount: event.attendees?.count ?? 0,
-                isAllDay: event.isAllDay
+                isAllDay: event.isAllDay,
+                calendarSource: "Apple Calendar"
             )
         }
         .filter { !$0.isAllDay }
@@ -101,6 +102,8 @@ struct CalendarEvent: Identifiable {
     var meetingURL: URL?
     /// Display names or emails of attendees (excluding the calendar owner).
     var attendeeNames: [String] = []
+    /// Source label for display — e.g. "Apple Calendar" or the Google account email.
+    var calendarSource: String = ""
     
     var timeUntilStart: TimeInterval {
         startDate.timeIntervalSinceNow

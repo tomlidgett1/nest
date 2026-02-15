@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		01277943C204428E3CDFD768 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 49D51D281CFAABB4E311E837 /* Supabase */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		CEC70B1D2F3D900B00AD49F2 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				01277943C204428E3CDFD768 /* Supabase in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +117,7 @@
 			);
 			name = TapMeeting;
 			packageProductDependencies = (
+				49D51D281CFAABB4E311E837 /* Supabase */,
 			);
 			productName = TapMeeting;
 			productReference = CEC70B0B2F3D900900AD49F2 /* TapMeeting.app */;
@@ -134,8 +140,6 @@
 				CEC70B1F2F3D900B00AD49F2 /* TapMeetingTests */,
 			);
 			name = TapMeetingTests;
-			packageProductDependencies = (
-			);
 			productName = TapMeetingTests;
 			productReference = CEC70B1C2F3D900B00AD49F2 /* TapMeetingTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -157,8 +161,6 @@
 				CEC70B292F3D900B00AD49F2 /* TapMeetingUITests */,
 			);
 			name = TapMeetingUITests;
-			packageProductDependencies = (
-			);
 			productName = TapMeetingUITests;
 			productReference = CEC70B262F3D900B00AD49F2 /* TapMeetingUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
@@ -195,6 +197,9 @@
 			);
 			mainGroup = CEC70B022F3D900900AD49F2;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				E80A6A55D2875124E61DDDF2 /* XCRemoteSwiftPackageReference "supabase-swift" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = CEC70B0C2F3D900900AD49F2 /* Products */;
 			projectDirPath = "";
@@ -565,6 +570,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		E80A6A55D2875124E61DDDF2 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/supabase/supabase-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		49D51D281CFAABB4E311E837 /* Supabase */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E80A6A55D2875124E61DDDF2 /* XCRemoteSwiftPackageReference "supabase-swift" */;
+			productName = Supabase;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = CEC70B032F3D900900AD49F2 /* Project object */;
 }

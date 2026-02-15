@@ -40,7 +40,10 @@ enum Constants {
     enum AI {
         static let enhancementModel = "gpt-4.1"
         static let autoTaggingModel = "gpt-4.1-mini"
+        static let semanticChatModel = "gpt-4.1"
+        static let embeddingModel = "text-embedding-3-large"
         static let responsesEndpoint = "https://api.openai.com/v1/responses"
+        static let embeddingsEndpoint = "https://api.openai.com/v1/embeddings"
         static let maxEnhancementTokens = 4096
         static let maxTaggingTokens = 512
         
@@ -54,6 +57,18 @@ enum Constants {
         static let maxStyleAnalysisTokens = 4096
         static let maxSummariseTokens = 1024
         static let maxClassifyTokens = 256
+        static let maxTodoExtractionTokens = 1024
+        static let maxSemanticAnswerTokens = 1400
+    }
+
+    // MARK: - Search
+
+    enum Search {
+        static let maxChunkCharacters = 900
+        static let maxSummaryCharacters = 1500
+        static let maxSearchResults = 20
+        static let minimumCitationCount = 2
+        static let emailBackfillWindowHours = 48
     }
     
     // MARK: - Calendar
@@ -77,34 +92,39 @@ enum Constants {
         "com.cisco.webexmeetingsapp"
     ]
     
-    // MARK: - Google Calendar
-    
-    enum GoogleCalendar {
-        /// OAuth 2.0 Client ID — create one at https://console.cloud.google.com
-        /// Type: "Desktop app" under OAuth 2.0 Client IDs.
-        static let clientID = ""  // User must fill this in
-        static let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
-        static let tokenURL = "https://oauth2.googleapis.com/token"
-        static let calendarAPIBase = "https://www.googleapis.com/calendar/v3"
-        static let scopes = "https://www.googleapis.com/auth/calendar.readonly"
-        /// Redirect URI for desktop OAuth flow (loopback).
-        static let redirectURI = "http://127.0.0.1:8234/callback"
-        static let loopbackPort: UInt16 = 8234
+    // MARK: - Supabase
+
+    enum Supabase {
+        static let url = "https://ynoidbjupfcaaymzbtic.supabase.co"
+        static let anonKey = "sb_publishable_TzLkFY46beB_8tQShPUU5g_d668i6ZR"
+        static let redirectScheme = "nest"
+        static let redirectURL = "nest://auth/callback"
+        /// Combined Google OAuth scopes requested during Supabase sign-in.
+        /// Covers: Calendar (read-only), Gmail (modify + send), Contacts (autocomplete).
+        static let googleScopes = "email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
     }
-    
-    // MARK: - Gmail
-    
-    enum Gmail {
+
+    // MARK: - Google Calendar
+
+    enum GoogleCalendar {
+        static let calendarAPIBase = "https://www.googleapis.com/calendar/v3"
         static let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
         static let tokenURL = "https://oauth2.googleapis.com/token"
+        static let redirectURI = "http://127.0.0.1:8234"
+        static let loopbackPort: UInt16 = 8234
+        static let scopes = "https://www.googleapis.com/auth/calendar.readonly"
+    }
+
+    // MARK: - Gmail
+
+    enum Gmail {
         static let apiBase = "https://gmail.googleapis.com/gmail/v1"
         static let peopleAPIBase = "https://people.googleapis.com/v1"
-        /// Gmail + Contacts scopes. Contacts scopes enable recipient autocomplete via the People API.
-        /// Note: existing users may need to re-authenticate to grant the new contacts scopes.
-        static let scopes = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send email https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
-        /// Redirect URI for desktop OAuth flow (loopback) — uses a different port to Calendar.
-        static let redirectURI = "http://127.0.0.1:8235/callback"
+        static let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
+        static let tokenURL = "https://oauth2.googleapis.com/token"
+        static let redirectURI = "http://127.0.0.1:8235"
         static let loopbackPort: UInt16 = 8235
+        static let scopes = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
     }
     
     // MARK: - Slack
@@ -143,12 +163,11 @@ enum Constants {
         static let deepgramAPIKey = "deepgram_api_key"
         static let openAIAPIKey = "openai_api_key"
         static let anthropicAPIKey = "anthropic_api_key"
+        static let emailEncryptionKey = "email_encryption_key"
         static let googleAccessToken = "google_access_token"
         static let googleRefreshToken = "google_refresh_token"
         static let googleClientID = "google_client_id"
         static let googleClientSecret = "google_client_secret"
-        static let gmailAccessToken = "gmail_access_token"
-        static let gmailRefreshToken = "gmail_refresh_token"
         static let slackUserToken = "slack_user_token"
     }
     
@@ -186,5 +205,15 @@ enum Constants {
         static let defaultVariantCount = "defaultVariantCount"
         static let autoSuggestActions = "autoSuggestActions"
         static let styleProfileEnabled = "styleProfileEnabled"
+
+        // To-Dos
+        static let processedTodoEmailMessageIds = "processedTodoEmailMessageIds"
+        /// JSON-encoded array of excluded sender emails (no to-dos will be created from these senders).
+        static let todoExcludedSenders = "todoExcludedSenders"
+        
+        // Supabase
+        static let hasCompletedSupabaseMigration = "hasCompletedSupabaseMigration"
+        static let hasCompletedSemanticBackfill = "hasCompletedSemanticBackfill"
+        static let semanticBackfillProgress = "semanticBackfillProgress"
     }
 }

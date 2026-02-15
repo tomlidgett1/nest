@@ -14,21 +14,21 @@ struct EmailView: View {
     @Binding var isSidebarCollapsed: Bool
     @Environment(AppState.self) private var appState
     @State private var showEmailCompose = false
-    
+    @State private var showSentAnimation = false
+    @State private var sentCheckmarkScale: CGFloat = 0.3
     private var gmail: GmailService { appState.gmailService }
+    
+    /// The email of the account to send from — follows the view filter, or first account.
+    private var composeSenderEmail: String {
+        if let filterId = gmail.filterAccountId,
+           let account = gmail.accounts.first(where: { $0.id == filterId }) {
+            return account.email
+        }
+        return gmail.connectedEmail ?? ""
+    }
     
     var body: some View {
         VStack(spacing: 0) {
-            // Meeting controls if active
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 6)
-            }
-            
             if gmail.isConnected {
                 connectedContent
             } else {
@@ -41,10 +41,6 @@ struct EmailView: View {
             if gmail.isConnected && gmail.inboxThreads.isEmpty {
                 Task { await gmail.fetchMailbox(.inbox) }
             }
-        }
-        .sheet(isPresented: $showEmailCompose) {
-            EmailComposeView(draft: EmailDraft(), mode: .newEmail)
-                .environment(appState)
         }
     }
     
@@ -78,8 +74,58 @@ struct EmailView: View {
                         .fill(Theme.divider)
                         .frame(width: 1)
                     
-                    EmailDetailView()
-                        .frame(maxWidth: .infinity)
+                    // Right panel: sent animation > compose > detail
+                    ZStack {
+                        if showSentAnimation {
+                            sentSuccessView
+                                .transition(.opacity)
+                        } else if showEmailCompose {
+                            ScrollView {
+                                EmailComposeView(
+                                    draft: EmailDraft(),
+                                    mode: .newEmail,
+                                    senderEmail: composeSenderEmail,
+                                    onDismiss: {
+                                        withAnimation(.easeInOut(duration: 0.25)) {
+                                            showEmailCompose = false
+                                        }
+                                    },
+                                    onSent: {
+                                        sentCheckmarkScale = 0.3
+                                        withAnimation(.easeInOut(duration: 0.3)) {
+                                            showEmailCompose = false
+                                            showSentAnimation = true
+                                        }
+                                        // Spring the checkmark in after a tiny delay
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                            withAnimation(.spring(response: 0.5, dampingFraction: 0.6)) {
+                                                sentCheckmarkScale = 1.0
+                                            }
+                                        }
+                                        // Auto-dismiss after 2s
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                                            withAnimation(.easeOut(duration: 0.35)) {
+                                                showSentAnimation = false
+                                            }
+                                        }
+                                    }
+                                )
+                                .padding(.bottom, 20)
+                            }
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .bottom).combined(with: .opacity),
+                                removal: .opacity
+                            ))
+                        } else {
+                            EmailDetailView()
+                                .frame(maxWidth: .infinity)
+                                .transition(.opacity)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .animation(.easeInOut(duration: 0.3), value: showEmailCompose)
+                    .animation(.easeInOut(duration: 0.3), value: showSentAnimation)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -89,10 +135,10 @@ struct EmailView: View {
     
     // MARK: - Email Toolbar
     
-    // MARK: - Left Toolbar (mailbox tabs only)
+    // MARK: - Left Toolbar (mailbox tabs)
     
     private var emailToolbar: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 6) {
             mailboxTabs
             Spacer(minLength: 0)
         }
@@ -104,49 +150,149 @@ struct EmailView: View {
     
     private var detailToolbar: some View {
         HStack(spacing: 8) {
-            Button {
-                if let thread = gmail.selectedThread {
-                    Task { await gmail.trashThread(threadId: thread.id) }
+            if showEmailCompose {
+                Button {
+                    postComposeToolbarAction(.toggleAIAssist)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 11))
+                        Text("AI Assist")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(6)
+                    .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
                 }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "trash")
-                        .font(.system(size: 11))
-                    Text("Delete")
-                        .font(.system(size: 12, weight: .medium))
+                .buttonStyle(.plain)
+                
+                Button {
+                    postComposeToolbarAction(.discard)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11))
+                        Text("Discard")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(6)
+                    .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
                 }
-                .foregroundColor(Theme.textSecondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Theme.sidebarBackground)
-                .cornerRadius(6)
+                .buttonStyle(.plain)
+                
+                Button {
+                    postComposeToolbarAction(.attach)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 11))
+                        Text("Attach")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(6)
+                    .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+                }
+                .buttonStyle(.plain)
+            } else {
+                Button {
+                    if let thread = gmail.selectedThread {
+                        Task { await gmail.trashThread(threadId: thread.id) }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                        Text("Delete")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(6)
+                    .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+                }
+                .buttonStyle(.plain)
+                .help("Move to Bin")
+                .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
+                
+                Button {
+                    if let thread = gmail.selectedThread {
+                        Task { await gmail.archiveThread(threadId: thread.id) }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "archivebox")
+                            .font(.system(size: 11))
+                        Text("Archive")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(6)
+                    .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+                }
+                .buttonStyle(.plain)
+                .help("Archive")
+                .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
             }
-            .buttonStyle(.plain)
-            .help("Move to Bin")
-            .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
-            
-            Button {
-                if let thread = gmail.selectedThread {
-                    Task { await gmail.archiveThread(threadId: thread.id) }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "archivebox")
-                        .font(.system(size: 11))
-                    Text("Archive")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .foregroundColor(Theme.textSecondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Theme.sidebarBackground)
-                .cornerRadius(6)
-            }
-            .buttonStyle(.plain)
-            .help("Archive")
-            .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
             
             Spacer()
+            
+            if showEmailCompose {
+                if let error = gmail.sendError {
+                    Text(error)
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.recording)
+                        .lineLimit(1)
+                }
+                
+                if gmail.sendSuccess {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12))
+                        Text("Sent")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.olive)
+                }
+                
+                Button {
+                    postComposeToolbarAction(.send)
+                } label: {
+                    HStack(spacing: 5) {
+                        if gmail.isSending {
+                            ProgressView()
+                                .controlSize(.mini)
+                        } else {
+                            Image(systemName: "paperplane.fill")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        Text("Send")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(gmail.isSending ? Theme.textQuaternary : Theme.olive)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .disabled(gmail.isSending)
+            }
             
             // Refresh
             Button {
@@ -165,12 +311,17 @@ struct EmailView: View {
             
             // Compose
             Button {
-                showEmailCompose = true
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showEmailCompose.toggle()
+                    if !showEmailCompose {
+                        showSentAnimation = false
+                    }
+                }
             } label: {
                 HStack(spacing: 5) {
-                    Image(systemName: "square.and.pencil")
+                    Image(systemName: showEmailCompose ? "xmark" : "square.and.pencil")
                         .font(.system(size: 11, weight: .medium))
-                    Text("Compose")
+                    Text(showEmailCompose ? "Close" : "Compose")
                         .font(.system(size: 12, weight: .medium))
                 }
                 .foregroundColor(.white)
@@ -200,6 +351,14 @@ struct EmailView: View {
         .help(tooltip)
     }
     
+    private func postComposeToolbarAction(_ action: EmailComposeToolbarAction) {
+        NotificationCenter.default.post(
+            name: .emailComposeToolbarAction,
+            object: nil,
+            userInfo: ["action": action.rawValue]
+        )
+    }
+    
     // MARK: - Mailbox Tabs
     
     private var mailboxTabs: some View {
@@ -217,19 +376,6 @@ struct EmailView: View {
                             .font(.system(size: 10))
                         Text(mailbox.displayName)
                             .font(.system(size: 12, weight: .medium))
-                        
-                        if mailbox == .inbox {
-                            let unreadCount = gmail.inboxThreads.filter(\.isUnread).count
-                            if unreadCount > 0 {
-                                Text("\(unreadCount)")
-                                    .font(.system(size: 9, weight: .semibold))
-                                    .foregroundColor(Theme.olive)
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 1)
-                                    .background(Theme.oliveFaint)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
-                        }
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
@@ -244,6 +390,40 @@ struct EmailView: View {
         .padding(2)
         .background(Color(red: 0.94, green: 0.93, blue: 0.90))
         .cornerRadius(6)
+    }
+    
+    // MARK: - Sent Success Animation
+    
+    private var sentSuccessView: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            
+            ZStack {
+                Circle()
+                    .fill(Theme.olive.opacity(0.08))
+                    .frame(width: 88, height: 88)
+                    .scaleEffect(sentCheckmarkScale)
+                
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 46))
+                    .foregroundColor(Theme.olive)
+                    .scaleEffect(sentCheckmarkScale)
+            }
+            
+            VStack(spacing: 6) {
+                Text("Email Sent")
+                    .font(Theme.headingFont(17))
+                    .foregroundColor(Theme.textPrimary)
+                
+                Text("Your message has been delivered successfully.")
+                    .font(Theme.captionFont(13))
+                    .foregroundColor(Theme.textTertiary)
+            }
+            
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.background)
     }
     
     // MARK: - Connect Prompt
@@ -261,7 +441,7 @@ struct EmailView: View {
                     .font(Theme.headingFont(16))
                     .foregroundColor(Theme.textPrimary)
                 
-                Text("View, send, and manage your emails directly inside Tap.\nAI-powered response drafting included.")
+                Text("View, send, and manage your emails directly inside Tap.\nSign in with Google or add an account in Preferences.")
                     .font(Theme.captionFont())
                     .foregroundColor(Theme.textTertiary)
                     .multilineTextAlignment(.center)
@@ -291,8 +471,8 @@ struct EmailView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(gmail.isAuthenticating)
-            } else {
-                Text("Set up Google credentials in Preferences → Calendars first.")
+            } else if !gmail.isConnectedViaSupabase {
+                Text("Sign in with Google to get started, or set up OAuth credentials in Preferences → Calendars.")
                     .font(Theme.captionFont())
                     .foregroundColor(Theme.textQuaternary)
                     .multilineTextAlignment(.center)

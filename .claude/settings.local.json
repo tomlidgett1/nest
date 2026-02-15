@@ -4,7 +4,11 @@
       "Bash(xcodebuild:*)",
       "Bash(xargs:*)",
       "Bash(wc:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(gem list:*)",
+      "Bash(ruby -e:*)",
+      "Bash(gem install:*)",
+      "Bash(ruby:*)"
     ]
   }
 }

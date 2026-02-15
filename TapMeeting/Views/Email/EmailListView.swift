@@ -9,6 +9,9 @@ struct EmailListView: View {
     
     private var gmail: GmailService { appState.gmailService }
     
+    /// Whether multiple accounts are connected (show account indicators when true).
+    private var hasMultipleAccounts: Bool { gmail.accounts.count > 1 }
+    
     private var currentThreads: [GmailThread] {
         gmail.threadsForMailbox(gmail.currentMailbox)
     }
@@ -201,6 +204,17 @@ struct EmailListView: View {
                         
                         Spacer(minLength: 4)
                         
+                        // Account indicator (only when multiple accounts)
+                        if hasMultipleAccounts, !thread.accountEmail.isEmpty {
+                            Text(shortAccountLabel(thread.accountEmail))
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundColor(Theme.textQuaternary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Theme.sidebarSelection)
+                                .cornerRadius(4)
+                        }
+                        
                         // Attachment icon
                         if thread.hasAttachments {
                             Image(systemName: "paperclip")
@@ -343,5 +357,15 @@ struct EmailListView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "d MMM"
         return formatter.string(from: date)
+    }
+    
+    /// Abbreviate an email to a short label, e.g. "john@example.com" → "john@ex…"
+    private func shortAccountLabel(_ email: String) -> String {
+        let parts = email.split(separator: "@")
+        guard parts.count == 2 else { return email }
+        let user = parts[0]
+        let domain = parts[1]
+        let shortDomain = domain.prefix(3)
+        return "\(user)@\(shortDomain)…"
     }
 }

@@ -549,6 +549,8 @@ struct AIEmailPreferencesView: View {
                         existing.sampleExcerpts = result.sampleExcerpts
                         existing.emailsAnalysed = sentEmails.count
                         existing.updatedAt = .now
+                        try? modelContext.save()
+                        appState.syncService?.pushStyleProfile(existing)
                     } else {
                         let profile = StyleProfile(
                             accountEmail: email,
@@ -568,9 +570,10 @@ struct AIEmailPreferencesView: View {
                             emailsAnalysed: sentEmails.count
                         )
                         modelContext.insert(profile)
+                        try? modelContext.save()
+                        appState.syncService?.pushStyleProfile(profile)
                     }
                     
-                    try? modelContext.save()
                     isAnalysing = false
                 }
             } catch {
@@ -584,8 +587,10 @@ struct AIEmailPreferencesView: View {
     
     private func resetStyleProfile() {
         guard let profile = activeProfile else { return }
+        let profileId = profile.id
         modelContext.delete(profile)
         try? modelContext.save()
+        appState.syncService?.deleteRemote(table: "style_profiles", id: profileId)
     }
     
     private func addRule() {
@@ -597,14 +602,17 @@ struct AIEmailPreferencesView: View {
         )
         modelContext.insert(rule)
         try? modelContext.save()
+        appState.syncService?.pushContactRule(rule)
         
         clearRuleForm()
         showAddRule = false
     }
     
     private func deleteRule(_ rule: ContactRule) {
+        let ruleId = rule.id
         modelContext.delete(rule)
         try? modelContext.save()
+        appState.syncService?.deleteRemote(table: "contact_rules", id: ruleId)
     }
     
     private func clearRuleForm() {

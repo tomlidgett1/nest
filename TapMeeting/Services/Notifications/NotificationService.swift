@@ -14,8 +14,9 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
     
     /// Creates a notification attachment from the app icon so notifications display it.
     private func appIconAttachment() -> UNNotificationAttachment? {
-        let icon = NSApp.applicationIconImage
-        guard !icon.size.width.isZero, !icon.size.height.isZero else { return nil }
+        // Prefer the asset catalogue icon explicitly so notifications match branding.
+        let icon = NSImage(named: "AppIcon") ?? NSApp.applicationIconImage
+        guard let icon, !icon.size.width.isZero, !icon.size.height.isZero else { return nil }
         
         guard let tiffData = icon.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
@@ -70,12 +71,54 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             content.title = "New emails"
             content.body = "You have \(threads.count) new emails"
         }
+        
+        let request = UNNotificationRequest(
+            identifier: "new-email-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        
+        UNUserNotificationCenter.current().add(request)
+    }
+    
+    // MARK: - New To-Dos
+    
+    /// Notify the user that new to-do items have been extracted.
+    func sendNewTodoNotification(count: Int, source: TodoItem.SourceType, sourceTitle: String? = nil) {
+        guard count > 0 else { return }
+        
+        let content = UNMutableNotificationContent()
+        content.sound = .default
+        
+        let sourceLabel: String
+        switch source {
+        case .meeting: sourceLabel = "meeting"
+        case .email: sourceLabel = "email"
+        case .manual: return // No notification for manual to-dos
+        }
+        
+        if count == 1 {
+            content.title = "New To-Do"
+            if let title = sourceTitle {
+                content.body = "From \(sourceLabel): \(title)"
+            } else {
+                content.body = "1 new to-do from a \(sourceLabel)"
+            }
+        } else {
+            content.title = "\(count) New To-Dos"
+            if let title = sourceTitle {
+                content.body = "From \(sourceLabel): \(title)"
+            } else {
+                content.body = "\(count) new to-dos from \(sourceLabel)s"
+            }
+        }
+        
         if let attachment = appIconAttachment() {
             content.attachments = [attachment]
         }
         
         let request = UNNotificationRequest(
-            identifier: "new-email-\(UUID().uuidString)",
+            identifier: "new-todo-\(UUID().uuidString)",
             content: content,
             trigger: nil
         )

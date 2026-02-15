@@ -9,7 +9,7 @@ struct NotesListView: View {
     @Environment(AppState.self) private var appState
     @State private var searchText = ""
     @State private var sidebarTab: SidebarTab = .home
-    @State private var isSidebarCollapsed = true
+    @State private var isSidebarCollapsed = false
     @State private var tabBeforeNote: SidebarTab = .home
     
     /// Forces a layout recalculation after window is ready. SwiftUI's unified toolbar
@@ -19,11 +19,14 @@ struct NotesListView: View {
     enum SidebarTab: Hashable {
         case home
         case meetings
+        case todos
         case email
+        case appleNotes
         case settings
         case folder(UUID?)
         case note(UUID)
         case tag(UUID)
+        case appleNote(String)
     }
     
     var body: some View {
@@ -55,21 +58,22 @@ struct NotesListView: View {
                     .modifier(ToolbarSafeAreaCompensation())
             }
             .animation(.easeInOut(duration: 0.25), value: isSidebarCollapsed)
+
+            if sidebarTab == .home {
+                VStack {
+                    Spacer()
+                    FloatingSemanticSearchBar()
+                        .padding(.horizontal, Theme.Spacing.contentPadding)
+                        .padding(.bottom, 16)
+                }
+                .transition(.opacity)
+            }
         }
         .frame(minWidth: 780, minHeight: 540)
         .background(Theme.background)
         .toolbar {
             ToolbarItem(placement: .navigation) {
-                HStack(spacing: 12) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "bird.fill")
-                            .font(.system(size: 11))
-                            .symbolRenderingMode(.hierarchical)
-                        Text("Nest")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .foregroundColor(Theme.textTertiary)
-                    
+                HStack(spacing: 10) {
                     Button {
                         withAnimation(.easeInOut(duration: 0.25)) {
                             isSidebarCollapsed.toggle()
@@ -82,9 +86,69 @@ struct NotesListView: View {
                     .buttonStyle(.plain)
                     .help("Toggle Sidebar")
                     
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            sidebarTab = .home
+                        }
+                    } label: {
+                        Image(systemName: "house")
+                            .font(.system(size: 13))
+                            .foregroundColor(Theme.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Go to Home")
+                    .padding(.leading, isSidebarCollapsed ? 0 : 104)
+                    
+                    // Account filter — only shown on Email tab with multiple accounts
+                    if sidebarTab == .email, appState.gmailService.accounts.count > 1 {
+                        emailAccountFilterMenu
+                    }
                 }
             }
-            
+            ToolbarItem(placement: .primaryAction) {
+                HStack(spacing: 12) {
+                    if appState.isMeetingActive {
+                        MeetingControlButtons()
+                    }
+                    Menu {
+                        Button {
+                            startNewMeeting()
+                        } label: {
+                            Label("New Meeting", systemImage: "calendar.badge.clock")
+                        }
+                        Button {
+                            startNewStandaloneNote()
+                        } label: {
+                            Label("New Note", systemImage: "doc.text")
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "plus.circle")
+                                .font(.system(size: 11))
+                            Text("Quick Start")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(Theme.textSecondary)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Theme.cardBackground)
+                        .cornerRadius(6)
+                        .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    
+                    HStack(spacing: 4) {
+                        Image(systemName: "bird.fill")
+                            .font(.system(size: 11))
+                            .symbolRenderingMode(.hierarchical)
+                        Text("Nest")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textTertiary)
+                }
+                .padding(.trailing, 12)
+            }
         }
         .toolbarBackground(.hidden, for: .windowToolbar)
         // Email compose is now handled inside EmailView
@@ -114,10 +178,10 @@ struct NotesListView: View {
             guard !hasTriggeredLayoutFix else { return }
             hasTriggeredLayoutFix = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
-                isSidebarCollapsed = false
+                isSidebarCollapsed = true
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                isSidebarCollapsed = true
+                isSidebarCollapsed = false
             }
         }
         .keyboardShortcut("n", modifiers: .command)
@@ -140,6 +204,73 @@ struct NotesListView: View {
         sidebarTab = .note(note.id)
     }
     
+    // MARK: - Email Account Filter (Toolbar)
+    
+    private var emailAccountFilterMenu: some View {
+        let gmail = appState.gmailService
+        let isFiltered = gmail.filterAccountId != nil
+        
+        return Menu {
+            Button {
+                gmail.filterAccountId = nil
+                gmail.selectedThread = nil
+                gmail.selectedMessageId = nil
+            } label: {
+                HStack {
+                    Text("All Accounts")
+                    if gmail.filterAccountId == nil {
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+            
+            Divider()
+            
+            ForEach(gmail.accounts, id: \.id) { account in
+                Button {
+                    gmail.filterAccountId = account.id
+                    gmail.selectedThread = nil
+                    gmail.selectedMessageId = nil
+                } label: {
+                    HStack {
+                        Text(account.email)
+                        if gmail.filterAccountId == account.id {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "at")
+                    .font(.system(size: 10, weight: .medium))
+                Text(emailAccountFilterLabel)
+                    .font(.system(size: 12, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .foregroundColor(isFiltered ? Theme.textPrimary : Theme.textSecondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(isFiltered ? Color.white : Color.clear)
+            .cornerRadius(6)
+            .shadow(color: isFiltered ? .black.opacity(0.05) : .clear, radius: 1, y: 1)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+    
+    private var emailAccountFilterLabel: String {
+        let gmail = appState.gmailService
+        guard let filterId = gmail.filterAccountId,
+              let account = gmail.accounts.first(where: { $0.id == filterId }) else {
+            return "All"
+        }
+        let parts = account.email.split(separator: "@")
+        guard parts.count == 2 else { return account.email }
+        return String(parts[0])
+    }
+    
     // MARK: - Main Content
     
     @ViewBuilder
@@ -160,6 +291,24 @@ struct NotesListView: View {
             )
         case .email:
             EmailView(isSidebarCollapsed: $isSidebarCollapsed)
+        case .todos:
+            TodoListView(
+                isSidebarCollapsed: $isSidebarCollapsed,
+                onNavigateToNote: { id in tabBeforeNote = .todos; sidebarTab = .note(id) },
+                onNavigateToEmail: { sidebarTab = .email }
+            )
+        case .appleNotes:
+            AppleNotesContentView(
+                isSidebarCollapsed: $isSidebarCollapsed,
+                onSelectNote: { id in tabBeforeNote = .appleNotes; sidebarTab = .appleNote(id) },
+                onCreateNote: { id in tabBeforeNote = .appleNotes; sidebarTab = .appleNote(id) }
+            )
+        case .appleNote(let id):
+            AppleNoteDetailView(
+                noteId: id,
+                isSidebarCollapsed: $isSidebarCollapsed,
+                onBack: { sidebarTab = tabBeforeNote }
+            )
         case .folder(let folderId):
             FolderContentView(
                 folderId: folderId,
@@ -229,47 +378,22 @@ private struct NoteSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Search bar + new note button
+            // Search bar
             HStack(spacing: 8) {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.textTertiary)
-                    
-                    TextField("Search", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(Theme.textPrimary)
-                }
-                .padding(.horizontal, Theme.Spacing.sidebarPadding)
-                .frame(height: Theme.Spacing.sidebarItemHeight)
-                .frame(maxWidth: .infinity)
-                .background(Theme.sidebarSelection)
-                .cornerRadius(6)
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.textTertiary)
                 
-                Menu {
-                    Button {
-                        onNewNote()
-                    } label: {
-                        Label("New Meeting", systemImage: "calendar.badge.clock")
-                    }
-                    Button {
-                        onNewStandaloneNote()
-                    } label: {
-                        Label("New Note", systemImage: "doc.text")
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(Theme.textSecondary)
-                        .frame(width: Theme.Spacing.sidebarItemHeight, height: Theme.Spacing.sidebarItemHeight)
-                        .background(Theme.sidebarSelection)
-                        .cornerRadius(6)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .frame(width: Theme.Spacing.sidebarItemHeight)
+                TextField("Search", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundColor(Theme.textPrimary)
             }
+            .padding(.horizontal, Theme.Spacing.sidebarPadding)
+            .frame(height: Theme.Spacing.sidebarItemHeight)
+            .frame(maxWidth: .infinity)
+            .background(Theme.sidebarSelection)
+            .cornerRadius(6)
             .padding(.horizontal, 10)
             .padding(.top, 10)
             .padding(.bottom, 10)
@@ -294,9 +418,28 @@ private struct NoteSidebar: View {
             SidebarItem(
                 icon: "envelope",
                 label: "Email",
-                isSelected: isEmailSelected
+                isSelected: isEmailSelected,
+                badge: appState.gmailService.isConnected ? appState.gmailService.inboxThreads.filter(\.isUnread).count : 0
             ) {
                 selectedTab = .email
+            }
+            
+            SidebarItem(
+                icon: "checklist",
+                label: "To-Dos",
+                isSelected: isTodosSelected,
+                badge: appState.todoRepository.pendingCount()
+            ) {
+                selectedTab = .todos
+            }
+            
+            SidebarItem(
+                icon: "note.text",
+                label: "Apple Notes",
+                isSelected: isAppleNotesSelected,
+                badge: appState.appleNotesService.notes.count
+            ) {
+                selectedTab = .appleNotes
             }
             
             // Folders section
@@ -464,6 +607,16 @@ private struct NoteSidebar: View {
         return false
     }
     
+    private var isTodosSelected: Bool {
+        if case .todos = selectedTab { return true }
+        return false
+    }
+    
+    private var isAppleNotesSelected: Bool {
+        if case .appleNotes = selectedTab { return true }
+        return false
+    }
+    
     private var isSettingsSelected: Bool {
         if case .settings = selectedTab { return true }
         return false
@@ -505,6 +658,7 @@ private struct SidebarItem: View {
     let icon: String
     let label: String
     let isSelected: Bool
+    var badge: Int = 0
     let action: () -> Void
     
     var body: some View {
@@ -520,6 +674,16 @@ private struct SidebarItem: View {
                     .foregroundColor(isSelected ? Theme.textPrimary : Theme.textSecondary)
                 
                 Spacer()
+                
+                if badge > 0 {
+                    Text("\(badge)")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Theme.olive)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Theme.oliveFaint)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
             }
             .padding(.horizontal, Theme.Spacing.sidebarItemContentPadding)
             .frame(height: Theme.Spacing.sidebarItemHeight)
@@ -809,16 +973,6 @@ private struct HomeContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // Meeting controls — only shown when recording
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, Theme.Spacing.contentPadding)
-                .padding(.bottom, 8)
-            }
-            
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     // Page title
@@ -1011,9 +1165,23 @@ private struct HomeContentView: View {
                                                         .foregroundColor(Theme.textPrimary)
                                                         .lineLimit(1)
                                                     
-                                                    Text(event.formattedTime)
-                                                        .font(Theme.captionFont(11))
-                                                        .foregroundColor(Theme.textTertiary)
+                                                    HStack(spacing: 4) {
+                                                        Text(event.formattedTime)
+                                                            .font(Theme.captionFont(11))
+                                                            .foregroundColor(Theme.textTertiary)
+                                                        
+                                                        // Show account source when multiple accounts are connected
+                                                        if appState.googleCalendarService.accounts.count > 1,
+                                                           !event.calendarSource.isEmpty,
+                                                           event.calendarSource != "Apple Calendar" {
+                                                            Text("·")
+                                                                .font(Theme.captionFont(11))
+                                                                .foregroundColor(Theme.textQuaternary)
+                                                            Text(event.calendarSource.split(separator: "@").first.map(String.init) ?? event.calendarSource)
+                                                                .font(Theme.captionFont(10))
+                                                                .foregroundColor(Theme.textQuaternary)
+                                                        }
+                                                    }
                                                 }
                                                 
                                                 Spacer()
@@ -1490,15 +1658,6 @@ private struct FolderContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, Theme.Spacing.contentPadding)
-                .padding(.bottom, 8)
-            }
-            
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     // Folder title — editable for real folders
@@ -1628,16 +1787,6 @@ private struct MeetingsContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // Meeting controls — only shown when recording
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, Theme.Spacing.contentPadding)
-                .padding(.bottom, 8)
-            }
-            
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     // Page title + Quick Start button
@@ -1757,15 +1906,6 @@ private struct TagContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, Theme.Spacing.contentPadding)
-                .padding(.bottom, 8)
-            }
-            
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     if let tag {
@@ -1856,6 +1996,641 @@ private struct TagContentView: View {
             }
         }
         .background(Theme.background)
+    }
+}
+
+// MARK: - Apple Notes Content View
+
+/// Full-page list of notes imported from the macOS Apple Notes app, grouped by folder.
+private struct AppleNotesContentView: View {
+    
+    @Binding var isSidebarCollapsed: Bool
+    let onSelectNote: (String) -> Void
+    var onCreateNote: ((String) -> Void)? = nil
+    @Environment(AppState.self) private var appState
+    @State private var searchText = ""
+    @State private var isCreating = false
+    
+    private var service: AppleNotesService { appState.appleNotesService }
+    
+    private var displayedNotes: [AppleNote] {
+        searchText.isEmpty ? service.notes : service.searchNotes(query: searchText)
+    }
+    
+    private var groupedByFolder: [(folder: String, notes: [AppleNote])] {
+        var groups: [String: [AppleNote]] = [:]
+        var order: [String] = []
+        for note in displayedNotes {
+            if groups[note.folder] == nil {
+                groups[note.folder] = []
+                order.append(note.folder)
+            }
+            groups[note.folder]?.append(note)
+        }
+        return order.compactMap { folder in
+            guard let notes = groups[folder] else { return nil }
+            return (folder: folder, notes: notes)
+        }
+    }
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Header
+                    HStack(alignment: .center, spacing: 12) {
+                        Text("Apple Notes")
+                            .font(Theme.titleFont(28))
+                            .foregroundColor(Theme.textPrimary)
+                        
+                        Spacer(minLength: 0)
+                        
+                        if service.isLoading {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                                .frame(width: 20, height: 20)
+                        }
+                        
+                        Button {
+                            Task { await service.fetchNotes() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 13))
+                                Text("Refresh")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Theme.cardBackground)
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Theme.divider.opacity(0.5), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(service.isLoading)
+                        .help("Refresh notes from Apple Notes")
+                        
+                        Button {
+                            guard !isCreating else { return }
+                            isCreating = true
+                            Task {
+                                if let newNote = await service.createNote() {
+                                    onCreateNote?(newNote.id)
+                                }
+                                isCreating = false
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 13))
+                                Text("New Note")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Theme.cardBackground)
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Theme.divider.opacity(0.5), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isCreating)
+                        .help("Create a new note in Apple Notes")
+                    }
+                    .padding(.top, Theme.Spacing.mainContentTopPadding)
+                    .padding(.bottom, 12)
+                    
+                    // Search bar
+                    if !service.notes.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 12))
+                                .foregroundColor(Theme.textTertiary)
+                            TextField("Search Apple Notes…", text: $searchText)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 13))
+                                .foregroundColor(Theme.textPrimary)
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(height: 32)
+                        .background(Theme.sidebarSelection)
+                        .cornerRadius(6)
+                        .padding(.bottom, 16)
+                    }
+                    
+                    // Content states
+                    if let error = service.errorMessage {
+                        // Error / permission denied
+                        VStack(spacing: 12) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 32))
+                                .foregroundColor(Theme.textTertiary)
+                            
+                            Text(error)
+                                .font(Theme.bodyFont())
+                                .foregroundColor(Theme.textSecondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 40)
+                            
+                            if error.contains("permission") || error.contains("Automation") {
+                                Button("Open System Settings") {
+                                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+                                        NSWorkspace.shared.open(url)
+                                    }
+                                }
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(Theme.olive)
+                                .padding(.top, 4)
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 60)
+                    } else if service.isLoading && service.notes.isEmpty {
+                        // Initial loading
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                            Text("Loading Apple Notes…")
+                                .font(Theme.captionFont())
+                                .foregroundColor(Theme.textTertiary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 60)
+                    } else if service.notes.isEmpty {
+                        // Empty state
+                        VStack(spacing: 8) {
+                            Image(systemName: "note.text")
+                                .font(.system(size: 32))
+                                .foregroundColor(Theme.textQuaternary)
+                            Text("No Apple Notes found")
+                                .font(Theme.headingFont())
+                                .foregroundColor(Theme.textTertiary)
+                            Text("Notes from the Apple Notes app will appear here.")
+                                .font(Theme.captionFont())
+                                .foregroundColor(Theme.textQuaternary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 60)
+                    } else if displayedNotes.isEmpty {
+                        // No search results
+                        VStack(spacing: 8) {
+                            Text("No matching notes")
+                                .font(Theme.headingFont())
+                                .foregroundColor(Theme.textTertiary)
+                            Text("Try a different search term.")
+                                .font(Theme.captionFont())
+                                .foregroundColor(Theme.textQuaternary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 60)
+                    } else {
+                        // Notes grouped by folder
+                        ForEach(groupedByFolder, id: \.folder) { group in
+                            AppleNoteFolderSection(
+                                folder: group.folder,
+                                notes: group.notes,
+                                onSelectNote: onSelectNote
+                            )
+                        }
+                    }
+                    
+                    // Footer
+                    if let lastFetched = service.lastFetchedAt {
+                        Text("Last updated \(lastFetched.formatted(date: .abbreviated, time: .shortened))")
+                            .font(Theme.captionFont(11))
+                            .foregroundColor(Theme.textQuaternary)
+                            .padding(.top, 20)
+                    }
+                    
+                    Spacer(minLength: 40)
+                }
+                .padding(.horizontal, Theme.Spacing.contentPadding)
+                .padding(.top, 4)
+            }
+        }
+        .background(Theme.background)
+        .onAppear {
+            if service.notes.isEmpty {
+                Task { await service.fetchNotes() }
+            }
+        }
+    }
+}
+
+// MARK: - Apple Note Folder Section
+
+/// A group of Apple Notes from the same folder, rendered as a card list.
+private struct AppleNoteFolderSection: View {
+    let folder: String
+    let notes: [AppleNote]
+    let onSelectNote: (String) -> Void
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.textTertiary)
+                Text(folder)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Theme.textTertiary)
+                
+                Text("(\(notes.count))")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textQuaternary)
+            }
+            .padding(.top, 20)
+            .padding(.bottom, 8)
+            
+            VStack(spacing: 0) {
+                ForEach(Array(notes.enumerated()), id: \.element.id) { index, note in
+                    Button {
+                        onSelectNote(note.id)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "note.text")
+                                .font(.system(size: 14))
+                                .foregroundColor(Theme.textQuaternary)
+                                .frame(width: 20)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(note.title)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .lineLimit(1)
+                                
+                                if !note.snippet.isEmpty {
+                                    Text(note.snippet)
+                                        .font(Theme.captionFont())
+                                        .foregroundColor(Theme.textTertiary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            
+                            Spacer()
+                            
+                            Text(note.formattedDate)
+                                .font(Theme.captionFont())
+                                .foregroundColor(Theme.textQuaternary)
+                            
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Theme.textQuaternary)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    
+                    if index < notes.count - 1 {
+                        Rectangle()
+                            .fill(Theme.divider)
+                            .frame(height: 1)
+                            .padding(.leading, 48)
+                    }
+                }
+            }
+            .background(Theme.cardBackground)
+            .cornerRadius(12)
+            .shadow(color: .black.opacity(0.03), radius: 3, y: 1)
+        }
+    }
+}
+
+// MARK: - Apple Note Detail View
+
+/// Editable detail view for a single Apple Note.
+/// Supports editing the title and body, with debounced auto-save back to Apple Notes.
+private struct AppleNoteDetailView: View {
+    let noteId: String
+    @Binding var isSidebarCollapsed: Bool
+    var onBack: (() -> Void)?
+    
+    @Environment(AppState.self) private var appState
+    
+    // Loading
+    @State private var isLoadingBody = true
+    
+    // Editing
+    @State private var editableBody = ""
+    @State private var isEditingTitle = false
+    @State private var editingTitle = ""
+    @State private var hasLoadedBody = false
+    
+    // Save state
+    @State private var saveStatus: SaveStatus = .saved
+    @State private var saveTask: Task<Void, Never>?
+    
+    // Delete
+    @State private var showDeleteConfirm = false
+    
+    private enum SaveStatus {
+        case saved, unsaved, saving
+        
+        var label: String {
+            switch self {
+            case .saved: return "Saved"
+            case .unsaved: return "Unsaved changes"
+            case .saving: return "Saving…"
+            }
+        }
+    }
+    
+    private var note: AppleNote? {
+        appState.appleNotesService.notes.first { $0.id == noteId }
+    }
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            if let note {
+                // Top bar: back, metadata, actions
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(alignment: .center) {
+                        // Back button
+                        if let onBack {
+                            Button(action: onBack) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "chevron.left")
+                                        .font(.system(size: 12, weight: .medium))
+                                    Text("Apple Notes")
+                                        .font(.system(size: 13))
+                                }
+                                .foregroundColor(Theme.textSecondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        
+                        Spacer()
+                        
+                        // Save status indicator
+                        if !isLoadingBody {
+                            HStack(spacing: 4) {
+                                Circle()
+                                    .fill(saveStatus == .saved ? Color.green.opacity(0.6) :
+                                          saveStatus == .saving ? Color.orange.opacity(0.6) :
+                                          Theme.textQuaternary)
+                                    .frame(width: 6, height: 6)
+                                Text(saveStatus.label)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Theme.textTertiary)
+                            }
+                        }
+                        
+                        // Actions
+                        HStack(spacing: 8) {
+                            Button {
+                                appState.appleNotesService.openInAppleNotes(id: note.id)
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "arrow.up.forward.square")
+                                        .font(.system(size: 11))
+                                    Text("Open in Notes")
+                                        .font(.system(size: 12, weight: .medium))
+                                }
+                                .foregroundColor(Theme.olive)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Theme.oliveFaint)
+                                .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            
+                            Button {
+                                showDeleteConfirm = true
+                            } label: {
+                                Image(systemName: "trash")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Theme.textTertiary)
+                                    .frame(width: 28, height: 28)
+                                    .background(Theme.sidebarSelection)
+                                    .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Delete this note")
+                        }
+                    }
+                    .padding(.horizontal, Theme.Spacing.contentPadding)
+                    .padding(.top, Theme.Spacing.mainContentTopPadding)
+                    .padding(.bottom, 8)
+                    
+                    // Metadata row
+                    HStack(spacing: 16) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder")
+                                .font(.system(size: 11))
+                            Text(note.folder)
+                                .font(Theme.captionFont(12))
+                        }
+                        .foregroundColor(Theme.textTertiary)
+                        
+                        HStack(spacing: 4) {
+                            Image(systemName: "clock")
+                                .font(.system(size: 11))
+                            Text("Modified \(note.formattedDate)")
+                                .font(Theme.captionFont(12))
+                        }
+                        .foregroundColor(Theme.textTertiary)
+                    }
+                    .padding(.horizontal, Theme.Spacing.contentPadding)
+                    .padding(.bottom, 12)
+                    
+                    Rectangle()
+                        .fill(Theme.divider)
+                        .frame(height: 1)
+                }
+                
+                // Editor area
+                if isLoadingBody {
+                    Spacer()
+                    VStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                        Text("Loading note…")
+                            .font(Theme.captionFont())
+                            .foregroundColor(Theme.textTertiary)
+                    }
+                    Spacer()
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            // Editable title
+                            if isEditingTitle {
+                                TextField("Note title", text: $editingTitle, onCommit: {
+                                    commitTitleRename()
+                                })
+                                .font(Theme.titleFont(26))
+                                .foregroundColor(Theme.textPrimary)
+                                .textFieldStyle(.plain)
+                                .onExitCommand { isEditingTitle = false }
+                                .padding(.top, 16)
+                                .padding(.bottom, 4)
+                            } else {
+                                Text(note.title)
+                                    .font(Theme.titleFont(26))
+                                    .foregroundColor(
+                                        note.title == "Untitled Note" ? Theme.textTertiary : Theme.textPrimary
+                                    )
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        editingTitle = note.title == "Untitled Note" ? "" : note.title
+                                        isEditingTitle = true
+                                    }
+                                    .help("Click to rename")
+                                    .padding(.top, 16)
+                                    .padding(.bottom, 4)
+                            }
+                            
+                            // Body editor
+                            AppleNoteTextEditor(text: $editableBody)
+                                .frame(minHeight: 400)
+                        }
+                        .padding(.horizontal, Theme.Spacing.contentPadding)
+                        .padding(.bottom, 40)
+                    }
+                }
+            } else {
+                Spacer()
+                Text("Note not found")
+                    .font(Theme.headingFont())
+                    .foregroundColor(Theme.textTertiary)
+                Spacer()
+            }
+        }
+        .background(Theme.background)
+        .task(id: noteId) {
+            isLoadingBody = true
+            hasLoadedBody = false
+            saveStatus = .saved
+            let body = await appState.appleNotesService.fetchNoteBody(id: noteId)
+            editableBody = body
+            hasLoadedBody = true
+            isLoadingBody = false
+        }
+        .onChange(of: editableBody) { _, _ in
+            guard hasLoadedBody else { return }
+            saveStatus = .unsaved
+            
+            // Debounced auto-save (1.5 seconds after last keystroke)
+            saveTask?.cancel()
+            saveTask = Task {
+                try? await Task.sleep(for: .seconds(1.5))
+                guard !Task.isCancelled else { return }
+                await saveBody()
+            }
+        }
+        .onDisappear {
+            // Save immediately when navigating away if there are unsaved changes
+            if saveStatus == .unsaved {
+                saveTask?.cancel()
+                Task { await saveBody() }
+            }
+        }
+        .alert("Delete Note", isPresented: $showDeleteConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                Task {
+                    try? await appState.appleNotesService.deleteNote(id: noteId)
+                    onBack?()
+                }
+            }
+        } message: {
+            Text("This will permanently delete \"\(note?.title ?? "this note")\" from Apple Notes. This cannot be undone.")
+        }
+    }
+    
+    private func saveBody() async {
+        await MainActor.run { saveStatus = .saving }
+        do {
+            try await appState.appleNotesService.saveNoteBody(id: noteId, plainText: editableBody)
+            await MainActor.run { saveStatus = .saved }
+        } catch {
+            print("[AppleNoteDetail] Save failed: \(error.localizedDescription)")
+            await MainActor.run { saveStatus = .unsaved }
+        }
+    }
+    
+    private func commitTitleRename() {
+        isEditingTitle = false
+        let trimmed = editingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != note?.title else { return }
+        Task {
+            try? await appState.appleNotesService.renameNote(id: noteId, title: trimmed)
+        }
+    }
+}
+
+// MARK: - Apple Note Text Editor
+
+/// A styled `TextEditor` wrapper that matches the app's warm cream aesthetic.
+private struct AppleNoteTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? NSTextView else {
+            return scrollView
+        }
+        
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.font = .systemFont(ofSize: 14)
+        textView.textColor = NSColor(Theme.textPrimary)
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.textContainerInset = NSSize(width: 0, height: 8)
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.delegate = context.coordinator
+        
+        // Match the line spacing
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineSpacing = 4
+        textView.defaultParagraphStyle = paragraphStyle
+        
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        
+        return scrollView
+    }
+    
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        // Only update if the text actually changed externally (not from typing)
+        if textView.string != text && !context.coordinator.isEditing {
+            textView.string = text
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+    
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+        var isEditing = false
+        
+        init(text: Binding<String>) {
+            self.text = text
+        }
+        
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            isEditing = true
+            text.wrappedValue = textView.string
+            isEditing = false
+        }
     }
 }
 

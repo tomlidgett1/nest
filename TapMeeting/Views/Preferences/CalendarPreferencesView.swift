@@ -36,14 +36,25 @@ struct CalendarPreferencesView: View {
                             .frame(height: 1)
                             .padding(.vertical, 12)
                         
-                        SettingsStatusRow(
-                            icon: "checkmark.circle.fill",
-                            title: "Google Calendar",
-                            subtitle: account.email,
-                            status: .connected,
-                            action: { googleCal.disconnect(accountId: account.id) },
-                            actionLabel: "Disconnect"
-                        )
+                        if googleCal.isSupabaseAccount(account) {
+                            // Primary Supabase account — cannot be disconnected independently
+                            SettingsStatusRow(
+                                icon: "checkmark.circle.fill",
+                                title: "Google Calendar (Primary)",
+                                subtitle: account.email,
+                                status: .connected
+                            )
+                        } else {
+                            // Additional account — can be disconnected
+                            SettingsStatusRow(
+                                icon: "checkmark.circle.fill",
+                                title: "Google Calendar",
+                                subtitle: account.email,
+                                status: .connected,
+                                action: { googleCal.disconnect(accountId: account.id) },
+                                actionLabel: "Disconnect"
+                            )
+                        }
                     }
                 }
             }
@@ -149,7 +160,7 @@ struct CalendarPreferencesView: View {
                         .cornerRadius(8)
                     }
                     
-                    // Add account button
+                    // Add account button (requires Google OAuth credentials)
                     Button {
                         googleCal.signIn()
                     } label: {
@@ -174,7 +185,18 @@ struct CalendarPreferencesView: View {
                         .cornerRadius(8)
                     }
                     .buttonStyle(.plain)
-                    .disabled(googleCal.isAuthenticating)
+                    .disabled(googleCal.isAuthenticating || !googleCal.hasCredentials)
+                    
+                    if !googleCal.hasCredentials && !googleCal.accounts.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 10))
+                                .foregroundColor(Theme.textQuaternary)
+                            Text("Configure Google OAuth credentials below to add another account.")
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textTertiary)
+                        }
+                    }
                     
                     if let error = googleCal.authError {
                         HStack(spacing: 6) {

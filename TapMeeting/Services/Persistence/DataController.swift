@@ -12,7 +12,8 @@ enum DataController {
             Folder.self,
             Tag.self,
             StyleProfile.self,
-            ContactRule.self
+            ContactRule.self,
+            TodoItem.self
         ])
         
         let configuration = ModelConfiguration(

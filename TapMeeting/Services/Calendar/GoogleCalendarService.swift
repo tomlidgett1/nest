@@ -51,29 +51,45 @@ final class GoogleCalendarService {
     /// Called after events are fetched so the merged calendar service can refresh.
     var onEventsFetched: (() -> Void)?
     
+    // MARK: - Supabase Integration
+
+    /// When set, Google access tokens come from Supabase auth for the primary account.
+    /// Additional accounts use per-account Keychain tokens via the legacy OAuth flow.
+    var supabaseService: SupabaseService? {
+        didSet { ensureSupabaseAccount() }
+    }
+
+    /// Whether connected via Supabase (single Google login) or legacy multi-account.
+    var isConnectedViaSupabase: Bool { supabaseService?.isAuthenticated ?? false }
+    
+    /// Whether the given account is the Supabase-managed primary account.
+    func isSupabaseAccount(_ account: GoogleCalendarAccount) -> Bool {
+        account.id == "supabase"
+    }
+
     // MARK: - Private
-    
+
     private var loopbackServer: LoopbackServer?
-    
+
     /// Whether a client ID is configured (user-provided or built-in).
     var hasClientID: Bool { !clientID.isEmpty }
-    
-    /// Whether both client ID and secret are configured.
+
+    /// Whether both client ID and secret are configured (needed for adding additional accounts).
     var hasCredentials: Bool { !clientID.isEmpty && !clientSecret.isEmpty }
-    
+
     /// The effective client ID — either user-provided or built-in.
     private var clientID: String {
-        let stored = KeychainHelper.get(key: Constants.Keychain.googleClientID) ?? ""
-        return stored.isEmpty ? Constants.GoogleCalendar.clientID : stored
+        let stored = KeychainHelper.get(key: "google_client_id") ?? ""
+        return stored.isEmpty ? "" : stored
     }
-    
+
     /// The effective client secret — user-provided via Keychain.
     private var clientSecret: String {
-        KeychainHelper.get(key: Constants.Keychain.googleClientSecret) ?? ""
+        KeychainHelper.get(key: "google_client_secret") ?? ""
     }
-    
+
     // MARK: - Init
-    
+
     init() {
         loadAccounts()
     }
@@ -90,8 +106,34 @@ final class GoogleCalendarService {
     }
     
     private func saveAccounts() {
-        if let data = try? JSONEncoder().encode(accounts) {
+        // Only persist non-Supabase accounts — the Supabase account is managed dynamically
+        let legacyAccounts = accounts.filter { $0.id != "supabase" }
+        if let data = try? JSONEncoder().encode(legacyAccounts) {
             UserDefaults.standard.set(data, forKey: Constants.Defaults.googleCalendarAccounts)
+        }
+    }
+    
+    /// Ensure the Supabase-authenticated Google account is represented in the accounts array.
+    /// Called when `supabaseService` is set or when authentication state may have changed.
+    func ensureSupabaseAccount() {
+        guard let supa = supabaseService, supa.isAuthenticated else {
+            // Remove Supabase account when signed out
+            if accounts.contains(where: { $0.id == "supabase" }) {
+                accounts.removeAll { $0.id == "supabase" }
+            }
+            return
+        }
+        
+        let email = supa.currentUserEmail ?? "user"
+        
+        if let existingIdx = accounts.firstIndex(where: { $0.id == "supabase" }) {
+            // Update email if it changed
+            if accounts[existingIdx].email != email {
+                accounts[existingIdx] = GoogleCalendarAccount(id: "supabase", email: email, addedAt: accounts[existingIdx].addedAt)
+            }
+        } else {
+            // Insert at the beginning so it's the primary/default account
+            accounts.insert(GoogleCalendarAccount(id: "supabase", email: email, addedAt: .now), at: 0)
         }
     }
     
@@ -170,6 +212,8 @@ final class GoogleCalendarService {
     
     /// Disconnect a specific account by ID.
     func disconnect(accountId: String) {
+        // Don't allow disconnecting the Supabase primary account (sign out via Supabase instead)
+        guard accountId != "supabase" else { return }
         guard let account = accounts.first(where: { $0.id == accountId }) else { return }
         
         KeychainHelper.delete(key: account.accessTokenKey)
@@ -297,6 +341,9 @@ final class GoogleCalendarService {
     
     /// Fetch upcoming events from all connected Google Calendar accounts.
     func fetchEvents() async {
+        // Ensure the Supabase account is up to date before fetching
+        await MainActor.run { ensureSupabaseAccount() }
+
         guard !accounts.isEmpty else {
             await MainActor.run {
                 events = []
@@ -304,39 +351,48 @@ final class GoogleCalendarService {
             }
             return
         }
-        
+
         // Fetch from all accounts concurrently
-        var allEvents: [CalendarEvent] = []
-        
-        await withTaskGroup(of: [CalendarEvent].self) { group in
+        let allEvents: [CalendarEvent] = await withTaskGroup(of: [CalendarEvent].self) { group in
             for account in accounts {
                 group.addTask { [self] in
                     await self.fetchEvents(for: account)
                 }
             }
-            
+
+            var collected: [CalendarEvent] = []
             for await accountEvents in group {
-                allEvents.append(contentsOf: accountEvents)
+                collected.append(contentsOf: accountEvents)
             }
+            return collected
         }
-        
+
         await MainActor.run {
             self.events = allEvents
             self.onEventsFetched?()
         }
-        
+
         print("[GoogleCalendar] Fetched \(allEvents.count) total events from \(accounts.count) account(s)")
     }
     
     /// Fetch events for a single account.
     private func fetchEvents(for account: GoogleCalendarAccount) async -> [CalendarEvent] {
-        var accessToken = KeychainHelper.get(key: account.accessTokenKey)
-        
-        // Try refreshing if no access token
-        if accessToken == nil || accessToken?.isEmpty == true {
-            accessToken = await refreshAccessToken(for: account)
+        // Route to the correct token source based on account type
+        var accessToken: String?
+        if account.id == "supabase", let supa = supabaseService {
+            // Supabase-managed primary account
+            accessToken = await supa.getGoogleAccessToken()
+            if accessToken == nil {
+                accessToken = await supa.refreshGoogleAccessToken()
+            }
+        } else {
+            // Legacy account — use per-account Keychain tokens
+            accessToken = KeychainHelper.get(key: account.accessTokenKey)
+            if accessToken == nil || accessToken?.isEmpty == true {
+                accessToken = await refreshAccessToken(for: account)
+            }
         }
-        
+
         guard let token = accessToken, !token.isEmpty else {
             print("[GoogleCalendar] No valid access token for \(account.email)")
             return []
@@ -370,16 +426,25 @@ final class GoogleCalendarService {
                     var retryRequest = URLRequest(url: url)
                     retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
                     let (retryData, _) = try await URLSession.shared.data(for: retryRequest)
-                    return parseEvents(from: retryData)
+                    return tagEvents(parseEvents(from: retryData), account: account)
                 }
                 return []
             }
             
-            return parseEvents(from: data)
+            return tagEvents(parseEvents(from: data), account: account)
             
         } catch {
             print("[GoogleCalendar] Fetch events failed for \(account.email): \(error)")
             return []
+        }
+    }
+    
+    /// Tag parsed events with the account they came from.
+    private func tagEvents(_ events: [CalendarEvent], account: GoogleCalendarAccount) -> [CalendarEvent] {
+        events.map { event in
+            var e = event
+            e.calendarSource = account.email
+            return e
         }
     }
     

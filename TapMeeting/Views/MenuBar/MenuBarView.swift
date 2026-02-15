@@ -340,6 +340,12 @@ private struct EventRow: View {
     let event: CalendarEvent
     @Environment(AppState.self) private var appState
     
+    /// Whether multiple calendar sources exist (show source labels when true).
+    private var hasMultipleSources: Bool {
+        let sources = Set(appState.calendarService.upcomingEvents.compactMap { $0.calendarSource.isEmpty ? nil : $0.calendarSource })
+        return sources.count > 1
+    }
+    
     var body: some View {
         Button {
             appState.startMeeting(title: event.title, calendarEventId: event.id, attendees: event.attendeeNames)
@@ -363,9 +369,23 @@ private struct EventRow: View {
                         .font(.system(size: 13))
                         .foregroundColor(Theme.textPrimary)
                         .lineLimit(1)
-                    Text(event.formattedTime)
-                        .font(.system(size: 10))
-                        .foregroundColor(Theme.textTertiary)
+                    
+                    HStack(spacing: 4) {
+                        Text(event.formattedTime)
+                            .font(.system(size: 10))
+                            .foregroundColor(Theme.textTertiary)
+                        
+                        // Show calendar source when multiple sources exist
+                        if hasMultipleSources, !event.calendarSource.isEmpty {
+                            Text("·")
+                                .font(.system(size: 10))
+                                .foregroundColor(Theme.textQuaternary)
+                            Text(shortCalendarSource(event.calendarSource))
+                                .font(.system(size: 9))
+                                .foregroundColor(Theme.textQuaternary)
+                                .lineLimit(1)
+                        }
+                    }
                 }
                 Spacer()
             }
@@ -381,6 +401,16 @@ private struct EventRow: View {
     }
     private var dayStr: String {
         let f = DateFormatter(); f.dateFormat = "d"; return f.string(from: event.startDate)
+    }
+    
+    /// Shorten calendar source for compact display.
+    private func shortCalendarSource(_ source: String) -> String {
+        if source == "Apple Calendar" { return "Apple" }
+        // For email addresses, show just the user part
+        if source.contains("@") {
+            return String(source.split(separator: "@").first ?? Substring(source))
+        }
+        return source
     }
 }
 

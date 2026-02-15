@@ -11,12 +11,17 @@ struct GmailPreferencesView: View {
         appState.gmailService
     }
     
+    /// Whether any legacy (non-Supabase) accounts exist.
+    private var hasLegacyAccounts: Bool {
+        gmail.accounts.contains { !gmail.isSupabaseAccount($0) }
+    }
+    
     var body: some View {
         VStack(spacing: 16) {
             // Connected Accounts
             SettingsCard(
                 title: "Gmail Accounts",
-                subtitle: "Connect your Gmail to see recent emails inside Tap. Uses the same Google credentials as Calendar."
+                subtitle: "Your primary account is connected via sign-in. You can add more accounts using Google OAuth credentials."
             ) {
                 VStack(spacing: 0) {
                     if gmail.accounts.isEmpty {
@@ -45,19 +50,30 @@ struct GmailPreferencesView: View {
                                     .padding(.vertical, 12)
                             }
                             
-                            SettingsStatusRow(
-                                icon: "envelope.fill",
-                                title: "Gmail",
-                                subtitle: account.email,
-                                status: .connected,
-                                action: { gmail.disconnect(accountId: account.id) },
-                                actionLabel: "Disconnect"
-                            )
+                            if gmail.isSupabaseAccount(account) {
+                                // Primary Supabase account — cannot be disconnected independently
+                                SettingsStatusRow(
+                                    icon: "envelope.fill",
+                                    title: "Gmail (Primary)",
+                                    subtitle: account.email,
+                                    status: .connected
+                                )
+                            } else {
+                                // Additional account — can be disconnected
+                                SettingsStatusRow(
+                                    icon: "envelope.fill",
+                                    title: "Gmail",
+                                    subtitle: account.email,
+                                    status: .connected,
+                                    action: { gmail.disconnect(accountId: account.id) },
+                                    actionLabel: "Disconnect"
+                                )
+                            }
                         }
                     }
                 }
                 
-                // Add account button
+                // Add additional account button
                 Button {
                     gmail.signIn()
                 } label: {
@@ -90,7 +106,7 @@ struct GmailPreferencesView: View {
                         Image(systemName: "info.circle")
                             .font(.system(size: 10))
                             .foregroundColor(Theme.textQuaternary)
-                        Text("Configure Google credentials in the Calendars section first.")
+                        Text("To add another account, configure Google OAuth credentials in the Calendars section first.")
                             .font(.system(size: 11))
                             .foregroundColor(Theme.textTertiary)
                     }

@@ -142,6 +142,10 @@ struct GmailMessage: Identifiable, Equatable {
 struct GmailThread: Identifiable, Equatable {
     let id: String
     var messages: [GmailMessage]
+    /// The account ID this thread was fetched from (used to route API calls to the right token).
+    var accountId: String = ""
+    /// The email address of the account this thread belongs to (for display).
+    var accountEmail: String = ""
     
     /// Subject line — taken from the first message in the thread.
     var subject: String {
@@ -277,8 +281,13 @@ final class GmailService {
     /// Current active mailbox.
     var currentMailbox: Mailbox = .inbox
     
+    /// When set, only threads from this account are shown. `nil` = all accounts.
+    var filterAccountId: String?
+    
     /// Called when new unread inbox threads are detected. Set by AppState to show notifications.
     var onNewEmailsDetected: (([GmailThread]) -> Void)?
+    /// Called whenever a mailbox thread snapshot is refreshed.
+    var onThreadsFetched: ((Mailbox, [GmailThread]) -> Void)?
     
     /// Whether threads are currently being fetched.
     private(set) var isFetching = false
@@ -301,29 +310,45 @@ final class GmailService {
     /// Only does a full fetch when Gmail reports changes since this ID.
     private var latestHistoryIds: [String: String] = [:]  // accountId -> historyId
     
+    // MARK: - Supabase Integration
+
+    /// When set, Google access tokens come from Supabase auth for the primary account.
+    /// Additional accounts use per-account Keychain tokens via the legacy OAuth flow.
+    var supabaseService: SupabaseService? {
+        didSet { ensureSupabaseAccount() }
+    }
+
+    /// Whether connected via Supabase (single Google login) or legacy multi-account.
+    var isConnectedViaSupabase: Bool { supabaseService?.isAuthenticated ?? false }
+    
+    /// Whether the given account is the Supabase-managed primary account.
+    func isSupabaseAccount(_ account: GmailAccount) -> Bool {
+        account.id == "supabase"
+    }
+
     // MARK: - Private
-    
+
     private var loopbackServer: LoopbackServer?
-    
+
     /// Whether a client ID is configured (user-provided or built-in).
     var hasClientID: Bool { !clientID.isEmpty }
-    
-    /// Whether both client ID and secret are configured.
+
+    /// Whether both client ID and secret are configured (needed for adding additional accounts).
     var hasCredentials: Bool { !clientID.isEmpty && !clientSecret.isEmpty }
-    
+
     /// The effective client ID — same credentials as Google Calendar.
     private var clientID: String {
-        let stored = KeychainHelper.get(key: Constants.Keychain.googleClientID) ?? ""
-        return stored.isEmpty ? Constants.GoogleCalendar.clientID : stored
+        let stored = KeychainHelper.get(key: "google_client_id") ?? ""
+        return stored.isEmpty ? "" : stored
     }
-    
+
     /// The effective client secret — user-provided via Keychain.
     private var clientSecret: String {
-        KeychainHelper.get(key: Constants.Keychain.googleClientSecret) ?? ""
+        KeychainHelper.get(key: "google_client_secret") ?? ""
     }
-    
+
     // MARK: - Init
-    
+
     init() {
         loadAccounts()
     }
@@ -338,8 +363,34 @@ final class GmailService {
     }
     
     private func saveAccounts() {
-        if let data = try? JSONEncoder().encode(accounts) {
+        // Only persist non-Supabase accounts — the Supabase account is managed dynamically
+        let legacyAccounts = accounts.filter { $0.id != "supabase" }
+        if let data = try? JSONEncoder().encode(legacyAccounts) {
             UserDefaults.standard.set(data, forKey: Constants.Defaults.gmailAccounts)
+        }
+    }
+    
+    /// Ensure the Supabase-authenticated Google account is represented in the accounts array.
+    /// Called when `supabaseService` is set or when authentication state may have changed.
+    func ensureSupabaseAccount() {
+        guard let supa = supabaseService, supa.isAuthenticated else {
+            // Remove Supabase account when signed out
+            if accounts.contains(where: { $0.id == "supabase" }) {
+                accounts.removeAll { $0.id == "supabase" }
+            }
+            return
+        }
+        
+        let email = supa.currentUserEmail ?? "user"
+        
+        if let existingIdx = accounts.firstIndex(where: { $0.id == "supabase" }) {
+            // Update email if it changed
+            if accounts[existingIdx].email != email {
+                accounts[existingIdx] = GmailAccount(id: "supabase", email: email, addedAt: accounts[existingIdx].addedAt)
+            }
+        } else {
+            // Insert at the beginning so it's the primary/default account
+            accounts.insert(GmailAccount(id: "supabase", email: email, addedAt: .now), at: 0)
         }
     }
     
@@ -384,6 +435,8 @@ final class GmailService {
     }
     
     func disconnect(accountId: String) {
+        // Don't allow disconnecting the Supabase primary account (sign out via Supabase instead)
+        guard accountId != "supabase" else { return }
         guard let account = accounts.first(where: { $0.id == accountId }) else { return }
         
         KeychainHelper.delete(key: account.accessTokenKey)
@@ -490,7 +543,7 @@ final class GmailService {
             
             // 404 means the historyId is too old / invalid — need full refresh
             if statusCode == 404 {
-                await MainActor.run { latestHistoryIds.removeValue(forKey: account.id) }
+                await MainActor.run { _ = latestHistoryIds.removeValue(forKey: account.id) }
                 return true
             }
             
@@ -606,6 +659,9 @@ final class GmailService {
     
     /// Fetch threads for a specific mailbox across all connected accounts.
     func fetchMailbox(_ mailbox: Mailbox) async {
+        // Ensure the Supabase account is up to date before fetching
+        await MainActor.run { ensureSupabaseAccount() }
+
         guard !accounts.isEmpty else {
             await MainActor.run { clearMailbox(mailbox) }
             return
@@ -634,7 +690,7 @@ final class GmailService {
         
         // Detect new unread inbox threads for notifications (only when we had a previous snapshot)
         var newThreadsToNotify: [GmailThread] = []
-        if mailbox == .inbox, let callback = onNewEmailsDetected {
+        if mailbox == .inbox, onNewEmailsDetected != nil {
             let previousIds = await MainActor.run { Set(inboxThreads.map(\.id)) }
             let newUnread = limited.filter { $0.isUnread && !previousIds.contains($0.id) }
             if !previousIds.isEmpty && !newUnread.isEmpty {
@@ -642,6 +698,7 @@ final class GmailService {
             }
         }
         
+        let threadsToNotify = newThreadsToNotify
         await MainActor.run {
             switch mailbox {
             case .inbox: self.inboxThreads = limited
@@ -651,13 +708,20 @@ final class GmailService {
             case .bin: self.trashThreads = limited
             }
             self.isFetching = false
+            self.onThreadsFetched?(mailbox, limited)
             
-            if !newThreadsToNotify.isEmpty, let callback = self.onNewEmailsDetected {
-                callback(newThreadsToNotify)
+            if !threadsToNotify.isEmpty, let callback = self.onNewEmailsDetected {
+                callback(threadsToNotify)
             }
         }
         
         print("[Gmail] Fetched \(limited.count) \(mailbox.displayName) threads")
+    }
+
+    func allThreads() -> [GmailThread] {
+        var merged = inboxThreads + sentThreads + draftThreads + archivedThreads + trashThreads
+        merged.sort { $0.date > $1.date }
+        return merged
     }
     
     /// Fetch the current historyId from each account's profile and store it.
@@ -686,15 +750,18 @@ final class GmailService {
         await fetchMailbox(.inbox)
     }
     
-    /// Get the threads array for the given mailbox.
+    /// Get the threads array for the given mailbox, respecting the current account filter.
     func threadsForMailbox(_ mailbox: Mailbox) -> [GmailThread] {
+        let all: [GmailThread]
         switch mailbox {
-        case .inbox: return inboxThreads
-        case .sent: return sentThreads
-        case .drafts: return draftThreads
-        case .archived: return archivedThreads
-        case .bin: return trashThreads
+        case .inbox: all = inboxThreads
+        case .sent: all = sentThreads
+        case .drafts: all = draftThreads
+        case .archived: all = archivedThreads
+        case .bin: all = trashThreads
         }
+        guard let filterId = filterAccountId else { return all }
+        return all.filter { $0.accountId == filterId }
     }
     
     private func clearMailbox(_ mailbox: Mailbox) {
@@ -746,11 +813,32 @@ final class GmailService {
             }
         }
         
-        return threads
+        // 3. Tag each thread with the account it belongs to
+        return threads.map { thread in
+            var t = thread
+            t.accountId = account.id
+            t.accountEmail = account.email
+            return t
+        }
     }
     
-    /// Get a valid access token for an account, refreshing if needed.
+    /// Get a valid access token for a specific account, refreshing if needed.
+    /// Routes to Supabase tokens for the primary account, or per-account Keychain tokens for others.
     private func validToken(for account: GmailAccount) async -> String? {
+        // Supabase-managed primary account — use Supabase-provided Google token
+        if account.id == "supabase" {
+            guard let supa = supabaseService else { return nil }
+            if let token = await supa.getGoogleAccessToken(), !token.isEmpty {
+                return token
+            }
+            if let token = await supa.refreshGoogleAccessToken(), !token.isEmpty {
+                return token
+            }
+            print("[Gmail] No valid Supabase Google token")
+            return nil
+        }
+
+        // Legacy accounts — use per-account Keychain tokens
         var accessToken = KeychainHelper.get(key: account.accessTokenKey)
         if accessToken == nil || accessToken?.isEmpty == true {
             accessToken = await refreshAccessToken(for: account)
@@ -760,6 +848,26 @@ final class GmailService {
             return nil
         }
         return token
+    }
+    
+    /// Find a thread in any mailbox by its ID.
+    private func findThreadInAnyMailbox(_ threadId: String) -> GmailThread? {
+        for threads in [inboxThreads, sentThreads, draftThreads, archivedThreads, trashThreads] {
+            if let thread = threads.first(where: { $0.id == threadId }) {
+                return thread
+            }
+        }
+        return nil
+    }
+    
+    /// Find the account that owns a specific thread, defaulting to the first account.
+    private func accountForThread(threadId: String) -> GmailAccount? {
+        if let thread = findThreadInAnyMailbox(threadId),
+           !thread.accountId.isEmpty,
+           let account = accounts.first(where: { $0.id == thread.accountId }) {
+            return account
+        }
+        return accounts.first
     }
     
     // MARK: - List Thread IDs
@@ -804,7 +912,7 @@ final class GmailService {
             }
             
             if statusCode != 200 {
-                print("[Gmail] List threads \(labelId) HTTP \(statusCode): \(String(data: data, encoding: .utf8)?.prefix(300) ?? "nil")")
+                print("[Gmail] List threads \(labelId ?? "nil") HTTP \(statusCode): \(String(data: data, encoding: .utf8)?.prefix(300) ?? "nil")")
             }
             
             return parseThreadIds(from: data)
@@ -1032,7 +1140,7 @@ final class GmailService {
     /// Mark all messages in a thread as read.
     /// Per Gmail API: POST /users/me/threads/{id}/modify
     func markThreadAsRead(threadId: String) async {
-        guard let account = accounts.first,
+        guard let account = accountForThread(threadId: threadId),
               let token = await validToken(for: account) else { return }
         
         let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(threadId)/modify")!
@@ -1086,11 +1194,16 @@ final class GmailService {
     
     /// Send an email using the Gmail API.
     /// Per Gmail API: POST /users/me/messages/send with { "raw": "<base64url RFC 2822>", "threadId": ... }
-    func sendEmail(_ draft: EmailDraft) async {
-        guard let account = accounts.first,
+    /// Returns true on success, false on failure.
+    func sendEmail(_ draft: EmailDraft, fromAccountId: String? = nil) async -> Bool {
+        let account: GmailAccount? = {
+            if let id = fromAccountId { return accounts.first { $0.id == id } }
+            return accounts.first
+        }()
+        guard let account,
               let token = await validToken(for: account) else {
             await MainActor.run { sendError = "No connected account." }
-            return
+            return false
         }
         
         await MainActor.run {
@@ -1160,7 +1273,7 @@ final class GmailService {
                 isSending = false
                 sendError = "Failed to encode message."
             }
-            return
+            return false
         }
         
         let base64url = messageData.base64EncodedString()
@@ -1184,15 +1297,24 @@ final class GmailService {
             let (data, response) = try await URLSession.shared.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             
-            if status == 200 {
+            if (200...299).contains(status) {
+                var sentThreadId = draft.threadId
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let responseThreadId = json["threadId"] as? String,
+                   !responseThreadId.isEmpty {
+                    sentThreadId = responseThreadId
+                }
+                
+                if let sentThreadId, !sentThreadId.isEmpty {
+                    await refreshThreadAfterSend(threadId: sentThreadId, token: token)
+                }
+                
                 await MainActor.run {
                     isSending = false
                     sendSuccess = true
                 }
                 print("[Gmail] ✓ Email sent to \(draft.to.joined(separator: ", "))")
-                
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                await MainActor.run { sendSuccess = false }
+                return true
             } else {
                 let errorText = String(data: data, encoding: .utf8) ?? "Unknown error"
                 await MainActor.run {
@@ -1200,6 +1322,7 @@ final class GmailService {
                     sendError = "Send failed (HTTP \(status))"
                 }
                 print("[Gmail] Send failed HTTP \(status): \(errorText.prefix(500))")
+                return false
             }
         } catch {
             await MainActor.run {
@@ -1207,6 +1330,45 @@ final class GmailService {
                 sendError = "Network error: \(error.localizedDescription)"
             }
             print("[Gmail] Send error: \(error)")
+            return false
+        }
+    }
+    
+    /// Refresh and merge the sent thread into local mailbox state so UI updates immediately.
+    private func refreshThreadAfterSend(threadId: String, token: String) async {
+        guard let refreshedThread = await fetchThread(id: threadId, token: token) else { return }
+        
+        await MainActor.run {
+            func replaceThreadIfPresent(_ thread: GmailThread, in threads: inout [GmailThread]) {
+                guard let idx = threads.firstIndex(where: { $0.id == thread.id }) else { return }
+                threads[idx] = thread
+                threads.sort { $0.date > $1.date }
+            }
+            
+            func upsertThread(_ thread: GmailThread, in threads: inout [GmailThread]) {
+                if let idx = threads.firstIndex(where: { $0.id == thread.id }) {
+                    threads[idx] = thread
+                } else {
+                    threads.insert(thread, at: 0)
+                }
+                threads.sort { $0.date > $1.date }
+                if threads.count > 25 {
+                    threads = Array(threads.prefix(25))
+                }
+            }
+            
+            // Sent mailbox should always reflect the newest sent thread immediately.
+            upsertThread(refreshedThread, in: &sentThreads)
+            
+            // Other mailboxes are only updated if this thread is already present there.
+            replaceThreadIfPresent(refreshedThread, in: &inboxThreads)
+            replaceThreadIfPresent(refreshedThread, in: &draftThreads)
+            replaceThreadIfPresent(refreshedThread, in: &archivedThreads)
+            replaceThreadIfPresent(refreshedThread, in: &trashThreads)
+            
+            if selectedThread?.id == refreshedThread.id {
+                selectedThread = refreshedThread
+            }
         }
     }
     
@@ -1214,8 +1376,12 @@ final class GmailService {
     
     /// Download an attachment's raw data from the Gmail API.
     /// Uses `GET /users/me/messages/{messageId}/attachments/{attachmentId}`.
-    func downloadAttachment(_ attachment: GmailAttachment) async -> Data? {
-        guard let account = accounts.first,
+    func downloadAttachment(_ attachment: GmailAttachment, accountId: String? = nil) async -> Data? {
+        let account: GmailAccount? = {
+            if let id = accountId { return accounts.first { $0.id == id } }
+            return accounts.first
+        }()
+        guard let account,
               let token = await validToken(for: account) else { return nil }
         
         let urlString = "\(Constants.Gmail.apiBase)/users/me/messages/\(attachment.messageId)/attachments/\(attachment.attachmentId)"
@@ -1313,7 +1479,7 @@ final class GmailService {
         do {
             try data.write(to: fileURL)
             await MainActor.run {
-                NSWorkspace.shared.open(fileURL)
+                _ = NSWorkspace.shared.open(fileURL)
             }
             print("[Gmail] Attachment opened: \(fileURL.path)")
         } catch {
@@ -1326,7 +1492,7 @@ final class GmailService {
     /// Move an entire thread to the bin.
     /// Per Gmail API: POST /users/me/threads/{id}/trash
     func trashThread(threadId: String) async {
-        guard let account = accounts.first,
+        guard let account = accountForThread(threadId: threadId),
               let token = await validToken(for: account) else { return }
         
         let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(threadId)/trash")!
@@ -1353,7 +1519,7 @@ final class GmailService {
     /// Restore an entire thread from the bin.
     /// Per Gmail API: POST /users/me/threads/{id}/untrash
     func untrashThread(threadId: String) async {
-        guard let account = accounts.first,
+        guard let account = accountForThread(threadId: threadId),
               let token = await validToken(for: account) else { return }
         
         let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(threadId)/untrash")!
@@ -1380,7 +1546,7 @@ final class GmailService {
     /// Archive an entire thread (remove from Inbox).
     /// Per Gmail API: POST /users/me/threads/{id}/modify — remove INBOX label.
     func archiveThread(threadId: String) async {
-        guard let account = accounts.first,
+        guard let account = accountForThread(threadId: threadId),
               let token = await validToken(for: account) else { return }
         
         let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(threadId)/modify")!
@@ -1412,6 +1578,7 @@ final class GmailService {
     /// Fetch recent sent messages for writing style analysis.
     /// Returns individual messages (not threads) from the SENT label.
     func fetchSentMessages(limit: Int = 100) async -> [GmailMessage] {
+        // Use the primary (first) account for style analysis
         guard let account = accounts.first,
               let token = await validToken(for: account) else { return [] }
         
@@ -1509,6 +1676,7 @@ final class GmailService {
     /// Search contacts and "other contacts" (people emailed before) using the Google People API.
     /// Combines both sources and deduplicates by email address.
     func searchContactSuggestions(query: String) async -> [ContactSuggestion] {
+        // Use the primary (first) account for contact search
         guard !query.isEmpty,
               let account = accounts.first,
               let token = await validToken(for: account) else { return [] }

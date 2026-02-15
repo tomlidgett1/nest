@@ -18,16 +18,6 @@ struct SlackView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // Meeting controls if active
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, 20)
-                .padding(.bottom, 6)
-            }
-            
             if slack.isConnected {
                 connectedContent
             } else {

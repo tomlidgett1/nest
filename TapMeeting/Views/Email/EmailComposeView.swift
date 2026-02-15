@@ -2,6 +2,17 @@ import SwiftUI
 import SwiftData
 import UniformTypeIdentifiers
 
+extension Notification.Name {
+    static let emailComposeToolbarAction = Notification.Name("emailComposeToolbarAction")
+}
+
+enum EmailComposeToolbarAction: String {
+    case toggleAIAssist
+    case attach
+    case discard
+    case send
+}
+
 /// Outlook-style inline email compose view with AI assist capability.
 ///
 /// Renders inline within the conversation thread ScrollView.
@@ -48,6 +59,7 @@ struct EmailComposeView: View {
     let quotedMessage: GmailMessage?
     let senderEmail: String
     var onDismiss: (() -> Void)?
+    var onSent: (() -> Void)?
     
     private var gmail: GmailService { appState.gmailService }
     private let aiService = EmailAIService()
@@ -69,7 +81,8 @@ struct EmailComposeView: View {
         mode: Mode,
         quotedMessage: GmailMessage? = nil,
         senderEmail: String = "",
-        onDismiss: (() -> Void)? = nil
+        onDismiss: (() -> Void)? = nil,
+        onSent: (() -> Void)? = nil
     ) {
         self._draft = State(initialValue: draft)
         self._toText = State(initialValue: draft.to.joined(separator: ", "))
@@ -81,6 +94,7 @@ struct EmailComposeView: View {
         self.quotedMessage = quotedMessage
         self.senderEmail = senderEmail
         self.onDismiss = onDismiss
+        self.onSent = onSent
     }
     
     // MARK: - Body
@@ -101,29 +115,7 @@ struct EmailComposeView: View {
                 
                 Spacer()
                 
-                // AI Assist toggle (for new emails)
-                if mode == .newEmail {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.15)) {
-                            aiAssistEnabled.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "sparkles")
-                                .font(.system(size: 10))
-                            Text("AI Assist")
-                                .font(.system(size: 11, weight: .medium))
-                        }
-                        .foregroundColor(aiAssistEnabled ? Theme.olive : Theme.textTertiary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(aiAssistEnabled ? Theme.oliveFaint : Theme.sidebarBackground)
-                        .cornerRadius(6)
-                    }
-                    .buttonStyle(.plain)
-                }
-                
-                if let onDismiss {
+                if let onDismiss, mode != .newEmail {
                     Button {
                         onDismiss()
                     } label: {
@@ -283,91 +275,88 @@ struct EmailComposeView: View {
             }
             
             // — Send / Discard bar —
-            HStack(spacing: 10) {
-                Button {
-                    onDismiss?()
-                } label: {
-                    Text("Discard")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(Theme.textTertiary)
-                        .padding(.horizontal, 14)
+            if mode != .newEmail {
+                HStack(spacing: 10) {
+                    Button {
+                        onDismiss?()
+                    } label: {
+                        Text("Discard")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(Theme.textTertiary)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 6)
+                            .background(Theme.sidebarBackground)
+                            .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    
+                    // Attach file button
+                    Button {
+                        pickFiles()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 11))
+                            Text("Attach")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(Theme.textSecondary)
+                        .padding(.horizontal, 10)
                         .padding(.vertical, 6)
                         .background(Theme.sidebarBackground)
                         .cornerRadius(6)
-                }
-                .buttonStyle(.plain)
-                
-                // Attach file button
-                Button {
-                    pickFiles()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "paperclip")
+                    }
+                    .buttonStyle(.plain)
+                    
+                    Spacer()
+                    
+                    if let error = gmail.sendError {
+                        Text(error)
                             .font(.system(size: 11))
-                        Text("Attach")
-                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(Theme.recording)
                     }
-                    .foregroundColor(Theme.textSecondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Theme.sidebarBackground)
-                    .cornerRadius(6)
-                }
-                .buttonStyle(.plain)
-                
-                Spacer()
-                
-                if let error = gmail.sendError {
-                    Text(error)
-                        .font(.system(size: 11))
-                        .foregroundColor(Theme.recording)
-                }
-                
-                if let aiError {
-                    Text(aiError)
-                        .font(.system(size: 11))
-                        .foregroundColor(Theme.recording)
-                }
-                
-                if gmail.sendSuccess {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 12))
-                        Text("Sent")
-                            .font(.system(size: 12, weight: .medium))
+                    
+                    if let aiError {
+                        Text(aiError)
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.recording)
                     }
-                    .foregroundColor(Theme.olive)
-                }
-                
-                Button {
-                    Task {
-                        await gmail.sendEmail(draft)
-                        if gmail.sendSuccess {
-                            onDismiss?()
+                    
+                    if gmail.sendSuccess {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 12))
+                            Text("Sent")
+                                .font(.system(size: 12, weight: .medium))
                         }
+                        .foregroundColor(Theme.olive)
                     }
-                } label: {
-                    HStack(spacing: 4) {
-                        if gmail.isSending {
-                            ProgressView().controlSize(.mini)
-                        } else {
-                            Image(systemName: "paperplane.fill")
-                                .font(.system(size: 11))
+                    
+                    Button {
+                        sendDraft()
+                    } label: {
+                        HStack(spacing: 4) {
+                            if gmail.isSending {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: "paperplane.fill")
+                                    .font(.system(size: 11))
+                            }
+                            Text("Send")
+                                .font(.system(size: 12, weight: .medium))
                         }
-                        Text("Send")
-                            .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(canSend ? Theme.olive : Theme.textQuaternary)
+                        .cornerRadius(6)
                     }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(canSend ? Theme.olive : Theme.textQuaternary)
-                    .cornerRadius(6)
+                    .buttonStyle(.plain)
+                    .disabled(!canSend || gmail.isSending)
                 }
-                .buttonStyle(.plain)
-                .disabled(!canSend || gmail.isSending)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
             
             // — Quoted original email —
             if let quoted = quotedMessage {
@@ -400,6 +389,37 @@ struct EmailComposeView: View {
             }
         }
         .background(Theme.background)
+        .onReceive(NotificationCenter.default.publisher(for: .emailComposeToolbarAction)) { notification in
+            guard mode == .newEmail else { return }
+            guard let rawAction = notification.userInfo?["action"] as? String,
+                  let action = EmailComposeToolbarAction(rawValue: rawAction) else { return }
+            
+            switch action {
+            case .toggleAIAssist:
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    aiAssistEnabled.toggle()
+                }
+            case .attach:
+                pickFiles()
+            case .discard:
+                onDismiss?()
+            case .send:
+                sendDraft()
+            }
+        }
+    }
+    
+    private func sendDraft() {
+        Task {
+            let wasSent = await gmail.sendEmail(draft)
+            if wasSent {
+                if let onSent {
+                    onSent()
+                } else {
+                    onDismiss?()
+                }
+            }
+        }
     }
     
     // MARK: - Contact Suggestion Dropdown

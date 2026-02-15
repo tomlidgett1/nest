@@ -39,8 +39,54 @@ final class AppState {
     var debugSystemBuffersSent = 0
     var debugMicSuppressedBySystem = 0
     
+    // MARK: - Supabase
+
+    /// Supabase auth and config service. Set after authentication.
+    var supabaseService: SupabaseService? {
+        didSet {
+            googleCalendarService.supabaseService = supabaseService
+            gmailService.supabaseService = supabaseService
+
+            // Trigger initial data fetch when Supabase auth is established
+            if supabaseService?.isAuthenticated == true {
+                configureSemanticSearchStack()
+                Task { await googleCalendarService.fetchEvents() }
+                Task {
+                    await gmailService.fetchMessages()
+                    gmailService.startPolling()
+                }
+            }
+        }
+    }
+
+    /// Sync service for bidirectional SwiftData <-> Supabase. Set after authentication.
+    var syncService: SyncService? {
+        didSet {
+            noteRepository.syncService = syncService
+            todoRepository.syncService = syncService
+        }
+    }
+
+    /// Semantic search retrieval.
+    var semanticSearchService: SemanticSearchService?
+    /// Grounded semantic chatbot.
+    var semanticChatService: SemanticChatService?
+    /// Search ingestion + backfill orchestration.
+    var searchIngestionService: SearchIngestionService?
+    let searchTelemetryService = SearchTelemetryService()
+    let embeddingService = EmbeddingService()
+    let emailEncryptionService = EmailEncryptionService()
+    var searchEvaluationService: SearchEvaluationService?
+
+    var semanticQuery: String = ""
+    var semanticResults: [SearchDocumentCandidate] = []
+    var semanticCitations: [SemanticCitation] = []
+    var semanticAnswer: String = ""
+    var semanticChatMessages: [SemanticChatMessage] = []
+    var isSemanticLoading = false
+
     // MARK: - Services
-    
+
     let audioCaptureManager = AudioCaptureManager()
     let transcriptStore = TranscriptStore()
     let noteEnhancementService = NoteEnhancementService()
@@ -52,8 +98,11 @@ final class AppState {
     let permissionsManager = PermissionsManager()
     let notificationService = NotificationService()
     let noteRepository: NoteRepository
+    let todoRepository: TodoRepository
+    let todoExtractionService = TodoExtractionService()
     let shareService = ShareService()
     let browserMonitorService = BrowserMonitorService()
+    let appleNotesService = AppleNotesService()
     
     /// Meeting HUD — managed directly by AppState.
     private var meetingHUD: MeetingHUDController?
@@ -72,6 +121,12 @@ final class AppState {
     
     /// Observation token for browser monitor changes.
     private var browserMonitorTimer: Timer?
+    
+    /// Background timer that polls for new to-dos every 20 seconds.
+    private var todoPollingTimer: Timer?
+    
+    /// Whether a to-do scan is currently in progress (drives UI indicator).
+    var isTodoScanning = false
     
     /// Single Deepgram connection in multichannel mode.
     /// Receives interleaved stereo PCM where:
@@ -113,6 +168,7 @@ final class AppState {
     
     init(modelContext: ModelContext) {
         self.noteRepository = NoteRepository(modelContext: modelContext)
+        self.todoRepository = TodoRepository(modelContext: modelContext)
         
         let hasOnboarded = UserDefaults.standard.bool(
             forKey: Constants.Defaults.hasCompletedOnboarding
@@ -138,9 +194,27 @@ final class AppState {
             gmailService.startPolling()
         }
         
-        // Show macOS notification when new emails arrive
+        // Show macOS notification when new emails arrive + extract to-dos
         gmailService.onNewEmailsDetected = { [weak self] threads in
             self?.notificationService.sendNewEmailNotification(threads: threads)
+            Task { await self?.extractTodosFromNewEmails(threads: threads) }
+        }
+
+        noteRepository.onNoteChanged = { [weak self] note in
+            guard let self, let ingestion = self.searchIngestionService else { return }
+            Task { try? await ingestion.indexNote(note) }
+        }
+        noteRepository.onTranscriptSaved = { [weak self] note, utterances in
+            guard let self, let ingestion = self.searchIngestionService else { return }
+            Task { try? await ingestion.indexTranscript(for: note, utterances: utterances) }
+        }
+        gmailService.onThreadsFetched = { [weak self] _, threads in
+            guard let self, let ingestion = self.searchIngestionService else { return }
+            Task {
+                for thread in threads {
+                    try? await ingestion.indexEmailThread(thread)
+                }
+            }
         }
         
         // Slack feature paused — uncomment when re-enabling
@@ -154,6 +228,9 @@ final class AppState {
         
         // Start calendar reminder monitoring
         startReminderMonitoring()
+        
+        // Start to-do background polling (every 20s)
+        startTodoPolling()
     }
     
     // MARK: - Meeting Lifecycle
@@ -406,6 +483,9 @@ final class AppState {
                 noteRepository.setEnhancedNotes(enhanced, for: note)
                 noteRepository.updateStatus(note, to: .enhanced)
             }
+            
+            // Auto-extract to-dos from enhanced notes
+            await extractTodosFromNote(note, enhancedNotes: enhanced)
         } catch {
             print("[AppState] Enhancement failed: \(error.localizedDescription)")
         }
@@ -483,6 +563,119 @@ final class AppState {
         }
     }
     
+    // MARK: - To-Do Extraction
+    
+    /// Extract to-dos from enhanced meeting notes and save them.
+    /// Called automatically after note enhancement completes.
+    private func extractTodosFromNote(_ note: Note, enhancedNotes: String) async {
+        let (noteTitle, noteId): (String, UUID) = await MainActor.run {
+            (note.title, note.id)
+        }
+        
+        do {
+            // Delete existing to-dos for this note (handles re-enhancement)
+            await MainActor.run {
+                todoRepository.deleteTodosForSource(sourceId: noteId.uuidString)
+            }
+            
+            let todos = try await todoExtractionService.extractFromMeetingNotes(
+                enhancedNotes: enhancedNotes,
+                noteTitle: noteTitle,
+                noteId: noteId
+            )
+            
+            guard !todos.isEmpty else {
+                print("[AppState] No to-dos extracted from note: \(noteTitle)")
+                return
+            }
+            
+            await MainActor.run {
+                todoRepository.saveTodos(todos)
+                notificationService.sendNewTodoNotification(
+                    count: todos.count,
+                    source: .meeting,
+                    sourceTitle: noteTitle
+                )
+            }
+            print("[AppState] Extracted \(todos.count) to-dos from note: \(noteTitle)")
+        } catch {
+            print("[AppState] To-do extraction from note failed: \(error.localizedDescription)")
+        }
+    }
+    
+    /// Extract to-dos from newly detected email threads.
+    /// Tracks processed message IDs to avoid re-extraction.
+    /// Passes existing to-do titles per thread to the AI for deduplication.
+    private func extractTodosFromNewEmails(threads: [GmailThread]) async {
+        // Load processed message IDs
+        var processedIds = Set(
+            UserDefaults.standard.stringArray(forKey: Constants.Defaults.processedTodoEmailMessageIds) ?? []
+        )
+        
+        // Load excluded senders so we can skip them entirely (saves API calls)
+        let excludedSenders = await MainActor.run { todoRepository.excludedSenders() }
+        
+        // Collect unprocessed messages, including the user's email for each
+        // so the AI can determine if requests are directed at the user or others
+        var unprocessed: [(message: GmailMessage, threadId: String, userEmail: String)] = []
+        for thread in threads {
+            // Use the latest message in the thread
+            guard let latestMessage = thread.messages.last else { continue }
+            let messageId = latestMessage.id
+            guard !processedIds.contains(messageId) else { continue }
+            
+            // Skip emails from excluded senders
+            if excludedSenders.contains(latestMessage.fromEmail.lowercased()) {
+                processedIds.insert(messageId)
+                continue
+            }
+            
+            let email = thread.accountEmail.isEmpty
+                ? (gmailService.connectedEmail ?? "")
+                : thread.accountEmail
+            unprocessed.append((message: latestMessage, threadId: thread.id, userEmail: email))
+            processedIds.insert(messageId)
+        }
+        
+        guard !unprocessed.isEmpty else { return }
+        
+        // Build existing to-do titles per thread for deduplication.
+        // The AI uses these to avoid creating duplicate tasks from quoted
+        // or referenced content in later messages of the same thread.
+        let existingTodosByThread: [String: [String]] = await MainActor.run {
+            var map: [String: [String]] = [:]
+            let threadIds = Set(unprocessed.map(\.threadId))
+            for threadId in threadIds {
+                let existing = todoRepository.fetchTodos(forSourceId: threadId)
+                if !existing.isEmpty {
+                    map[threadId] = existing.map(\.title)
+                }
+            }
+            return map
+        }
+        
+        // Extract to-dos from all unprocessed messages, with dedup context
+        let todos = await todoExtractionService.extractFromEmails(
+            unprocessed,
+            existingTodosByThread: existingTodosByThread
+        )
+        
+        if !todos.isEmpty {
+            await MainActor.run {
+                todoRepository.saveTodos(todos)
+                notificationService.sendNewTodoNotification(
+                    count: todos.count,
+                    source: .email
+                )
+            }
+            print("[AppState] Extracted \(todos.count) to-dos from \(unprocessed.count) new emails")
+        }
+        
+        // Persist processed IDs (keep last 500 to avoid unbounded growth)
+        let trimmed = Array(processedIds.suffix(500))
+        UserDefaults.standard.set(trimmed, forKey: Constants.Defaults.processedTodoEmailMessageIds)
+    }
+    
     // MARK: - AI Connections
     
     /// Find meeting notes related to a given note by content similarity.
@@ -520,18 +713,138 @@ final class AppState {
         UserDefaults.standard.set(true, forKey: Constants.Defaults.hasCompletedOnboarding)
         showOnboarding = false
     }
+
+    @MainActor
+    func runSemanticSearch(_ query: String) async {
+        guard let semanticSearchService else { return }
+        semanticQuery = query
+        isSemanticLoading = true
+        defer { isSemanticLoading = false }
+
+        do {
+            let response = try await semanticSearchService.search(query: query)
+            semanticResults = response.results
+            semanticCitations = response.citations
+        } catch {
+            semanticResults = []
+            semanticCitations = []
+            searchTelemetryService.track(event: "semantic_search_error", fields: ["error": error.localizedDescription])
+        }
+    }
+
+    @MainActor
+    func askSemanticAssistant(_ query: String) async {
+        guard let semanticChatService else { return }
+        let prompt = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+
+        // 1. Append user message and show thinking indicator
+        semanticChatMessages.append(
+            SemanticChatMessage(role: .user, content: prompt)
+        )
+        isSemanticLoading = true
+
+        do {
+            // 2. Retrieval + evidence building happens inside respondStreaming (this is the "thinking" phase)
+            let (citations, stream) = try await semanticChatService.respondStreaming(
+                to: prompt,
+                conversationHistory: semanticChatMessages
+            )
+
+            // 3. Retrieval done — append empty assistant message and stop thinking indicator
+            semanticChatMessages.append(
+                SemanticChatMessage(role: .assistant, content: "", citations: citations)
+            )
+            let messageIndex = semanticChatMessages.count - 1
+            isSemanticLoading = false
+
+            // 4. Stream tokens into the message
+            for await delta in stream {
+                semanticChatMessages[messageIndex].content += delta
+            }
+
+            // 5. Final state update
+            semanticAnswer = semanticChatMessages[messageIndex].content
+            semanticCitations = citations
+
+        } catch {
+            isSemanticLoading = false
+            semanticAnswer = "The assistant could not answer right now."
+            semanticCitations = []
+            semanticChatMessages.append(
+                SemanticChatMessage(role: .assistant, content: semanticAnswer)
+            )
+            searchTelemetryService.track(event: "semantic_chat_error", fields: ["error": error.localizedDescription])
+        }
+    }
+
+    @MainActor
+    func clearSemanticChat() {
+        semanticChatMessages = []
+        semanticAnswer = ""
+        semanticCitations = []
+        semanticResults = []
+        semanticQuery = ""
+    }
+
+    private func configureSemanticSearchStack() {
+        guard let supabase = supabaseService else { return }
+        guard searchIngestionService == nil else { return }
+
+        let semanticSearch = SemanticSearchService(
+            client: supabase.client,
+            embeddingService: embeddingService,
+            telemetry: searchTelemetryService
+        )
+        let semanticChat = SemanticChatService(
+            searchService: semanticSearch,
+            telemetry: searchTelemetryService
+        )
+        let ingestion = SearchIngestionService(
+            client: supabase.client,
+            embeddingService: embeddingService,
+            encryptionService: emailEncryptionService,
+            telemetry: searchTelemetryService
+        )
+
+        self.semanticSearchService = semanticSearch
+        self.semanticChatService = semanticChat
+        self.searchIngestionService = ingestion
+        self.searchEvaluationService = SearchEvaluationService(searchService: semanticSearch, telemetry: searchTelemetryService)
+    }
+
+    func runSemanticBackfillIfNeeded() async {
+        guard let ingestion = searchIngestionService else { return }
+        await gmailService.fetchMailbox(.inbox)
+        await gmailService.fetchMailbox(.sent)
+        calendarService.fetchUpcomingEvents()
+        let notes = noteRepository.fetchAllNotes()
+        let threads = gmailService.allThreads()
+        let events = calendarService.upcomingEvents
+        await ingestion.runMandatoryBackfill(notes: notes, threads: threads, calendarEvents: events)
+    }
+
+    func runSemanticEvaluationSuite() async -> [SearchEvaluationResult] {
+        guard let evaluator = searchEvaluationService else { return [] }
+        let suite = [
+            SearchEvaluationCase(query: "What decisions were made this week?", minimumResults: 3, minimumCitations: 2),
+            SearchEvaluationCase(query: "Find my latest email follow-up commitments", minimumResults: 2, minimumCitations: 2),
+            SearchEvaluationCase(query: "Which meetings mention calendar launches?", minimumResults: 2, minimumCitations: 2)
+        ]
+        return await evaluator.run(cases: suite)
+    }
     
     // MARK: - Audio → Transcription Pipeline
     
     /// Create a single multichannel Deepgram service and wire result callbacks.
     /// Must happen BEFORE audio starts flowing so the optional chain doesn't drop data.
     private func setupTranscriptionServices() {
-        guard let apiKey = KeychainHelper.get(key: Constants.Keychain.deepgramAPIKey),
+        guard let apiKey = supabaseService?.deepgramAPIKey ?? KeychainHelper.get(key: "deepgram_api_key"),
               !apiKey.isEmpty else {
-            print("[AppState] ⚠ No Deepgram API key — transcription disabled. Set one in Preferences → API Keys.")
+            print("[AppState] ⚠ No Deepgram API key — transcription disabled.")
             return
         }
-        
+
         print("[AppState] Creating Deepgram multichannel service (key: \(apiKey.prefix(8))…)")
         
         let service = DeepgramService(source: .mic, multichannel: true)
@@ -906,6 +1219,94 @@ final class AppState {
         
         meetingReminderHUD = controller
         controller.show(event: event)
+    }
+    
+    // MARK: - To-Do Background Polling
+    
+    /// Start a 20-second timer that scans for unprocessed email threads
+    /// and extracts to-dos from any that haven't been analysed yet.
+    private func startTodoPolling() {
+        todoPollingTimer?.invalidate()
+        let timer = Timer(timeInterval: 20.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { await self.todoPollingTick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        todoPollingTimer = timer
+        print("[AppState] To-do polling started (every 20s)")
+    }
+    
+    /// Single tick of the to-do polling cycle.
+    /// Checks inbox threads for any unprocessed messages and extracts to-dos.
+    private func todoPollingTick() async {
+        // Don't scan if Gmail isn't connected
+        guard gmailService.isConnected else { return }
+        
+        await MainActor.run { isTodoScanning = true }
+        defer { Task { @MainActor in isTodoScanning = false } }
+        
+        // Load processed message IDs
+        let processedIds = Set(
+            UserDefaults.standard.stringArray(forKey: Constants.Defaults.processedTodoEmailMessageIds) ?? []
+        )
+        
+        // Check inbox threads for any unprocessed messages
+        let inboxThreads = await MainActor.run { gmailService.inboxThreads }
+        let defaultEmail = await MainActor.run { gmailService.connectedEmail ?? "" }
+        let excludedSenders = await MainActor.run { todoRepository.excludedSenders() }
+        
+        var unprocessed: [(message: GmailMessage, threadId: String, userEmail: String)] = []
+        var newProcessedIds = processedIds
+        
+        for thread in inboxThreads {
+            guard let latestMessage = thread.messages.last else { continue }
+            guard !processedIds.contains(latestMessage.id) else { continue }
+            
+            // Skip emails from excluded senders
+            if excludedSenders.contains(latestMessage.fromEmail.lowercased()) {
+                newProcessedIds.insert(latestMessage.id)
+                continue
+            }
+            
+            let email = thread.accountEmail.isEmpty ? defaultEmail : thread.accountEmail
+            unprocessed.append((message: latestMessage, threadId: thread.id, userEmail: email))
+            newProcessedIds.insert(latestMessage.id)
+        }
+        
+        guard !unprocessed.isEmpty else { return }
+        
+        // Build existing to-do titles per thread for deduplication
+        let existingTodosByThread: [String: [String]] = await MainActor.run {
+            var map: [String: [String]] = [:]
+            let threadIds = Set(unprocessed.map(\.threadId))
+            for threadId in threadIds {
+                let existing = todoRepository.fetchTodos(forSourceId: threadId)
+                if !existing.isEmpty {
+                    map[threadId] = existing.map(\.title)
+                }
+            }
+            return map
+        }
+        
+        let todos = await todoExtractionService.extractFromEmails(
+            unprocessed,
+            existingTodosByThread: existingTodosByThread
+        )
+        
+        if !todos.isEmpty {
+            await MainActor.run {
+                todoRepository.saveTodos(todos)
+                notificationService.sendNewTodoNotification(
+                    count: todos.count,
+                    source: .email
+                )
+            }
+            print("[AppState] [Poll] Extracted \(todos.count) to-dos from \(unprocessed.count) emails")
+        }
+        
+        // Persist processed IDs
+        let trimmed = Array(newProcessedIds.suffix(500))
+        UserDefaults.standard.set(trimmed, forKey: Constants.Defaults.processedTodoEmailMessageIds)
     }
 }
 

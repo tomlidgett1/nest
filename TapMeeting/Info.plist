@@ -6,6 +6,14 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
+			<string>Nest Supabase OAuth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>nest</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
 			<string>Tap Slack OAuth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>

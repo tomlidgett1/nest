@@ -182,11 +182,11 @@ struct NoteDetailView: View {
                                         }
                                     }
                                     Divider()
-                                    // Extract action items to standalone note
-                                    if let enhanced = note.enhancedNotes, !enhanced.isEmpty {
-                                        Button("Extract Action Items to Note") {
-                                            extractActionItems(from: enhanced)
-                                        }
+                                    // Action items are now auto-extracted to the To-Dos tab
+                                    if note.enhancedNotes != nil {
+                                        Text("Action items are added to To-Dos automatically")
+                                            .font(.system(size: 12))
+                                            .foregroundColor(.secondary)
                                     }
                                     Divider()
                                     Button("Delete Note", role: .destructive) {

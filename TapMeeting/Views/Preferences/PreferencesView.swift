@@ -261,15 +261,6 @@ struct SettingsContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            if appState.isMeetingActive {
-                HStack(spacing: 10) {
-                    Spacer()
-                    MeetingControlButtons()
-                }
-                .padding(.horizontal, Theme.Spacing.contentPadding)
-                .padding(.bottom, 8)
-            }
-            
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     Text("Settings")

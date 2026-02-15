@@ -25,6 +25,14 @@ struct EmailDetailView: View {
     private var selectedThreadId: String? { gmail.selectedThread?.id }
     private var selectedMessageId: String? { gmail.selectedMessageId }
     
+    /// The sender email for the current thread — uses the thread's account when available.
+    private var senderEmailForCurrentThread: String {
+        if let thread = gmail.selectedThread, !thread.accountEmail.isEmpty {
+            return thread.accountEmail
+        }
+        return gmail.connectedEmail ?? ""
+    }
+    
     private let aiService = EmailAIService()
     
     var body: some View {
@@ -573,7 +581,7 @@ struct EmailDetailView: View {
             draft: draft,
             mode: mode,
             quotedMessage: quotedMessage,
-            senderEmail: gmail.connectedEmail ?? "",
+            senderEmail: senderEmailForCurrentThread,
             onDismiss: onDismiss
         )
     }
@@ -591,7 +599,7 @@ struct EmailDetailView: View {
     }
     
     private func replyAllDraft(for message: GmailMessage) -> EmailDraft {
-        let myEmail = gmail.connectedEmail?.lowercased() ?? ""
+        let myEmail = senderEmailForCurrentThread.lowercased()
         
         var draft = EmailDraft()
         draft.to = [message.fromEmail]
