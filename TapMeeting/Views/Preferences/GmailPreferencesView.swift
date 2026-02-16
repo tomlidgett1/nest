@@ -1,8 +1,7 @@
 import SwiftUI
 
 /// Preferences section for managing Gmail connections.
-/// Supports multiple Gmail accounts. Reuses the same Google Cloud credentials
-/// configured in the Calendar section.
+/// Primary account is Supabase-managed; additional accounts use loopback OAuth.
 struct GmailPreferencesView: View {
     
     @Environment(AppState.self) private var appState
@@ -11,17 +10,12 @@ struct GmailPreferencesView: View {
         appState.gmailService
     }
     
-    /// Whether any legacy (non-Supabase) accounts exist.
-    private var hasLegacyAccounts: Bool {
-        gmail.accounts.contains { !gmail.isSupabaseAccount($0) }
-    }
-    
     var body: some View {
         VStack(spacing: 16) {
             // Connected Accounts
             SettingsCard(
                 title: "Gmail Accounts",
-                subtitle: "Your primary account is connected via sign-in. You can add more accounts using Google OAuth credentials."
+                subtitle: "Your primary account is connected via Supabase. You can add additional Gmail accounts below."
             ) {
                 VStack(spacing: 0) {
                     if gmail.accounts.isEmpty {
@@ -51,7 +45,6 @@ struct GmailPreferencesView: View {
                             }
                             
                             if gmail.isSupabaseAccount(account) {
-                                // Primary Supabase account — cannot be disconnected independently
                                 SettingsStatusRow(
                                     icon: "envelope.fill",
                                     title: "Gmail (Primary)",
@@ -59,57 +52,67 @@ struct GmailPreferencesView: View {
                                     status: .connected
                                 )
                             } else {
-                                // Additional account — can be disconnected
-                                SettingsStatusRow(
-                                    icon: "envelope.fill",
-                                    title: "Gmail",
-                                    subtitle: account.email,
-                                    status: .connected,
-                                    action: { gmail.disconnect(accountId: account.id) },
-                                    actionLabel: "Disconnect"
-                                )
+                                HStack(spacing: 12) {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(Theme.sidebarSelection)
+                                            .frame(width: 32, height: 32)
+                                        Image(systemName: "envelope")
+                                            .font(.system(size: 13))
+                                            .foregroundColor(Theme.textSecondary)
+                                    }
+                                    
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(account.email)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundColor(Theme.textPrimary)
+                                        Text("Additional account")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(Theme.textTertiary)
+                                    }
+                                    
+                                    Spacer()
+                                    
+                                    Button {
+                                        gmail.disconnect(accountId: account.id)
+                                    } label: {
+                                        Text("Remove")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundColor(Theme.recording)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
                             }
                         }
                     }
                 }
                 
-                // Add additional account button
+                // Add Another Account button
                 Button {
-                    gmail.signIn()
+                    gmail.signInAdditionalAccount()
                 } label: {
                     HStack(spacing: 6) {
-                        if gmail.isAuthenticating {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Connecting…")
-                        } else {
-                            Image(systemName: "envelope.badge.person.crop")
-                                .font(.system(size: 12))
-                            Text(gmail.accounts.isEmpty
-                                 ? "Connect Gmail"
-                                 : "Add Another Gmail Account")
-                        }
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: 12))
+                        Text("Add Another Google Account")
+                            .font(.system(size: 12, weight: .medium))
                     }
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 9)
-                    .background(Theme.olive)
-                    .cornerRadius(8)
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 12)
+                    .background(Theme.sidebarSelection)
+                    .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
-                .disabled(gmail.isAuthenticating || !gmail.hasCredentials)
-                .padding(.top, 4)
+                .disabled(gmail.isAuthenticating)
                 
-                if !gmail.hasCredentials {
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle")
-                            .font(.system(size: 10))
-                            .foregroundColor(Theme.textQuaternary)
-                        Text("To add another account, configure Google OAuth credentials in the Calendars section first.")
-                            .font(.system(size: 11))
-                            .foregroundColor(Theme.textTertiary)
-                    }
+                HStack(spacing: 6) {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 10))
+                        .foregroundColor(Theme.textQuaternary)
+                    Text("To reconnect your primary account, sign out and sign back in from the Account section.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.textTertiary)
                 }
                 
                 if let error = gmail.authError {

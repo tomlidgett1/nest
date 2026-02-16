@@ -189,16 +189,13 @@ private struct IdleMenuContent: View {
 private struct GoogleCalendarConnectCard: View {
     
     @Environment(AppState.self) private var appState
-    @State private var clientID: String = ""
-    @State private var clientSecret: String = ""
-    @State private var showSetup = false
     
     private var googleCal: GoogleCalendarService {
         appState.googleCalendarService
     }
     
-    private var needsCredentials: Bool {
-        !googleCal.hasCredentials
+    private var gmail: GmailService {
+        appState.gmailService
     }
     
     var body: some View {
@@ -221,99 +218,30 @@ private struct GoogleCalendarConnectCard: View {
                 Spacer()
             }
             
-            if needsCredentials || showSetup {
-                // Credentials setup
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Client ID")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Theme.textSecondary)
-                    
-                    TextField("xxxxx.apps.googleusercontent.com", text: $clientID)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 10, design: .monospaced))
-                    
-                    Text("Client Secret")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Theme.textSecondary)
-                        .padding(.top, 2)
-                    
-                    SecureField("GOCSPX-xxxxx", text: $clientSecret)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 10, design: .monospaced))
-                    
-                    Button {
-                        NSWorkspace.shared.open(URL(string: "https://console.cloud.google.com/apis/credentials")!)
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "questionmark.circle")
-                                .font(.system(size: 9))
-                            Text("Get credentials from Google Cloud Console")
-                                .font(.system(size: 9))
-                        }
-                        .foregroundColor(Theme.olive)
-                    }
-                    .buttonStyle(.plain)
-                    
-                    let idTrimmed = clientID.trimmingCharacters(in: .whitespaces)
-                    let secretTrimmed = clientSecret.trimmingCharacters(in: .whitespaces)
-                    
-                    if !idTrimmed.isEmpty && !secretTrimmed.isEmpty {
-                        Button {
-                            googleCal.setClientID(idTrimmed)
-                            googleCal.setClientSecret(secretTrimmed)
-                            showSetup = false
-                            // Auto-trigger sign in after saving
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                                googleCal.signIn()
-                            }
-                        } label: {
-                            Text("Save & Connect")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 5)
-                                .background(Theme.olive)
-                                .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
+            // Connect additional Google account (Gmail + Calendar combined)
+            Button {
+                gmail.signInAdditionalAccount()
+            } label: {
+                HStack(spacing: 5) {
+                    if gmail.isAuthenticating {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Connecting…")
+                    } else {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 10))
+                        Text("Add Google Account")
                     }
                 }
-            } else {
-                // Connect button (client ID already configured)
-                Button {
-                    googleCal.signIn()
-                } label: {
-                    HStack(spacing: 5) {
-                        if googleCal.isAuthenticating {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Connecting…")
-                        } else {
-                            Image(systemName: "arrow.right.circle.fill")
-                                .font(.system(size: 10))
-                            Text("Connect")
-                        }
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 5)
-                    .background(Theme.olive)
-                    .cornerRadius(6)
-                }
-                .buttonStyle(.plain)
-                .disabled(googleCal.isAuthenticating)
-                
-                // Link to reconfigure
-                Button {
-                    showSetup = true
-                } label: {
-                    Text("Change Client ID")
-                        .font(.system(size: 9))
-                        .foregroundColor(Theme.textQuaternary)
-                }
-                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(Theme.olive)
+                .cornerRadius(6)
             }
+            .buttonStyle(.plain)
+            .disabled(gmail.isAuthenticating)
             
             if let error = googleCal.authError {
                 Text(error)
@@ -327,10 +255,6 @@ private struct GoogleCalendarConnectCard: View {
         .cornerRadius(8)
         .padding(.horizontal, 10)
         .padding(.top, 6)
-        .onAppear {
-            clientID = KeychainHelper.get(key: Constants.Keychain.googleClientID) ?? ""
-            clientSecret = KeychainHelper.get(key: Constants.Keychain.googleClientSecret) ?? ""
-        }
     }
 }
 

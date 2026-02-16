@@ -111,6 +111,7 @@ final class NoteEnhancementService {
     What NOT to Do:
 
     - Do not use # or ### — only ## for all section headers.
+    - Do not provide any Next Steps or action items if there are none.
     - Do not use * for bullet points — only use - (hyphen).
     - Do not use bold (**) or italic formatting within bullets.
     - Do not write introductory summaries or conclusions.

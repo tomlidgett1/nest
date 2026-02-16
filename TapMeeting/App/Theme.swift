@@ -50,6 +50,17 @@ enum Theme {
     
     /// Recording red — slightly warm.
     static let recording = Color(red: 0.85, green: 0.25, blue: 0.20)
+
+    // MARK: - Calendar
+
+    /// Subtle grid line for calendar hour rows.
+    static let calendarGridLine = divider.opacity(0.5)
+    /// Today column highlight.
+    static let calendarTodayHighlight = Color(red: 0.64, green: 0.60, blue: 0.40).opacity(0.08)
+    /// Current time indicator line (red).
+    static let calendarCurrentTime = Color(red: 0.85, green: 0.25, blue: 0.20)
+    /// Weekend column background tint.
+    static let calendarWeekend = Color(red: 0.97, green: 0.96, blue: 0.94).opacity(0.5)
     
     // MARK: - Tag Colours
     

@@ -113,10 +113,6 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
             }
         }
         
-        if let attachment = appIconAttachment() {
-            content.attachments = [attachment]
-        }
-        
         let request = UNNotificationRequest(
             identifier: "new-todo-\(UUID().uuidString)",
             content: content,

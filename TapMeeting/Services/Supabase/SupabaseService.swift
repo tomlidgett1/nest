@@ -41,6 +41,11 @@ final class SupabaseService: NSObject {
     /// Shared API keys fetched from the `app_config` table.
     private(set) var appConfig: [String: String] = [:]
 
+    /// Lightweight telemetry counters for Google token refresh health.
+    private var googleRefreshAttempts = 0
+    private var googleRefreshSuccesses = 0
+    private var googleRefreshFailures = 0
+
     // MARK: - Supabase Client
 
     let client: SupabaseClient
@@ -89,6 +94,7 @@ final class SupabaseService: NSObject {
                 provider: .google,
                 redirectTo: URL(string: Constants.Supabase.redirectURL),
                 scopes: Constants.Supabase.googleScopes,
+                queryParams: Constants.Supabase.googleOAuthQueryParams,
                 launchFlow: { url in
                     try await self.openOAuthURL(url)
                 }
@@ -131,10 +137,12 @@ final class SupabaseService: NSObject {
             print("[SupabaseService] Sign out error: \(error.localizedDescription)")
         }
 
-        // Clear cached Google tokens
+        // Clear cached Google user tokens (NOT app credentials — those come from app_config)
         KeychainHelper.delete(key: Self.googleTokenKey)
         KeychainHelper.delete(key: Self.googleRefreshTokenKey)
         KeychainHelper.delete(key: Self.googleTokenExpiryKey)
+        KeychainHelper.delete(key: Constants.Keychain.googleAccessToken)
+        KeychainHelper.delete(key: Constants.Keychain.googleRefreshToken)
 
         await MainActor.run {
             isAuthenticated = false
@@ -156,11 +164,11 @@ final class SupabaseService: NSObject {
     /// Stores the Unix timestamp (seconds) when the cached Google token expires.
     private static let googleTokenExpiryKey = "google_provider_token_expiry"
 
-    /// Returns the Google OAuth access token if it is still valid.
+    /// Returns the Google OAuth access token if available.
     ///
     /// Priority:
     /// 1. Live Supabase session `providerToken` (set right after sign-in)
-    /// 2. Keychain-cached token **only** if it hasn't expired
+    /// 2. Keychain-cached token if not definitively expired
     /// 3. `nil` — caller should invoke `refreshGoogleAccessToken()`.
     func getGoogleAccessToken() async -> String? {
         // 1. Try the live session (available right after sign-in / OAuth callback)
@@ -174,13 +182,16 @@ final class SupabaseService: NSObject {
             print("[SupabaseService] Failed to get session: \(error.localizedDescription)")
         }
 
-        // 2. Keychain-cached token — only return if not expired
-        if let cached = KeychainHelper.get(key: Self.googleTokenKey), !cached.isEmpty,
-           !isGoogleTokenExpired() {
-            return cached
+        // 2. Keychain-cached token — return it unless we *know* it's expired.
+        //    If no expiry is stored (legacy cache), optimistically return the token
+        //    and let the API reject it with 401 if it's actually expired.
+        if let cached = KeychainHelper.get(key: Self.googleTokenKey), !cached.isEmpty {
+            if !isGoogleTokenDefinitelyExpired() {
+                return cached
+            }
+            print("[SupabaseService] Cached Google token is expired")
         }
 
-        // Expired or missing — caller must refresh
         return nil
     }
 
@@ -189,125 +200,211 @@ final class SupabaseService: NSObject {
     /// Priority:
     /// 1. Supabase `refreshSession()` — sometimes returns a new provider token
     /// 2. Direct Google OAuth2 token refresh using the cached refresh token
-    /// 3. `nil` — no way to obtain a valid token
+    /// 3. Cached token as last resort (might still work; API will 401 if not)
+    /// 4. `nil` — no way to obtain a valid token
     func refreshGoogleAccessToken() async -> String? {
-        // 1. Try Supabase session refresh (occasionally returns a provider token)
+        // 1. Try Supabase session refresh (updates Supabase auth state)
         do {
             let session = try await client.auth.refreshSession()
             await applySession(session)
             if let token = session.providerToken, !token.isEmpty {
                 cacheGoogleTokens(from: session)
-                print("[SupabaseService] Got Google token from Supabase session refresh")
+                logGoogleRefreshEvent("provider_token_from_session_refresh")
                 return token
             }
         } catch {
             print("[SupabaseService] Supabase session refresh failed: \(error.localizedDescription)")
         }
 
-        // 2. Direct Google token refresh using the stored refresh token
-        if let token = await refreshGoogleTokenDirectly() {
+        // 2. Refresh via server-side token broker (production path)
+        if let token = await refreshGoogleTokenViaBrokerWithRetry() {
             return token
         }
+        // 3. Use cached token only when it is not known-expired.
+        if let cached = KeychainHelper.get(key: Self.googleTokenKey), !cached.isEmpty {
+            if !isGoogleTokenDefinitelyExpired() {
+                logGoogleRefreshEvent("cached_token_fallback")
+                return cached
+            }
+            print("[SupabaseService] Skipping cached token fallback because token is expired")
+        }
 
-        print("[SupabaseService] Unable to refresh Google access token")
+        logGoogleRefreshEvent("refresh_failed_no_token")
         return nil
-    }
-
-    // MARK: - Direct Google Token Refresh
-
-    /// Refresh the Google access token by POSTing the refresh token directly
-    /// to Google's OAuth2 endpoint. This is needed because Supabase's
-    /// `refreshSession()` only refreshes the Supabase JWT, not the Google token.
-    ///
-    /// Requires `google_client_id` (and optionally `google_client_secret`) in
-    /// Keychain — these can come from the `app_config` table or user preferences.
-    private func refreshGoogleTokenDirectly() async -> String? {
-        guard let refreshToken = KeychainHelper.get(key: Self.googleRefreshTokenKey),
-              !refreshToken.isEmpty else {
-            print("[SupabaseService] No Google refresh token available")
-            return nil
-        }
-
-        guard let clientId = KeychainHelper.get(key: "google_client_id"),
-              !clientId.isEmpty else {
-            print("[SupabaseService] No Google client ID — cannot refresh directly")
-            return nil
-        }
-
-        let clientSecret = KeychainHelper.get(key: "google_client_secret") ?? ""
-
-        // Build the token request
-        let params: [(String, String)] = [
-            ("client_id", clientId),
-            ("client_secret", clientSecret),
-            ("refresh_token", refreshToken),
-            ("grant_type", "refresh_token")
-        ]
-        let bodyString = params
-            .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1)" }
-            .joined(separator: "&")
-
-        guard let url = URL(string: "https://oauth2.googleapis.com/token") else { return nil }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.httpBody = bodyString.data(using: .utf8)
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-
-            guard status == 200 else {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                print("[SupabaseService] Direct Google refresh failed: HTTP \(status) — \(body)")
-                return nil
-            }
-
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accessToken = json["access_token"] as? String,
-                  !accessToken.isEmpty else {
-                print("[SupabaseService] Direct Google refresh: unexpected response format")
-                return nil
-            }
-
-            // Cache the new token + expiry
-            let expiresIn = json["expires_in"] as? Int ?? 3600
-            KeychainHelper.set(key: Self.googleTokenKey, value: accessToken)
-            let expiryTimestamp = Int(Date().timeIntervalSince1970) + expiresIn - 60 // 60s safety margin
-            KeychainHelper.set(key: Self.googleTokenExpiryKey, value: String(expiryTimestamp))
-
-            print("[SupabaseService] Refreshed Google token directly (expires in \(expiresIn)s)")
-            return accessToken
-        } catch {
-            print("[SupabaseService] Direct Google refresh error: \(error.localizedDescription)")
-            return nil
-        }
     }
 
     // MARK: - Token Helpers
 
-    /// Whether the cached Google access token has expired (or expiry is unknown).
-    private func isGoogleTokenExpired() -> Bool {
+    /// Returns `true` only when we **know** the token is expired (stored expiry has passed).
+    /// If no expiry is stored (legacy token), returns `false` — we optimistically try it
+    /// and let the API reject with 401 if it's actually expired.
+    private func isGoogleTokenDefinitelyExpired() -> Bool {
         guard let expiryString = KeychainHelper.get(key: Self.googleTokenExpiryKey),
               let expiry = Int(expiryString) else {
-            // No expiry stored — treat as expired so we refresh
-            return true
+            // No expiry stored — don't assume expired; let the API decide
+            return false
         }
         return Int(Date().timeIntervalSince1970) >= expiry
+    }
+
+    /// Returns the best currently valid Google token, refreshing if needed.
+    func validGoogleAccessToken() async -> String? {
+        if let token = await getGoogleAccessToken(), !token.isEmpty, !isGoogleTokenDefinitelyExpired() {
+            return token
+        }
+        return await refreshGoogleAccessToken()
+    }
+
+    /// Refresh via Supabase Edge Function with bounded retries and exponential backoff.
+    private func refreshGoogleTokenViaBrokerWithRetry() async -> String? {
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            googleRefreshAttempts += 1
+            if let token = await refreshGoogleTokenViaBroker() {
+                googleRefreshSuccesses += 1
+                logGoogleRefreshEvent("broker_refresh_success_attempt_\(attempt)")
+                return token
+            }
+
+            if attempt < maxAttempts {
+                let backoffSeconds = pow(2.0, Double(attempt - 1)) * 0.5
+                let jitterSeconds = Double(Int.random(in: 0...250)) / 1000.0
+                try? await Task.sleep(nanoseconds: UInt64((backoffSeconds + jitterSeconds) * 1_000_000_000))
+            }
+        }
+        googleRefreshFailures += 1
+        logGoogleRefreshEvent("broker_refresh_failed")
+        return nil
+    }
+
+    /// Request a fresh Google access token from the server-side broker.
+    private func refreshGoogleTokenViaBroker() async -> String? {
+        guard let functionURL = URL(string: Constants.Supabase.googleTokenBrokerPath) else {
+            print("[SupabaseService] Invalid token broker URL")
+            return nil
+        }
+
+        do {
+            guard let supabaseJWT = await supabaseAccessTokenForFunctionCall() else {
+                print("[SupabaseService] Cannot call token broker: no valid Supabase JWT")
+                return nil
+            }
+            var request = URLRequest(url: functionURL)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(Constants.Supabase.anonKey, forHTTPHeaderField: "apikey")
+            request.setValue("Bearer \(supabaseJWT)", forHTTPHeaderField: "Authorization")
+            request.httpBody = "{}".data(using: .utf8)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                let body = String(data: data, encoding: .utf8) ?? ""
+                print("[SupabaseService] Broker refresh failed: HTTP \(status) — \(body)")
+                return nil
+            }
+
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let accessToken = json["access_token"] as? String,
+                  !accessToken.isEmpty else {
+                print("[SupabaseService] Broker refresh response missing access_token")
+                return nil
+            }
+
+            let expiresIn = json["expires_in"] as? Int ?? 3600
+            cacheGoogleAccessToken(accessToken, expiresInSeconds: expiresIn)
+            return accessToken
+        } catch {
+            print("[SupabaseService] Broker refresh error: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Returns a Supabase access token suitable for Edge Function auth.
+    /// Prefers a freshly refreshed session; falls back to an unexpired current token.
+    private func supabaseAccessTokenForFunctionCall() async -> String? {
+        do {
+            let refreshed = try await client.auth.refreshSession()
+            await applySession(refreshed)
+            return refreshed.accessToken
+        } catch {
+            print("[SupabaseService] refreshSession before broker call failed: \(error.localizedDescription)")
+        }
+
+        do {
+            let session = try await client.auth.session
+            if !isJWTDefinitelyExpired(session.accessToken, leewaySeconds: 30) {
+                return session.accessToken
+            }
+            print("[SupabaseService] Current Supabase JWT is expired")
+            return nil
+        } catch {
+            print("[SupabaseService] No current Supabase session for broker call: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Best-effort JWT expiry check based on `exp` claim.
+    private func isJWTDefinitelyExpired(_ jwt: String, leewaySeconds: Int = 0) -> Bool {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return true }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = payload.count % 4
+        if remainder > 0 {
+            payload += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: payload),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = json["exp"] as? TimeInterval else {
+            return true
+        }
+        let now = Date().timeIntervalSince1970 + TimeInterval(leewaySeconds)
+        return now >= exp
+    }
+
+    /// Cache an access token with pre-emptive refresh window and jitter.
+    private func cacheGoogleAccessToken(_ token: String, expiresInSeconds: Int) {
+        KeychainHelper.set(key: Self.googleTokenKey, value: token)
+
+        // Refresh slightly before expiry with jitter to avoid refresh spikes at scale.
+        let jitterSeconds = Int.random(in: 0...120)
+        let safetyBuffer = 300 + jitterSeconds
+        let effectiveTTL = max(60, expiresInSeconds - safetyBuffer)
+        let expiryTimestamp = Int(Date().timeIntervalSince1970) + effectiveTTL
+        KeychainHelper.set(key: Self.googleTokenExpiryKey, value: String(expiryTimestamp))
     }
 
     /// Persist provider tokens in Keychain so they survive session restores.
     private func cacheGoogleTokens(from session: Session) {
         if let token = session.providerToken, !token.isEmpty {
-            KeychainHelper.set(key: Self.googleTokenKey, value: token)
-            // Google access tokens are valid for 3600s; store expiry with 60s safety margin
-            let expiryTimestamp = Int(Date().timeIntervalSince1970) + 3540
-            KeychainHelper.set(key: Self.googleTokenExpiryKey, value: String(expiryTimestamp))
+            cacheGoogleAccessToken(token, expiresInSeconds: 3600)
         }
         if let refresh = session.providerRefreshToken, !refresh.isEmpty {
             KeychainHelper.set(key: Self.googleRefreshTokenKey, value: refresh)
+            Task { await persistGoogleRefreshToken(refresh, userId: session.user.id) }
         }
+    }
+
+    /// Persist the Google provider refresh token in Supabase for durable server-side refresh.
+    private func persistGoogleRefreshToken(_ refreshToken: String, userId: UUID) async {
+        guard !refreshToken.isEmpty else { return }
+        do {
+            try await client
+                .from("google_oauth_tokens")
+                .upsert(GoogleOAuthTokenRow(userID: userId, refreshToken: refreshToken), onConflict: "user_id")
+                .execute()
+            print("[SupabaseService] Persisted Google refresh token to Supabase")
+        } catch {
+            print("[SupabaseService] Failed to persist Google refresh token: \(error.localizedDescription)")
+        }
+    }
+
+    private func logGoogleRefreshEvent(_ event: String) {
+        print(
+            "[SupabaseService] google_refresh_event=\(event) attempts=\(googleRefreshAttempts) successes=\(googleRefreshSuccesses) failures=\(googleRefreshFailures)"
+        )
     }
 
     // MARK: - App Config
@@ -344,6 +441,8 @@ final class SupabaseService: NSObject {
     var deepgramAPIKey: String? { appConfig["deepgram_api_key"] }
     var openAIAPIKey: String? { appConfig["openai_api_key"] }
     var anthropicAPIKey: String? { appConfig["anthropic_api_key"] }
+    var googleClientID: String? { appConfig["google_client_id"] }
+    var googleClientSecret: String? { appConfig["google_client_secret"] }
 
     // MARK: - Private
 
@@ -393,6 +492,16 @@ extension SupabaseService: ASWebAuthenticationPresentationContextProviding {
 private struct AppConfigRow: Decodable {
     let key: String
     let value: String
+}
+
+private struct GoogleOAuthTokenRow: Encodable {
+    let userID: UUID
+    let refreshToken: String
+
+    enum CodingKeys: String, CodingKey {
+        case userID = "user_id"
+        case refreshToken = "refresh_token"
+    }
 }
 
 // AnyJSON from the Supabase SDK already provides .stringValue

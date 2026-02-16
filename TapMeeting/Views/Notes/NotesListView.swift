@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 
 /// The main app window — Granola-style layout.
 ///
@@ -11,6 +12,11 @@ struct NotesListView: View {
     @State private var sidebarTab: SidebarTab = .home
     @State private var isSidebarCollapsed = false
     @State private var tabBeforeNote: SidebarTab = .home
+
+    // Calendar toolbar state (lifted so it can live in the window toolbar)
+    @State private var calendarViewMode: CalendarViewMode = .week
+    @State private var calendarCurrentDate: Date = .now
+    @State private var showCalendarSelector = false
     
     /// Forces a layout recalculation after window is ready. SwiftUI's unified toolbar
     /// reports stale safe-area insets on first layout; a hierarchy change fixes it.
@@ -19,6 +25,7 @@ struct NotesListView: View {
     enum SidebarTab: Hashable {
         case home
         case meetings
+        case calendar
         case todos
         case email
         case appleNotes
@@ -103,40 +110,135 @@ struct NotesListView: View {
                     if sidebarTab == .email, appState.gmailService.accounts.count > 1 {
                         emailAccountFilterMenu
                     }
+                    
+                    // Calendar navigation — only shown on Calendar tab
+                    if sidebarTab == .calendar, appState.googleCalendarService.isConnected {
+                        HStack(spacing: 4) {
+                            Button { calendarNavigatePrevious() } label: {
+                                Image(systemName: "chevron.left")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .frame(width: 28, height: 28)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Previous \(calendarViewMode.displayName)")
+
+                            Button { calendarCurrentDate = .now } label: {
+                                Text("Today")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Theme.sidebarBackground)
+                                    .cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Go to today")
+
+                            Button { calendarNavigateNext() } label: {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .frame(width: 28, height: 28)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Next \(calendarViewMode.displayName)")
+                        }
+                        .padding(.leading, 4)
+
+                        Text(calendarDateRangeLabel)
+                            .font(Theme.headingFont(16))
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(.leading, 4)
+                    }
                 }
             }
             ToolbarItem(placement: .primaryAction) {
                 HStack(spacing: 12) {
-                    if appState.isMeetingActive {
+                    if appState.isMeetingActive, !isViewingLiveNote {
                         MeetingControlButtons()
                     }
-                    Menu {
+                    
+                    // Email toolbar — mailbox tabs + compose + refresh
+                    if sidebarTab == .email, appState.gmailService.isConnected {
+                        emailToolbarTabs
+                        
                         Button {
-                            startNewMeeting()
+                            Task { await appState.gmailService.fetchMailbox(appState.gmailService.currentMailbox) }
                         } label: {
-                            Label("New Meeting", systemImage: "calendar.badge.clock")
-                        }
-                        Button {
-                            startNewStandaloneNote()
-                        } label: {
-                            Label("New Note", systemImage: "doc.text")
-                        }
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "plus.circle")
-                                .font(.system(size: 11))
-                            Text("Quick Start")
+                            Image(systemName: "arrow.clockwise")
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundColor(Theme.textSecondary)
+                                .frame(width: 28, height: 28)
+                                .rotationEffect(.degrees(appState.gmailService.isFetching ? 360 : 0))
+                                .animation(appState.gmailService.isFetching ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: appState.gmailService.isFetching)
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Theme.cardBackground)
-                        .cornerRadius(6)
-                        .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+                        .buttonStyle(.plain)
+                        .disabled(appState.gmailService.isFetching)
+                        .help("Refresh")
+                        
+                        Button {
+                            NotificationCenter.default.post(name: .emailComposeToggle, object: nil)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "square.and.pencil")
+                                    .font(.system(size: 11, weight: .medium))
+                                Text("Compose")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .foregroundColor(Theme.textPrimary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Theme.cardBackground)
+                            .cornerRadius(6)
+                            .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
+                    
+                    // Calendar view mode + selector — shown on Calendar tab
+                    if sidebarTab == .calendar, appState.googleCalendarService.isConnected {
+                        HStack(spacing: 2) {
+                            ForEach(CalendarViewMode.allCases, id: \.self) { mode in
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        calendarViewMode = mode
+                                    }
+                                } label: {
+                                    Text(mode.displayName)
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(calendarViewMode == mode ? Theme.textPrimary : Theme.textSecondary)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(calendarViewMode == mode ? Theme.sidebarBackground : Color.clear)
+                                        .cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(2)
+                        .background(Color(red: 0.96, green: 0.95, blue: 0.93))
+                        .cornerRadius(6)
+
+                        Button {
+                            showCalendarSelector.toggle()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "line.3.horizontal.decrease.circle")
+                                    .font(.system(size: 12))
+                                Text("Calendars")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .foregroundColor(Theme.textSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Theme.sidebarBackground)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .popover(isPresented: $showCalendarSelector, arrowEdge: .bottom) {
+                            CalendarSelectorPopover()
+                                .environment(appState)
+                        }
+                    }
                     
                     HStack(spacing: 4) {
                         Image(systemName: "bird.fill")
@@ -174,6 +276,12 @@ struct NotesListView: View {
                 appState.shouldNavigateToLiveMeeting = false
             }
         }
+        .onChange(of: sidebarTab) { _, newTab in
+            // Mark all to-dos as seen when the user navigates to the To-Dos page
+            if case .todos = newTab {
+                appState.todoRepository.markAllAsSeen()
+            }
+        }
         .onAppear {
             guard !hasTriggeredLayoutFix else { return }
             hasTriggeredLayoutFix = true
@@ -208,67 +316,72 @@ struct NotesListView: View {
     
     private var emailAccountFilterMenu: some View {
         let gmail = appState.gmailService
-        let isFiltered = gmail.filterAccountId != nil
         
-        return Menu {
-            Button {
-                gmail.filterAccountId = nil
+        return Picker(selection: Binding<String>(
+            get: { gmail.filterAccountId ?? "__all__" },
+            set: { newValue in
+                gmail.filterAccountId = newValue == "__all__" ? nil : newValue
                 gmail.selectedThread = nil
                 gmail.selectedMessageId = nil
-            } label: {
-                HStack {
-                    Text("All Accounts")
-                    if gmail.filterAccountId == nil {
-                        Image(systemName: "checkmark")
-                    }
-                }
             }
-            
+        ), label: EmptyView()) {
+            Text("All Accounts").tag("__all__")
             Divider()
-            
             ForEach(gmail.accounts, id: \.id) { account in
-                Button {
-                    gmail.filterAccountId = account.id
-                    gmail.selectedThread = nil
-                    gmail.selectedMessageId = nil
-                } label: {
-                    HStack {
-                        Text(account.email)
-                        if gmail.filterAccountId == account.id {
-                            Image(systemName: "checkmark")
-                        }
-                    }
-                }
+                Text(account.email).tag(account.id)
             }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "at")
-                    .font(.system(size: 10, weight: .medium))
-                Text(emailAccountFilterLabel)
-                    .font(.system(size: 12, weight: .medium))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-            }
-            .foregroundColor(isFiltered ? Theme.textPrimary : Theme.textSecondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(isFiltered ? Color.white : Color.clear)
-            .cornerRadius(6)
-            .shadow(color: isFiltered ? .black.opacity(0.05) : .clear, radius: 1, y: 1)
         }
-        .menuStyle(.borderlessButton)
+        .pickerStyle(.menu)
         .fixedSize()
     }
     
-    private var emailAccountFilterLabel: String {
+    // MARK: - Email Toolbar Tabs (Mailbox switcher)
+    
+    private var emailToolbarTabs: some View {
         let gmail = appState.gmailService
-        guard let filterId = gmail.filterAccountId,
-              let account = gmail.accounts.first(where: { $0.id == filterId }) else {
-            return "All"
+        let inboxUnread = gmail.inboxThreads.filter(\.isUnread).count
+        let isSearchActive = !gmail.searchQuery.isEmpty
+        
+        return HStack(spacing: 0) {
+            ForEach(Mailbox.allCases) { mailbox in
+                let isActive = gmail.currentMailbox == mailbox && !isSearchActive
+                Button {
+                    gmail.currentMailbox = mailbox
+                    gmail.selectedThread = nil
+                    gmail.selectedMessageId = nil
+                    gmail.clearSearch()
+                    NotificationCenter.default.post(name: .emailMailboxChanged, object: nil)
+                    Task { await gmail.fetchMailbox(mailbox) }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: mailbox.icon)
+                            .font(.system(size: 10))
+                        Text(mailbox.displayName)
+                            .font(.system(size: 12, weight: .medium))
+                        
+                        if mailbox == .inbox, inboxUnread > 0, !isSearchActive {
+                            Text("\(inboxUnread)")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(Theme.olive)
+                                .cornerRadius(4)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .foregroundColor(isActive ? Theme.textPrimary : Theme.textSecondary)
+                    .background(isActive ? Color.white : Color.clear)
+                    .cornerRadius(6)
+                    .shadow(color: isActive ? .black.opacity(0.05) : .clear, radius: 1, y: 1)
+                }
+                .buttonStyle(.plain)
+            }
         }
-        let parts = account.email.split(separator: "@")
-        guard parts.count == 2 else { return account.email }
-        return String(parts[0])
+        .padding(2)
+        .background(Color(red: 0.94, green: 0.93, blue: 0.90))
+        .cornerRadius(6)
     }
     
     // MARK: - Main Content
@@ -288,6 +401,11 @@ struct NotesListView: View {
                 isSidebarCollapsed: $isSidebarCollapsed,
                 onSelectNote: { id in tabBeforeNote = .meetings; sidebarTab = .note(id) },
                 onNewNote: { startNewMeeting() }
+            )
+        case .calendar:
+            CalendarView(
+                viewMode: $calendarViewMode,
+                currentDate: $calendarCurrentDate
             )
         case .email:
             EmailView(isSidebarCollapsed: $isSidebarCollapsed)
@@ -359,6 +477,63 @@ struct NotesListView: View {
             SettingsContentView(isSidebarCollapsed: $isSidebarCollapsed)
         }
     }
+    
+    /// Whether the user is currently viewing the live meeting's note.
+    private var isViewingLiveNote: Bool {
+        guard let meeting = appState.currentMeeting,
+              case .note(let id) = sidebarTab else { return false }
+        return meeting.note.id == id
+    }
+    
+    // MARK: - Calendar Toolbar Helpers
+    
+    private var calendarWeekStart: Date {
+        let cal = Foundation.Calendar.current
+        let weekday = cal.component(.weekday, from: calendarCurrentDate)
+        return cal.date(byAdding: .day, value: -(weekday - cal.firstWeekday), to: cal.startOfDay(for: calendarCurrentDate))!
+    }
+    
+    private var calendarDateRangeLabel: String {
+        let formatter = DateFormatter()
+        switch calendarViewMode {
+        case .week:
+            formatter.dateFormat = "MMM d"
+            let end = Foundation.Calendar.current.date(byAdding: .day, value: 6, to: calendarWeekStart)!
+            let startStr = formatter.string(from: calendarWeekStart)
+            let endStr = formatter.string(from: end)
+            let yearFormatter = DateFormatter()
+            yearFormatter.dateFormat = ", yyyy"
+            return "\(startStr) – \(endStr)\(yearFormatter.string(from: end))"
+        case .month:
+            let cal = Foundation.Calendar.current
+            let comps = cal.dateComponents([.year, .month], from: calendarCurrentDate)
+            let monthStart = cal.date(from: comps)!
+            formatter.dateFormat = "MMMM yyyy"
+            return formatter.string(from: monthStart)
+        }
+    }
+    
+    private func calendarNavigatePrevious() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            switch calendarViewMode {
+            case .week:
+                calendarCurrentDate = Foundation.Calendar.current.date(byAdding: .day, value: -7, to: calendarCurrentDate)!
+            case .month:
+                calendarCurrentDate = Foundation.Calendar.current.date(byAdding: .month, value: -1, to: calendarCurrentDate)!
+            }
+        }
+    }
+    
+    private func calendarNavigateNext() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            switch calendarViewMode {
+            case .week:
+                calendarCurrentDate = Foundation.Calendar.current.date(byAdding: .day, value: 7, to: calendarCurrentDate)!
+            case .month:
+                calendarCurrentDate = Foundation.Calendar.current.date(byAdding: .month, value: 1, to: calendarCurrentDate)!
+            }
+        }
+    }
 }
 
 // MARK: - Sidebar
@@ -414,7 +589,15 @@ private struct NoteSidebar: View {
             ) {
                 selectedTab = .meetings
             }
-            
+
+            SidebarItem(
+                icon: "calendar",
+                label: "Calendar",
+                isSelected: isCalendarSelected
+            ) {
+                selectedTab = .calendar
+            }
+
             SidebarItem(
                 icon: "envelope",
                 label: "Email",
@@ -428,7 +611,8 @@ private struct NoteSidebar: View {
                 icon: "checklist",
                 label: "To-Dos",
                 isSelected: isTodosSelected,
-                badge: appState.todoRepository.pendingCount()
+                badge: appState.todoRepository.pendingCount(),
+                newBadge: appState.todoRepository.unseenCount()
             ) {
                 selectedTab = .todos
             }
@@ -601,7 +785,12 @@ private struct NoteSidebar: View {
         if case .meetings = selectedTab { return true }
         return false
     }
-    
+
+    private var isCalendarSelected: Bool {
+        if case .calendar = selectedTab { return true }
+        return false
+    }
+
     private var isEmailSelected: Bool {
         if case .email = selectedTab { return true }
         return false
@@ -616,6 +805,8 @@ private struct NoteSidebar: View {
         if case .appleNotes = selectedTab { return true }
         return false
     }
+
+    // Calendar helpers removed — they live on NotesListView where the @State vars are.
     
     private var isSettingsSelected: Bool {
         if case .settings = selectedTab { return true }
@@ -659,6 +850,8 @@ private struct SidebarItem: View {
     let label: String
     let isSelected: Bool
     var badge: Int = 0
+    /// Optional "new items" badge — shown as a distinct accent indicator.
+    var newBadge: Int = 0
     let action: () -> Void
     
     var body: some View {
@@ -674,6 +867,16 @@ private struct SidebarItem: View {
                     .foregroundColor(isSelected ? Theme.textPrimary : Theme.textSecondary)
                 
                 Spacer()
+                
+                if newBadge > 0 {
+                    Text("\(newBadge) new")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Theme.recording)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Theme.recording.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
                 
                 if badge > 0 {
                     Text("\(badge)")
@@ -970,6 +1173,9 @@ private struct HomeContentView: View {
     @Environment(AppState.self) private var appState
     @State private var isNewMeetingHovered = false
     @State private var isNewNoteHovered = false
+
+    /// 10-second auto-refresh timer for upcoming calendar events.
+    private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
     
     var body: some View {
         VStack(spacing: 0) {
@@ -1215,10 +1421,7 @@ private struct HomeContentView: View {
                                                     .buttonStyle(.plain)
                                                 }
                                                 
-                                                Image("GoogleCalendarIcon")
-                                                    .resizable()
-                                                    .aspectRatio(contentMode: .fit)
-                                                    .frame(width: 16, height: 16)
+                                                CompanyLogoView(event: event, size: 20)
                                             }
                                             .padding(.horizontal, 16)
                                             .padding(.vertical, 10)
@@ -1332,7 +1535,15 @@ private struct HomeContentView: View {
             if appState.googleCalendarService.isConnected {
                 Task {
                     await appState.googleCalendarService.fetchEvents()
-                    // onEventsFetched callback will trigger calendarService.fetchUpcomingEvents()
+                }
+            } else {
+                appState.calendarService.fetchUpcomingEvents()
+            }
+        }
+        .onReceive(refreshTimer) { _ in
+            if appState.googleCalendarService.isConnected {
+                Task {
+                    await appState.googleCalendarService.fetchEvents()
                 }
             } else {
                 appState.calendarService.fetchUpcomingEvents()

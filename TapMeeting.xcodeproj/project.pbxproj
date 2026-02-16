@@ -28,7 +28,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		CEC70B0B2F3D900900AD49F2 /* TapMeeting.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TapMeeting.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CEC70B0B2F3D900900AD49F2 /* Nest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Nest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		CEC70B1C2F3D900B00AD49F2 /* TapMeetingTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TapMeetingTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CEC70B262F3D900B00AD49F2 /* TapMeetingUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TapMeetingUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -90,7 +90,7 @@
 		CEC70B0C2F3D900900AD49F2 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				CEC70B0B2F3D900900AD49F2 /* TapMeeting.app */,
+				CEC70B0B2F3D900900AD49F2 /* Nest.app */,
 				CEC70B1C2F3D900B00AD49F2 /* TapMeetingTests.xctest */,
 				CEC70B262F3D900B00AD49F2 /* TapMeetingUITests.xctest */,
 			);
@@ -100,9 +100,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		CEC70B0A2F3D900900AD49F2 /* TapMeeting */ = {
+		CEC70B0A2F3D900900AD49F2 /* Nest */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = CEC70B302F3D900B00AD49F2 /* Build configuration list for PBXNativeTarget "TapMeeting" */;
+			buildConfigurationList = CEC70B302F3D900B00AD49F2 /* Build configuration list for PBXNativeTarget "Nest" */;
 			buildPhases = (
 				CEC70B072F3D900900AD49F2 /* Sources */,
 				CEC70B082F3D900900AD49F2 /* Frameworks */,
@@ -115,12 +115,12 @@
 			fileSystemSynchronizedGroups = (
 				CEC70B0D2F3D900900AD49F2 /* TapMeeting */,
 			);
-			name = TapMeeting;
+			name = Nest;
 			packageProductDependencies = (
 				49D51D281CFAABB4E311E837 /* Supabase */,
 			);
 			productName = TapMeeting;
-			productReference = CEC70B0B2F3D900900AD49F2 /* TapMeeting.app */;
+			productReference = CEC70B0B2F3D900900AD49F2 /* Nest.app */;
 			productType = "com.apple.product-type.application";
 		};
 		CEC70B1B2F3D900B00AD49F2 /* TapMeetingTests */ = {
@@ -205,7 +205,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				CEC70B0A2F3D900900AD49F2 /* TapMeeting */,
+				CEC70B0A2F3D900900AD49F2 /* Nest */,
 				CEC70B1B2F3D900B00AD49F2 /* TapMeetingTests */,
 				CEC70B252F3D900B00AD49F2 /* TapMeetingUITests */,
 			);
@@ -263,12 +263,12 @@
 /* Begin PBXTargetDependency section */
 		CEC70B1E2F3D900B00AD49F2 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = CEC70B0A2F3D900900AD49F2 /* TapMeeting */;
+			target = CEC70B0A2F3D900900AD49F2 /* Nest */;
 			targetProxy = CEC70B1D2F3D900B00AD49F2 /* PBXContainerItemProxy */;
 		};
 		CEC70B282F3D900B00AD49F2 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = CEC70B0A2F3D900900AD49F2 /* TapMeeting */;
+			target = CEC70B0A2F3D900900AD49F2 /* Nest */;
 			targetProxy = CEC70B272F3D900B00AD49F2 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -542,7 +542,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		CEC70B302F3D900B00AD49F2 /* Build configuration list for PBXNativeTarget "TapMeeting" */ = {
+		CEC70B302F3D900B00AD49F2 /* Build configuration list for PBXNativeTarget "Nest" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				CEC70B312F3D900B00AD49F2 /* Debug */,

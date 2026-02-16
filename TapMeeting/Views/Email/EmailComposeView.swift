@@ -25,6 +25,7 @@ struct EmailComposeView: View {
     enum Mode {
         case reply
         case replyAll
+        case forward
         case newEmail
     }
     
@@ -274,95 +275,17 @@ struct EmailComposeView: View {
                 .padding(.vertical, 10)
             }
             
-            // — Send / Discard bar —
-            if mode != .newEmail {
-                HStack(spacing: 10) {
-                    Button {
-                        onDismiss?()
-                    } label: {
-                        Text("Discard")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(Theme.textTertiary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 6)
-                            .background(Theme.sidebarBackground)
-                            .cornerRadius(6)
-                    }
-                    .buttonStyle(.plain)
-                    
-                    // Attach file button
-                    Button {
-                        pickFiles()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "paperclip")
-                                .font(.system(size: 11))
-                            Text("Attach")
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .foregroundColor(Theme.textSecondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Theme.sidebarBackground)
-                        .cornerRadius(6)
-                    }
-                    .buttonStyle(.plain)
-                    
-                    Spacer()
-                    
-                    if let error = gmail.sendError {
-                        Text(error)
-                            .font(.system(size: 11))
-                            .foregroundColor(Theme.recording)
-                    }
-                    
-                    if let aiError {
-                        Text(aiError)
-                            .font(.system(size: 11))
-                            .foregroundColor(Theme.recording)
-                    }
-                    
-                    if gmail.sendSuccess {
-                        HStack(spacing: 4) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 12))
-                            Text("Sent")
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .foregroundColor(Theme.olive)
-                    }
-                    
-                    Button {
-                        sendDraft()
-                    } label: {
-                        HStack(spacing: 4) {
-                            if gmail.isSending {
-                                ProgressView().controlSize(.mini)
-                            } else {
-                                Image(systemName: "paperplane.fill")
-                                    .font(.system(size: 11))
-                            }
-                            Text("Send")
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(canSend ? Theme.olive : Theme.textQuaternary)
-                        .cornerRadius(6)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canSend || gmail.isSending)
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 10)
-            }
-            
             // — Quoted original email —
             if let quoted = quotedMessage {
                 rowDivider()
                 
                 VStack(alignment: .leading, spacing: 4) {
+                    if mode == .forward {
+                        Text("---------- Forwarded message ----------")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textTertiary)
+                            .padding(.bottom, 4)
+                    }
                     quotedField("From:", value: "\(quoted.from) <\(quoted.fromEmail)>")
                     quotedField("Date:", value: formattedQuotedDate(quoted.date))
                     quotedField("To:", value: quoted.to.joined(separator: ", "))
@@ -388,9 +311,8 @@ struct EmailComposeView: View {
                 }
             }
         }
-        .background(Theme.background)
+        .background(Color.clear)
         .onReceive(NotificationCenter.default.publisher(for: .emailComposeToolbarAction)) { notification in
-            guard mode == .newEmail else { return }
             guard let rawAction = notification.userInfo?["action"] as? String,
                   let action = EmailComposeToolbarAction(rawValue: rawAction) else { return }
             
@@ -411,7 +333,79 @@ struct EmailComposeView: View {
     
     private func sendDraft() {
         Task {
-            let wasSent = await gmail.sendEmail(draft)
+            var finalDraft = draft
+            
+            if let quoted = quotedMessage {
+                // ── Plain text version ──
+                var plainQuoted = "\n\n"
+                if mode == .forward {
+                    plainQuoted += "---------- Forwarded message ----------\n"
+                    plainQuoted += "From: \(quoted.from) <\(quoted.fromEmail)>\n"
+                    plainQuoted += "Date: \(formattedQuotedDate(quoted.date))\n"
+                    plainQuoted += "Subject: \(quoted.subject)\n"
+                    plainQuoted += "To: \(quoted.to.joined(separator: ", "))\n\n"
+                } else {
+                    plainQuoted += "On \(formattedQuotedDate(quoted.date)), \(quoted.from) <\(quoted.fromEmail)> wrote:\n\n"
+                }
+                
+                let plainBody: String
+                if !quoted.bodyPlain.isEmpty {
+                    plainBody = quoted.bodyPlain
+                } else if !quoted.bodyHTML.isEmpty {
+                    plainBody = Self.stripHTML(quoted.bodyHTML)
+                } else {
+                    plainBody = ""
+                }
+                
+                if mode != .forward {
+                    plainQuoted += plainBody.components(separatedBy: "\n").map { "> \($0)" }.joined(separator: "\n")
+                } else {
+                    plainQuoted += plainBody
+                }
+                
+                finalDraft.body = draft.body + plainQuoted
+                
+                // ── HTML version (preserves original formatting) ──
+                let escapedUserBody = draft.body
+                    .replacingOccurrences(of: "&", with: "&amp;")
+                    .replacingOccurrences(of: "<", with: "&lt;")
+                    .replacingOccurrences(of: ">", with: "&gt;")
+                    .replacingOccurrences(of: "\n", with: "<br>")
+                
+                let originalHTML = !quoted.bodyHTML.isEmpty ? quoted.bodyHTML : "<pre>\(plainBody)</pre>"
+                
+                var htmlBody = """
+                <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;color:#222;">
+                \(escapedUserBody)
+                </div>
+                <br>
+                """
+                
+                if mode == .forward {
+                    htmlBody += """
+                    <div style="border-top:1px solid #ccc;padding-top:12px;margin-top:12px;color:#555;font-size:13px;">
+                    <b>---------- Forwarded message ----------</b><br>
+                    <b>From:</b> \(quoted.from) &lt;\(quoted.fromEmail)&gt;<br>
+                    <b>Date:</b> \(formattedQuotedDate(quoted.date))<br>
+                    <b>Subject:</b> \(quoted.subject)<br>
+                    <b>To:</b> \(quoted.to.joined(separator: ", "))<br>
+                    </div>
+                    <br>
+                    \(originalHTML)
+                    """
+                } else {
+                    htmlBody += """
+                    <div style="border-left:3px solid #ccc;padding-left:12px;margin-top:12px;color:#555;">
+                    <p style="font-size:12px;color:#888;">On \(formattedQuotedDate(quoted.date)), \(quoted.from) &lt;\(quoted.fromEmail)&gt; wrote:</p>
+                    \(originalHTML)
+                    </div>
+                    """
+                }
+                
+                finalDraft.bodyHTML = htmlBody
+            }
+            
+            let wasSent = await gmail.sendEmail(finalDraft)
             if wasSent {
                 if let onSent {
                     onSent()
@@ -420,6 +414,41 @@ struct EmailComposeView: View {
                 }
             }
         }
+    }
+    
+    /// Strips HTML tags and decodes common entities to produce a plain text version.
+    private static func stripHTML(_ html: String) -> String {
+        var result = html
+        let blockPatterns = [
+            "<style[^>]*>[\\s\\S]*?</style>",
+            "<script[^>]*>[\\s\\S]*?</script>"
+        ]
+        for pattern in blockPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+            }
+        }
+        let newlinePatterns = ["<br\\s*/?>", "</p>", "</div>", "</tr>", "</li>", "</h[1-6]>"]
+        for pattern in newlinePatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "\n")
+            }
+        }
+        if let regex = try? NSRegularExpression(pattern: "<[^>]+>", options: []) {
+            result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "")
+        }
+        let entities: [(String, String)] = [
+            ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+            ("&quot;", "\""), ("&#39;", "'"), ("&apos;", "'"),
+            ("&nbsp;", " "), ("&#160;", " ")
+        ]
+        for (entity, char) in entities {
+            result = result.replacingOccurrences(of: entity, with: char)
+        }
+        if let regex = try? NSRegularExpression(pattern: "\\n{3,}", options: []) {
+            result = regex.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "\n\n")
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     
     // MARK: - Contact Suggestion Dropdown

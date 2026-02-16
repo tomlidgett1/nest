@@ -1,6 +1,20 @@
 import SwiftUI
 @preconcurrency import WebKit
 
+// MARK: - Detail Panel Toolbar Actions (from EmailView header bar)
+
+extension Notification.Name {
+    static let emailDetailToolbarAction = Notification.Name("emailDetailToolbarAction")
+    static let emailReplyModeChanged = Notification.Name("emailReplyModeChanged")
+    static let emailComposeToggle = Notification.Name("emailComposeToggle")
+    static let emailMailboxChanged = Notification.Name("emailMailboxChanged")
+}
+
+enum EmailDetailToolbarAction: String {
+    case aiDraft
+    case summarise
+}
+
 /// Detail view for a selected email thread.
 ///
 /// Shows subject at top, then one big scrollable conversation chain.
@@ -11,15 +25,30 @@ struct EmailDetailView: View {
     @Environment(AppState.self) private var appState
     @State private var showReply = false
     @State private var showReplyAll = false
+    @State private var showForward = false
     @State private var showAIDraft = false
     @State private var aiDraftBody: String = ""
-    @State private var expandedMessageIds: Set<String> = []
+    @State private var collapsedMessageIds: Set<String> = []
+    @State private var collapsedForThreadId: String?
     @State private var expandedRecipientKeys: Set<String> = []
     
     // Summarise state
     @State private var threadSummary: String?
     @State private var isSummarising = false
     @State private var showSummary = false
+    
+    /// Whether any inline compose view (reply, reply all, forward, AI draft) is active.
+    private var isInComposeMode: Bool {
+        showReply || showReplyAll || showForward || showAIDraft
+    }
+    
+    private func broadcastReplyMode() {
+        NotificationCenter.default.post(
+            name: .emailReplyModeChanged,
+            object: nil,
+            userInfo: ["active": isInComposeMode]
+        )
+    }
     
     private var gmail: GmailService { appState.gmailService }
     private var selectedThreadId: String? { gmail.selectedThread?.id }
@@ -44,27 +73,78 @@ struct EmailDetailView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Theme.background)
+        .background(Color.clear)
         .onChange(of: selectedThreadId) { _, _ in
             showReply = false
             showReplyAll = false
+            showForward = false
             showAIDraft = false
             aiDraftBody = ""
             threadSummary = nil
             showSummary = false
             expandedRecipientKeys = []
-            updateExpandedMessageIds()
+            collapseOlderMessages()
+            broadcastReplyMode()
         }
         .onChange(of: selectedMessageId) { _, _ in
             expandedRecipientKeys = []
-            updateExpandedMessageIds()
+            collapsedMessageIds = []
+            collapsedForThreadId = gmail.selectedThread?.id
+        }
+        .onChange(of: showReply) { _, _ in broadcastReplyMode() }
+        .onChange(of: showReplyAll) { _, _ in broadcastReplyMode() }
+        .onChange(of: showForward) { _, _ in broadcastReplyMode() }
+        .onChange(of: showAIDraft) { _, _ in broadcastReplyMode() }
+        .onReceive(NotificationCenter.default.publisher(for: .emailDetailToolbarAction)) { notification in
+            guard gmail.selectedThread != nil else { return }
+            guard let rawAction = notification.userInfo?["action"] as? String,
+                  let action = EmailDetailToolbarAction(rawValue: rawAction) else { return }
+            
+            switch action {
+            case .aiDraft:
+                showReply = false; showReplyAll = false; showForward = false
+                withAnimation(.easeInOut(duration: 0.2)) { showAIDraft.toggle() }
+            case .summarise:
+                if showSummary {
+                    withAnimation(.easeInOut(duration: 0.3)) { showSummary = false }
+                } else {
+                    let msgs = gmail.selectedThread.map { displayMessages(for: $0) } ?? []
+                    summariseThread(messages: msgs)
+                }
+            }
         }
     }
     
-    private func updateExpandedMessageIds() {
-        guard let thread = gmail.selectedThread else { return }
+    /// Collapse all messages except the most recent so the newest email is always
+    /// prominently displayed when a thread is selected.
+    private func collapseOlderMessages() {
+        guard let thread = gmail.selectedThread else {
+            collapsedMessageIds = []
+            collapsedForThreadId = nil
+            return
+        }
         let msgs = displayMessages(for: thread)
-        expandedMessageIds = Set(msgs.map(\.id))
+        if msgs.count > 1 {
+            // msgs is oldest→newest; collapse everything except the last (newest)
+            collapsedMessageIds = Set(msgs.dropLast().map(\.id))
+        } else {
+            collapsedMessageIds = []
+        }
+        collapsedForThreadId = thread.id
+    }
+    
+    /// Returns the effective collapsed set for the current render pass.
+    /// When the thread has just changed but `collapseOlderMessages` hasn't fired yet
+    /// (onChange runs AFTER the body), `collapsedMessageIds` is stale. This function
+    /// detects that case and returns the correct default (all but newest collapsed)
+    /// so we never briefly render every message expanded.
+    private func effectiveCollapsedIds(for messages: [GmailMessage], threadId: String) -> Set<String> {
+        if collapsedForThreadId == threadId {
+            return collapsedMessageIds
+        }
+        // Stale — compute the default collapse set inline
+        guard messages.count > 1 else { return [] }
+        return Set(messages.dropLast().map(\.id))
     }
     
     // MARK: - Empty
@@ -116,22 +196,28 @@ struct EmailDetailView: View {
                 
                 HStack(spacing: 2) {
                     actionButton(icon: "arrowshape.turn.up.left", tooltip: "Reply", isActive: showReply) {
-                        showReplyAll = false; showAIDraft = false
+                        showReplyAll = false; showForward = false; showAIDraft = false
                         showReply.toggle()
                     }
                     actionButton(icon: "arrowshape.turn.up.left.2", tooltip: "Reply All", isActive: showReplyAll) {
-                        showReply = false; showAIDraft = false
+                        showReply = false; showForward = false; showAIDraft = false
                         showReplyAll.toggle()
                     }
+                    actionButton(icon: "arrowshape.turn.up.right", tooltip: "Forward", isActive: showForward) {
+                        showReply = false; showReplyAll = false; showAIDraft = false
+                        showForward.toggle()
+                    }
                     actionButton(icon: "sparkles", tooltip: "AI Draft", isActive: showAIDraft) {
-                        showReply = false; showReplyAll = false
+                        showReply = false; showReplyAll = false; showForward = false
                         showAIDraft.toggle()
                     }
                     
                     // Summarise button — works for single emails and threads
                     actionButton(icon: "text.alignleft", tooltip: "Summarise", isActive: showSummary) {
                         if showSummary {
-                            showSummary = false
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                showSummary = false
+                            }
                         } else {
                             summariseThread(messages: messagesToShow)
                         }
@@ -151,12 +237,17 @@ struct EmailDetailView: View {
             .padding(.horizontal, 24)
             .padding(.vertical, 14)
             
-            Rectangle().fill(Theme.divider).frame(height: 1)
+            Rectangle().fill(Theme.divider.opacity(0.5)).frame(height: 1).padding(.horizontal, 12)
             
-            // Summary card (above thread messages)
-            if showSummary {
-                summaryCard
+            // Summary card (above thread messages) — animated dropdown
+            VStack(spacing: 0) {
+                if showSummary {
+                    summaryCard
+                        .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .top)))
+                }
             }
+            .clipped()
+            .animation(.easeInOut(duration: 0.3), value: showSummary)
             
             // When composing, the compose view REPLACES the thread (like Outlook).
             // Otherwise show the conversation chain.
@@ -190,39 +281,51 @@ struct EmailDetailView: View {
                     .padding(.bottom, 20)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if showAIDraft, let latest {
+            } else if showForward, let latest {
                 ScrollView {
-                    EmailAIDraftSheet(
-                        thread: messagesToShow,
-                        message: latest,
-                        onUse: { draftText in
-                            aiDraftBody = draftText
-                            showAIDraft = false
-                            showReply = true
-                        },
-                        onDismiss: { showAIDraft = false }
+                    inlineComposeView(
+                        draft: forwardDraft(for: latest),
+                        mode: .forward,
+                        quotedMessage: latest,
+                        onDismiss: { showForward = false }
                     )
                     .padding(.bottom, 20)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                // Normal conversation view
+                // Conversation view — AI Draft card appears above emails when active
                 ScrollView {
+                    if showAIDraft, let latest {
+                        EmailAIDraftSheet(
+                            thread: messagesToShow,
+                            message: latest,
+                            onUse: { draftText in
+                                aiDraftBody = draftText
+                                showAIDraft = false
+                                showReply = true
+                            },
+                            onDismiss: { showAIDraft = false }
+                        )
+                    }
+                    
+                    let collapsed = effectiveCollapsedIds(for: messagesToShow, threadId: thread.id)
                     VStack(spacing: 0) {
                         ForEach(Array(messagesToShow.reversed())) { message in
-                            let isExpanded = expandedMessageIds.contains(message.id)
+                            let isExpanded = !collapsed.contains(message.id)
                             
                             messageBlock(message, isExpanded: isExpanded, canCollapse: messagesToShow.count > 1)
                             
                             if message.id != messagesToShow.first?.id {
                                 Rectangle()
-                                    .fill(Theme.divider)
+                                    .fill(Theme.divider.opacity(0.5))
                                     .frame(height: 1)
+                                    .padding(.horizontal, 12)
                             }
                         }
                     }
                     .padding(.bottom, 20)
                 }
+                .id(thread.id)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -238,7 +341,7 @@ struct EmailDetailView: View {
                     Image(systemName: "text.alignleft")
                         .font(.system(size: 11))
                         .foregroundColor(Theme.olive)
-                    Text("Summary")
+                    Text(isSummarising ? "Summarising…" : "Summary")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(Theme.textPrimary)
                 }
@@ -246,7 +349,7 @@ struct EmailDetailView: View {
                 Spacer()
                 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
+                    withAnimation(.easeInOut(duration: 0.3)) {
                         showSummary = false
                     }
                 } label: {
@@ -259,7 +362,7 @@ struct EmailDetailView: View {
             
             if isSummarising {
                 ShimmerThinkingView(
-                    text: "Summarising…",
+                    text: "",
                     icon: "text.alignleft",
                     lineCount: 3
                 )
@@ -268,10 +371,10 @@ struct EmailDetailView: View {
             }
         }
         .padding(14)
-        .background(Color.white)
+        .background(Theme.sidebarBackground)
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .stroke(Theme.divider, lineWidth: 1)
+                .stroke(Theme.divider.opacity(0.5), lineWidth: 1)
         )
         .cornerRadius(6)
         .padding(.horizontal, 24)
@@ -281,7 +384,9 @@ struct EmailDetailView: View {
     // MARK: - Summarise Thread
     
     private func summariseThread(messages: [GmailMessage]) {
-        showSummary = true
+        withAnimation(.easeInOut(duration: 0.3)) {
+            showSummary = true
+        }
         
         guard threadSummary == nil else { return }
         
@@ -388,10 +493,10 @@ struct EmailDetailView: View {
             Button {
                 guard canCollapse else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
-                    if expandedMessageIds.contains(message.id) {
-                        expandedMessageIds.remove(message.id)
+                    if collapsedMessageIds.contains(message.id) {
+                        collapsedMessageIds.remove(message.id)
                     } else {
-                        expandedMessageIds.insert(message.id)
+                        collapsedMessageIds.insert(message.id)
                     }
                 }
             } label: {
@@ -557,10 +662,10 @@ struct EmailDetailView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .frame(minWidth: 180, maxWidth: 240)
-            .background(Color.white)
+            .background(Theme.sidebarBackground.opacity(0.5))
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(Theme.divider, lineWidth: 1)
+                    .stroke(Theme.divider.opacity(0.6), lineWidth: 1)
             )
             .cornerRadius(8)
         }
@@ -615,6 +720,16 @@ struct EmailDetailView: View {
         draft.inReplyTo = message.messageIdHeader
         draft.threadId = message.threadId
         draft.references = buildReferences(for: message)
+        return draft
+    }
+    
+    private func forwardDraft(for message: GmailMessage) -> EmailDraft {
+        var draft = EmailDraft()
+        // To is empty — user fills in the recipient(s)
+        draft.subject = message.subject.hasPrefix("Fw:") || message.subject.hasPrefix("Fwd:")
+            ? message.subject
+            : "Fw: \(message.subject)"
+        // No inReplyTo, references, or threadId — forward starts a new thread
         return draft
     }
     
@@ -785,7 +900,7 @@ struct InlineHTMLView: View {
     @State private var contentHeight: CGFloat = 200 // sensible default until measured
     
     var body: some View {
-        InlineHTMLWebView(html: html, contentHeight: $contentHeight)
+        InlineHTMLWebView(html: html, messageId: messageId, contentHeight: $contentHeight)
             .frame(maxWidth: .infinity)
             .frame(height: contentHeight)
             .id(messageId) // force new view per message
@@ -795,11 +910,21 @@ struct InlineHTMLView: View {
 /// The actual NSViewRepresentable WKWebView that measures its content height.
 private struct InlineHTMLWebView: NSViewRepresentable {
     let html: String
+    let messageId: String
     @Binding var contentHeight: CGFloat
     
     func makeCoordinator() -> Coordinator {
         Coordinator(contentHeight: $contentHeight)
     }
+    
+    /// Persistent temp directory for writing HTML files that WKWebView loads via loadFileURL.
+    /// Using loadFileURL (instead of loadHTMLString) gives the page a proper file:// origin,
+    /// which allows it to fetch remote images, stylesheets, and fonts without cross-origin blocks.
+    private static let htmlDir: URL = {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("TapEmail", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
     
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -808,14 +933,39 @@ private struct InlineHTMLWebView: NSViewRepresentable {
         // Allow all remote content (images, stylesheets, etc.) to load automatically
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         
+        // Use the default data store so the web view can cache/fetch remote resources
+        config.websiteDataStore = .default()
+        
         let webView = NonScrollingWebView(frame: CGRect(x: 0, y: 0, width: 600, height: 200), configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
+        
+        // Set a standard browser user agent — some image servers reject the
+        // default WKWebView UA, which prevents external email images from loading
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         
         // Install a user content script that re-measures height after all images load
         let heightScript = WKUserScript(
             source: """
             (function() {
+                // ── Rewrite wide fixed-width tables to be fluid ──
+                var vw = document.documentElement.clientWidth || window.innerWidth;
+                document.querySelectorAll('table').forEach(function(tbl) {
+                    var w = tbl.getAttribute('width');
+                    if (w && parseInt(w, 10) > vw) {
+                        tbl.setAttribute('width', '100%');
+                        tbl.style.width = '100%';
+                        tbl.style.maxWidth = '100%';
+                    }
+                    if (tbl.style.width) {
+                        var pw = parseInt(tbl.style.width, 10);
+                        if (pw > vw) {
+                            tbl.style.width = '100%';
+                            tbl.style.maxWidth = '100%';
+                        }
+                    }
+                });
+
                 function reportHeight() {
                     var h = Math.max(document.body.scrollHeight, document.body.offsetHeight, document.documentElement.scrollHeight);
                     window.webkit.messageHandlers.heightChanged.postMessage(h);
@@ -846,8 +996,15 @@ private struct InlineHTMLWebView: NSViewRepresentable {
         if context.coordinator.lastHTML != html {
             context.coordinator.lastHTML = html
             let wrappedHTML = Self.wrapHTML(html)
-            // Use a real base URL so remote images, stylesheets, etc. resolve properly
-            webView.loadHTMLString(wrappedHTML, baseURL: URL(string: "https://mail.google.com"))
+            
+            // Write to a per-message temp file and load via loadFileURL so the page
+            // has a proper file:// origin for fetching remote images. Each message
+            // gets its own file to prevent concurrent webviews from overwriting
+            // each other's content during the brief all-expanded render window.
+            let safeId = messageId.replacingOccurrences(of: "/", with: "_")
+            let fileURL = Self.htmlDir.appendingPathComponent("email-\(safeId).html")
+            try? wrappedHTML.write(to: fileURL, atomically: true, encoding: .utf8)
+            webView.loadFileURL(fileURL, allowingReadAccessTo: Self.htmlDir)
         }
     }
     
@@ -858,8 +1015,9 @@ private struct InlineHTMLWebView: NSViewRepresentable {
         <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; img-src * data: blob: https: http:;">
+        <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; img-src * data: blob: https: http:; style-src * 'unsafe-inline'; font-src * data:;">
         <style>
+            /* ── Base reset ── */
             * { box-sizing: border-box; }
             body {
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -871,28 +1029,102 @@ private struct InlineHTMLWebView: NSViewRepresentable {
                 background: transparent;
                 word-wrap: break-word;
                 overflow-wrap: break-word;
-                overflow: hidden;
+                overflow-x: hidden;
+                overflow-y: hidden;
+                max-width: 100%;
             }
-            a { color: #6b6440; }
-            img { max-width: 100%; height: auto; display: inline-block; }
+
+            /* ── Email wrapper — containment boundary ── */
+            .email-wrapper {
+                max-width: 100%;
+                overflow: hidden;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+            }
+
+            /* ── Table reset — emails use tables for LAYOUT, not data ── */
+            table {
+                border-collapse: collapse;
+            }
+            table, td, th {
+                border: none;
+                padding: 0;
+            }
+
+            /* ── Make top-level layout tables fluid ── */
+            body > table,
+            body > div > table,
+            .email-wrapper > table,
+            .email-wrapper > div > table,
+            .email-wrapper > center > table {
+                width: 100% !important;
+                max-width: 100% !important;
+            }
+
+            /* ── Images — prevent gaps in table cells, constrain width ── */
+            img {
+                max-width: 100%;
+                height: auto;
+                display: inline-block;
+                vertical-align: middle;
+                border: 0;
+            }
+
+            /* ── Links ── */
+            a {
+                color: #6b6440;
+                word-break: break-all;
+            }
+
+            /* ── Quoted text / blockquotes ── */
             blockquote {
                 border-left: 3px solid #e0ddce;
                 margin: 10px 0;
                 padding: 4px 16px;
                 color: #8c8778;
             }
+
+            /* ── Gmail quoted replies ── */
+            .gmail_quote {
+                border-left: 3px solid #e0ddce;
+                margin: 12px 0 0 0;
+                padding: 0 0 0 12px;
+                color: #8c8778;
+            }
+
+            /* ── Code blocks ── */
             pre, code {
                 background: #f5f4f0;
                 border-radius: 4px;
                 padding: 2px 6px;
                 font-size: 13px;
             }
-            table { border-collapse: collapse; max-width: 100%; }
-            td, th { padding: 4px 8px; border: 1px solid #e0ddce; }
+            pre {
+                overflow-x: auto;
+                max-width: 100%;
+                padding: 8px 12px;
+            }
+
+            /* ── Horizontal rules (thread separators) ── */
+            hr {
+                border: none;
+                border-top: 1px solid #e0ddce;
+                margin: 16px 0;
+            }
+
+            /* ── Prevent wide fixed-width elements from overflowing ── */
+            div, span, p, td {
+                max-width: 100%;
+            }
+
+            /* ── Centre-aligned email wrappers (common pattern) ── */
+            center {
+                max-width: 100%;
+            }
         </style>
         </head>
         <body>
-        \(html)
+        <div class="email-wrapper">\(html)</div>
         </body>
         </html>
         """

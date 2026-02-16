@@ -32,13 +32,13 @@ enum Constants {
     enum Transcription {
         static let model = "nova-2-meeting"
         static let language = "en"
-        static let endpointingMs = 600
+        static let endpointingMs = 300
     }
     
     // MARK: - AI
     
     enum AI {
-        static let enhancementModel = "gpt-4.1"
+        static let enhancementModel = "gpt-5.2"
         static let autoTaggingModel = "gpt-4.1-mini"
         static let semanticChatModel = "gpt-4.1"
         static let embeddingModel = "text-embedding-3-large"
@@ -48,7 +48,8 @@ enum Constants {
         static let maxTaggingTokens = 512
         
         // Anthropic (Email AI)
-        static let anthropicModel = "claude-sonnet-4-5-20250929"
+        static let anthropicModel = "claude-opus-4-6"
+        static let anthropicSonnetModel = "claude-sonnet-4-5"
         static let anthropicEndpoint = "https://api.anthropic.com/v1/messages"
         static let anthropicVersion = "2023-06-01"
         static let maxEmailReplyTokens = 1024
@@ -59,6 +60,7 @@ enum Constants {
         static let maxClassifyTokens = 256
         static let maxTodoExtractionTokens = 1024
         static let maxSemanticAnswerTokens = 1400
+        static let maxCatchUpTokens = 1024
     }
 
     // MARK: - Search
@@ -97,8 +99,15 @@ enum Constants {
     enum Supabase {
         static let url = "https://ynoidbjupfcaaymzbtic.supabase.co"
         static let anonKey = "sb_publishable_TzLkFY46beB_8tQShPUU5g_d668i6ZR"
+        static let functionsBaseURL = "\(url)/functions/v1"
+        static let googleTokenBrokerPath = "\(functionsBaseURL)/google-token-broker"
         static let redirectScheme = "nest"
         static let redirectURL = "nest://auth/callback"
+        /// Google OAuth query params required to obtain/rotate refresh tokens.
+        static let googleOAuthQueryParams: [(String, String?)] = [
+            ("access_type", "offline"),
+            ("prompt", "consent")
+        ]
         /// Combined Google OAuth scopes requested during Supabase sign-in.
         /// Covers: Calendar (read-only), Gmail (modify + send), Contacts (autocomplete).
         static let googleScopes = "email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
@@ -108,11 +117,14 @@ enum Constants {
 
     enum GoogleCalendar {
         static let calendarAPIBase = "https://www.googleapis.com/calendar/v3"
+        static let calendarListEndpoint = "\(calendarAPIBase)/users/me/calendarList"
         static let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
         static let tokenURL = "https://oauth2.googleapis.com/token"
-        static let redirectURI = "http://127.0.0.1:8234"
+        static let redirectURI = "http://localhost:8234"
         static let loopbackPort: UInt16 = 8234
         static let scopes = "https://www.googleapis.com/auth/calendar.readonly"
+        /// Interval in seconds between automatic calendar event refreshes.
+        static let pollingInterval: TimeInterval = 300
     }
 
     // MARK: - Gmail
@@ -122,7 +134,7 @@ enum Constants {
         static let peopleAPIBase = "https://people.googleapis.com/v1"
         static let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
         static let tokenURL = "https://oauth2.googleapis.com/token"
-        static let redirectURI = "http://127.0.0.1:8235"
+        static let redirectURI = "http://localhost:8235"
         static let loopbackPort: UInt16 = 8235
         static let scopes = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
     }
@@ -210,7 +222,13 @@ enum Constants {
         static let processedTodoEmailMessageIds = "processedTodoEmailMessageIds"
         /// JSON-encoded array of excluded sender emails (no to-dos will be created from these senders).
         static let todoExcludedSenders = "todoExcludedSenders"
+        /// JSON-encoded array of excluded email category raw values (e.g. "meeting_invites").
+        static let todoExcludedCategories = "todoExcludedCategories"
         
+        // Calendar View
+        static let calendarVisibilityState = "calendarVisibilityState"
+        static let calendarViewMode = "calendarViewMode"
+
         // Supabase
         static let hasCompletedSupabaseMigration = "hasCompletedSupabaseMigration"
         static let hasCompletedSemanticBackfill = "hasCompletedSemanticBackfill"

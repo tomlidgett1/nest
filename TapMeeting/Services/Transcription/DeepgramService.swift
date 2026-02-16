@@ -172,7 +172,7 @@ final class DeepgramService: TranscriptionServiceProtocol {
             URLQueryItem(name: "smart_format", value: "true"),
             URLQueryItem(name: "interim_results", value: "true"),
             URLQueryItem(name: "vad_events", value: "true"),
-            URLQueryItem(name: "utterance_end_ms", value: "1500"),
+            URLQueryItem(name: "utterance_end_ms", value: "1000"),
             URLQueryItem(name: "endpointing", value: String(Constants.Transcription.endpointingMs)),
         ]
         

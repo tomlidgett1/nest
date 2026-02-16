@@ -96,7 +96,8 @@ final class TodoExtractionService {
         message: GmailMessage,
         threadId: String,
         userEmail: String,
-        existingTodoTitles: [String] = []
+        existingTodoTitles: [String] = [],
+        excludedCategories: Set<EmailCategory> = []
     ) async throws -> [TodoItem] {
         let apiKey = try getAPIKey()
         
@@ -145,32 +146,82 @@ final class TodoExtractionService {
             """
         }
         
+        // Build excluded categories context for the AI prompt
+        let excludedCategoriesContext: String
+        if excludedCategories.isEmpty {
+            excludedCategoriesContext = ""
+        } else {
+            let labels = excludedCategories.map(\.label).sorted().joined(separator: ", ")
+            excludedCategoriesContext = """
+
+            ## Excluded Email Categories
+            The user has explicitly excluded the following email categories from to-do extraction: \(labels).
+            If this email falls into any of those categories, return an empty array [] — even if the email contains actionable content.
+            For example: if "Meeting Invites" is excluded, do NOT extract to-dos from calendar invitations, event RSVPs, or meeting scheduling emails.
+            """
+        }
+        
         let systemPrompt = """
-        You are a task extraction assistant. Analyse the email below and extract actionable to-do items that require the USER's action.
+        You are an extremely strict task extraction assistant. You ONLY extract tasks when a real human has personally and explicitly asked the user to do something specific. You are skeptical by default — when in doubt, return [].
 
         The user's email address is: \(userEmail)
 
-        Rules:
-        - Only extract NEW tasks from the LATEST message content — ignore quoted/forwarded text (lines starting with ">", "On ... wrote:", or indented replies).
-        - Only extract tasks that the USER (identified above) personally needs to do.
-        - Do NOT extract tasks that are directed at other recipients. Pay close attention to the To and CC fields — if the user is CC'd and the request is for someone else, return [].
-        - If the email asks "someone" or a specific other person to do something, that is NOT the user's to-do.
-        - If this is a newsletter, marketing email, automated notification, receipt, or non-actionable message, return an empty array [].
-        - Do NOT duplicate tasks that already exist (see "Already-Tracked To-Dos" section below, if present). A task is a duplicate if it refers to the same underlying request, even if worded differently.
-        - Each to-do should be a clear, actionable task.
-        - Extract deadlines when mentioned.
-        - Assign priority: "high" for urgent requests, "low" for FYI/optional, "medium" for standard requests.
+        ## CRITICAL: What is NOT a to-do (return [] for ALL of these)
+        - Marketing emails, promotions, feature announcements ("Try our new feature", "Check out what's new")
+        - Newsletters, digests, roundups, blog post notifications
+        - Automated notifications (verification codes, OTPs, password resets, sign-in alerts, security alerts)
+        - Receipts, invoices, order confirmations, shipping updates, delivery notifications
+        - Subscription confirmations or cancellations
+        - Social media notifications (likes, comments, follows, connection requests)
+        - Calendar invitations or event reminders (these are handled by the calendar, not to-dos)
+        - System alerts, server notifications, CI/CD notifications, build reports
+        - Bank statements, account alerts, transaction notifications, financial summaries
+        - App notifications (Slack digests, Jira updates, GitHub notifications, etc.)
+        - Emails from a "noreply@" or "no-reply@" address
+        - Emails that simply share information, news, or updates without asking the user to do anything
+        - Emails that say "FYI", "for your information", "just letting you know", "heads up"
+        - Generic CTAs like "Click here", "Learn more", "View details", "Update your preferences"
+        - Emails with unsubscribe links in the footer (strong signal it's marketing/automated)
+
+        ## What IS a to-do (only these qualify)
+        A to-do MUST meet ALL of these criteria:
+        1. A specific real person (not an automated system) has written to the user
+        2. They are explicitly asking the user to perform a concrete action
+        3. The request requires the user's conscious effort, judgement, or time to complete
+        4. NOT responding would have real consequences (missed deadline, broken commitment, blocked colleague)
+
+        Examples of genuine to-dos:
+        - "Can you review this proposal and send feedback by Friday?"
+        - "Please send me the Q4 report"
+        - "We need you to approve the budget before we can proceed"
+        - "Could you hop on a call tomorrow to discuss the project?"
+
+        Examples that are NOT to-dos (return []):
+        - "Your verification code is 123456" → NOT a to-do
+        - "Try our exciting new feature!" → NOT a to-do
+        - "Your monthly statement is ready" → NOT a to-do
+        - "Here's a summary of your recent activity" → NOT a to-do
+        - "Your order has shipped" → NOT a to-do
+        - "Reminder: your subscription renews tomorrow" → NOT a to-do
+        - "John mentioned you in a comment" → NOT a to-do
+
+        ## Additional rules
+        - Only extract from the LATEST message content — ignore quoted/forwarded text (lines starting with ">", "On ... wrote:", or indented replies).
+        - Only extract tasks directed at the USER personally. If the request is for someone else, return [].
+        - Do NOT duplicate tasks that already exist (see below if present).
+        - Assign priority: "high" for urgent requests with deadlines, "low" for nice-to-have, "medium" for standard requests.
         - Use Australian English spelling.
-        \(recipientContext)\(existingTodosContext)
+        - When in doubt, return []. It is FAR better to miss a to-do than to create a false one.
+        \(recipientContext)\(existingTodosContext)\(excludedCategoriesContext)
 
         Return ONLY a JSON array of objects. Each object must have:
         - "title": string — short task description (imperative voice)
         - "details": string or null — additional context
         - "dueDate": string (ISO 8601) or null
         - "priority": "high" | "medium" | "low"
-        - "sourceSnippet": string — brief excerpt from the NEW message content showing the request
+        - "sourceSnippet": string — brief excerpt showing the SPECIFIC request from a real person
 
-        Return valid JSON array only, no markdown fences. Return [] if no NEW actionable items for the user.
+        Return valid JSON array only, no markdown fences. Return [] if no genuine to-dos.
         """
         
         let bodyText = message.bodyPlain.isEmpty ? message.snippet : message.bodyPlain
@@ -215,7 +266,8 @@ final class TodoExtractionService {
     ///   - existingTodosByThread: Dictionary mapping threadId → list of existing to-do titles.
     func extractFromEmails(
         _ messages: [(message: GmailMessage, threadId: String, userEmail: String)],
-        existingTodosByThread: [String: [String]] = [:]
+        existingTodosByThread: [String: [String]] = [:],
+        excludedCategories: Set<EmailCategory> = []
     ) async -> [TodoItem] {
         var allTodos: [TodoItem] = []
         
@@ -237,7 +289,8 @@ final class TodoExtractionService {
                             message: item.message,
                             threadId: item.threadId,
                             userEmail: item.userEmail,
-                            existingTodoTitles: existingTitles
+                            existingTodoTitles: existingTitles,
+                            excludedCategories: excludedCategories
                         )
                     } catch {
                         print("[TodoExtraction] Email extraction failed for '\(item.message.subject)': \(error.localizedDescription)")

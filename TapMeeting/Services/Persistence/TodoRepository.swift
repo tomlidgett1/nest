@@ -38,7 +38,8 @@ final class TodoRepository {
             sourceType: sourceType,
             sourceId: sourceId,
             sourceTitle: sourceTitle,
-            sourceSnippet: sourceSnippet
+            sourceSnippet: sourceSnippet,
+            isSeen: true // User-created to-dos are immediately seen
         )
         modelContext.insert(todo)
         save()
@@ -100,6 +101,31 @@ final class TodoRepository {
     /// Count of pending (incomplete, non-deleted) to-dos.
     func pendingCount() -> Int {
         fetchPendingTodos().count
+    }
+    
+    /// Count of unseen, non-deleted, non-completed to-dos.
+    func unseenCount() -> Int {
+        let predicate = #Predicate<TodoItem> { todo in
+            todo.isDeleted == false && todo.isCompleted == false && todo.isSeen == false
+        }
+        let descriptor = FetchDescriptor<TodoItem>(predicate: predicate)
+        return (try? modelContext.fetchCount(descriptor))
+            ?? (try? modelContext.fetch(descriptor).count)
+            ?? 0
+    }
+    
+    /// Mark all unseen to-dos as seen. Called when the user views the To-Dos page.
+    func markAllAsSeen() {
+        let predicate = #Predicate<TodoItem> { todo in
+            todo.isDeleted == false && todo.isSeen == false
+        }
+        let descriptor = FetchDescriptor<TodoItem>(predicate: predicate)
+        guard let unseen = try? modelContext.fetch(descriptor), !unseen.isEmpty else { return }
+        for todo in unseen {
+            todo.isSeen = true
+        }
+        save()
+        print("[TodoRepository] Marked \(unseen.count) to-dos as seen")
     }
     
     /// Fetch to-dos for a specific source (note or email thread).
@@ -216,6 +242,83 @@ final class TodoRepository {
     /// Check whether a sender email is excluded.
     func isSenderExcluded(_ email: String) -> Bool {
         excludedSenders().contains(email.lowercased().trimmingCharacters(in: .whitespaces))
+    }
+    
+    // MARK: - Category Exclusions
+    
+    /// Returns the set of excluded email categories.
+    func excludedCategories() -> Set<EmailCategory> {
+        let arr = UserDefaults.standard.stringArray(forKey: Constants.Defaults.todoExcludedCategories) ?? []
+        return Set(arr.compactMap { EmailCategory(rawValue: $0) })
+    }
+    
+    /// Toggle an email category exclusion on or off.
+    /// When enabling an exclusion, also soft-deletes existing email-sourced to-dos
+    /// that match the category (based on stored sender + subject metadata).
+    func toggleCategoryExclusion(_ category: EmailCategory) {
+        var arr = UserDefaults.standard.stringArray(forKey: Constants.Defaults.todoExcludedCategories) ?? []
+        
+        if arr.contains(category.rawValue) {
+            // Remove — re-enable this category
+            arr.removeAll { $0 == category.rawValue }
+            UserDefaults.standard.set(arr, forKey: Constants.Defaults.todoExcludedCategories)
+            print("[TodoRepository] Re-enabled category: \(category.label)")
+        } else {
+            // Add — exclude this category
+            arr.append(category.rawValue)
+            UserDefaults.standard.set(arr, forKey: Constants.Defaults.todoExcludedCategories)
+            
+            // Retroactively soft-delete matching email-sourced to-dos
+            let allTodos = fetchAllTodos()
+            var removedCount = 0
+            for todo in allTodos where todo.sourceType == .email {
+                let matched = EmailCategory.classifyFromTodoMetadata(
+                    senderEmail: todo.senderEmail,
+                    sourceTitle: todo.sourceTitle
+                )
+                if matched.contains(category) {
+                    todo.isDeleted = true
+                    syncService?.pushTodo(todo)
+                    removedCount += 1
+                }
+            }
+            if removedCount > 0 { save() }
+            
+            print("[TodoRepository] Excluded category: \(category.label) (removed \(removedCount) existing to-dos)")
+        }
+    }
+    
+    /// Check whether a specific category is excluded.
+    func isCategoryExcluded(_ category: EmailCategory) -> Bool {
+        excludedCategories().contains(category)
+    }
+    
+    /// Check whether a Gmail message should be skipped based on category exclusions.
+    /// Returns the matched excluded categories (empty if the message should be processed).
+    func matchesExcludedCategory(
+        subject: String,
+        fromEmail: String,
+        labelIds: [String] = [],
+        attachmentFilenames: [String] = [],
+        attachmentMimeTypes: [String] = []
+    ) -> Set<EmailCategory> {
+        let excluded = excludedCategories()
+        guard !excluded.isEmpty else { return [] }
+        
+        let detected = EmailCategory.classify(
+            subject: subject,
+            fromEmail: fromEmail,
+            labelIds: labelIds,
+            attachmentFilenames: attachmentFilenames,
+            attachmentMimeTypes: attachmentMimeTypes
+        )
+        
+        return detected.intersection(excluded)
+    }
+    
+    /// Total number of active exclusion rules (senders + categories).
+    func totalExclusionCount() -> Int {
+        excludedSenders().count + excludedCategories().count
     }
     
     // MARK: - Private

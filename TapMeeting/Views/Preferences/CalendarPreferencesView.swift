@@ -1,16 +1,17 @@
 import SwiftUI
 
 /// Preferences section for managing calendar connections.
-/// Supports multiple Google Calendar accounts and shows Apple Calendar status.
+/// Primary Google Calendar is Supabase-managed; additional accounts use loopback OAuth.
 struct CalendarPreferencesView: View {
     
     @Environment(AppState.self) private var appState
-    @State private var clientID: String = ""
-    @State private var clientSecret: String = ""
-    @State private var showCredentialsField = false
     
     private var googleCal: GoogleCalendarService {
         appState.googleCalendarService
+    }
+    
+    private var gmail: GmailService {
+        appState.gmailService
     }
     
     var body: some View {
@@ -37,7 +38,6 @@ struct CalendarPreferencesView: View {
                             .padding(.vertical, 12)
                         
                         if googleCal.isSupabaseAccount(account) {
-                            // Primary Supabase account — cannot be disconnected independently
                             SettingsStatusRow(
                                 icon: "checkmark.circle.fill",
                                 title: "Google Calendar (Primary)",
@@ -45,157 +45,78 @@ struct CalendarPreferencesView: View {
                                 status: .connected
                             )
                         } else {
-                            // Additional account — can be disconnected
-                            SettingsStatusRow(
-                                icon: "checkmark.circle.fill",
-                                title: "Google Calendar",
-                                subtitle: account.email,
-                                status: .connected,
-                                action: { googleCal.disconnect(accountId: account.id) },
-                                actionLabel: "Disconnect"
-                            )
-                        }
-                    }
-                }
-            }
-            
-            // Google Credentials
-            SettingsCard(title: "Google Integration") {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Credentials toggle
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showCredentialsField.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(Theme.olive.opacity(0.08))
-                                    .frame(width: 32, height: 32)
-                                Image(systemName: "key")
-                                    .font(.system(size: 13))
-                                    .foregroundColor(Theme.olive)
-                            }
-                            
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Google Cloud Credentials")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundColor(Theme.textPrimary)
-                                Text("Required for Google Calendar and Gmail integration")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(Theme.textTertiary)
-                            }
-                            
-                            Spacer()
-                            
-                            Image(systemName: showCredentialsField ? "chevron.up" : "chevron.down")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(Theme.textTertiary)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    
-                    if showCredentialsField {
-                        VStack(alignment: .leading, spacing: 10) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("OAuth Client ID (Desktop app)")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundColor(Theme.textSecondary)
-                                
-                                TextField("xxxxx.apps.googleusercontent.com", text: $clientID)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .padding(8)
-                                    .background(Theme.background)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(Theme.divider, lineWidth: 1)
-                                    )
-                                    .cornerRadius(6)
-                            }
-                            
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text("OAuth Client Secret")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundColor(Theme.textSecondary)
-                                
-                                SecureField("GOCSPX-xxxxx", text: $clientSecret)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .padding(8)
-                                    .background(Theme.background)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(Theme.divider, lineWidth: 1)
-                                    )
-                                    .cornerRadius(6)
-                            }
-                            
-                            HStack(spacing: 6) {
-                                Image(systemName: "info.circle")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(Theme.textQuaternary)
-                                Text("Create at console.cloud.google.com → APIs & Services → Credentials")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(Theme.textQuaternary)
-                            }
-                            
-                            if !clientID.isEmpty && !clientSecret.isEmpty {
-                                Button("Save Credentials") {
-                                    googleCal.setClientID(clientID.trimmingCharacters(in: .whitespaces))
-                                    googleCal.setClientSecret(clientSecret.trimmingCharacters(in: .whitespaces))
+                            HStack(spacing: 12) {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(Theme.sidebarSelection)
+                                        .frame(width: 32, height: 32)
+                                    Image(systemName: "calendar")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(Theme.textSecondary)
                                 }
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 6)
-                                .background(Theme.olive)
-                                .cornerRadius(6)
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(account.email)
+                                        .font(.system(size: 13, weight: .medium))
+                                        .foregroundColor(Theme.textPrimary)
+                                    Text("Additional account")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(Theme.textTertiary)
+                                }
+                                
+                                Spacer()
+                                
+                                Button {
+                                    googleCal.disconnect(accountId: account.id)
+                                } label: {
+                                    Text("Remove")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundColor(Theme.recording)
+                                }
                                 .buttonStyle(.plain)
                             }
                         }
-                        .padding(14)
-                        .background(Theme.background)
-                        .cornerRadius(8)
                     }
-                    
-                    // Add account button (requires Google OAuth credentials)
-                    Button {
-                        googleCal.signIn()
-                    } label: {
-                        HStack(spacing: 6) {
-                            if googleCal.isAuthenticating {
-                                ProgressView()
-                                    .controlSize(.small)
-                                Text("Connecting…")
-                            } else {
-                                Image(systemName: "calendar.badge.plus")
-                                    .font(.system(size: 12))
-                                Text(googleCal.accounts.isEmpty
-                                     ? "Connect Google Calendar"
-                                     : "Add Another Google Account")
-                            }
-                        }
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 9)
-                        .background(Theme.olive)
-                        .cornerRadius(8)
+                }
+                
+                // Add Another Account button (uses Gmail's combined OAuth flow)
+                Button {
+                    gmail.signInAdditionalAccount()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: 12))
+                        Text("Add Another Google Account")
+                            .font(.system(size: 12, weight: .medium))
                     }
-                    .buttonStyle(.plain)
-                    .disabled(googleCal.isAuthenticating || !googleCal.hasCredentials)
-                    
-                    if !googleCal.hasCredentials && !googleCal.accounts.isEmpty {
-                        HStack(spacing: 6) {
-                            Image(systemName: "info.circle")
-                                .font(.system(size: 10))
-                                .foregroundColor(Theme.textQuaternary)
-                            Text("Configure Google OAuth credentials below to add another account.")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.textTertiary)
-                        }
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.vertical, 6)
+                    .padding(.horizontal, 12)
+                    .background(Theme.sidebarSelection)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .disabled(gmail.isAuthenticating)
+            }
+            
+            // Google integration info
+            SettingsCard(title: "Google Integration") {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.shield")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.olive)
+                        Text("Your primary Google account is managed through Supabase auth.")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                    }
+                    HStack(spacing: 6) {
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 10))
+                            .foregroundColor(Theme.textQuaternary)
+                        Text("To reconnect your primary account, sign out and sign back in from the Account section.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textTertiary)
                     }
                     
                     if let error = googleCal.authError {
@@ -209,10 +130,6 @@ struct CalendarPreferencesView: View {
                     }
                 }
             }
-        }
-        .onAppear {
-            clientID = KeychainHelper.get(key: Constants.Keychain.googleClientID) ?? ""
-            clientSecret = KeychainHelper.get(key: Constants.Keychain.googleClientSecret) ?? ""
         }
     }
 }

@@ -14,15 +14,17 @@ struct ShimmerThinkingView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Thinking text with shimmer
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 11))
-                    .foregroundColor(Theme.olive)
-                
-                Text(text)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(shimmerGradient)
+            // Thinking text with shimmer (hidden when text is empty)
+            if !text.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: icon)
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.olive)
+                    
+                    Text(text)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(shimmerGradient)
+                }
             }
             
             // Skeleton lines (optional)

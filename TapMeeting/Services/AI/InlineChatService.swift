@@ -99,6 +99,61 @@ final class InlineChatService {
         return response.text ?? "Sorry, I couldn't generate a response."
     }
     
+    // MARK: - Catch-Up (Anthropic / Claude Sonnet)
+    
+    private let catchUpSystemPrompt = """
+    You are a concise meeting catch-up assistant. The user stepped away and wants a quick summary \
+    of what was discussed in a specific time window of the meeting transcript. \
+    Be articulate but brief — use 2-4 bullet points max. Each bullet should be one sentence. \
+    Focus on decisions, key points, and action items. Skip filler and small talk. \
+    Never repeat the question. Use Australian English spelling.
+    """
+    
+    /// Summarise a time window of transcript using Claude Sonnet for fast, concise responses.
+    func catchUp(transcriptSlice: String, windowLabel: String) async throws -> String {
+        let apiKey = KeychainHelper.get(key: Constants.Keychain.anthropicAPIKey) ?? ""
+        guard !apiKey.isEmpty else {
+            throw EnhancementError.missingAPIKey
+        }
+        
+        guard !transcriptSlice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return "Nothing was said in the \(windowLabel)."
+        }
+        
+        let userContent = """
+        Here is the meeting transcript from the \(windowLabel):
+        
+        \(transcriptSlice)
+        
+        Summarise what I missed.
+        """
+        
+        let body = CatchUpAnthropicRequest(
+            model: Constants.AI.anthropicSonnetModel,
+            max_tokens: Constants.AI.maxCatchUpTokens,
+            system: catchUpSystemPrompt,
+            messages: [CatchUpAnthropicMessage(role: "user", content: userContent)]
+        )
+        
+        let url = URL(string: Constants.AI.anthropicEndpoint)!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue(Constants.AI.anthropicVersion, forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        
+        let data = try await performRequest(request)
+        let response = try JSONDecoder().decode(CatchUpAnthropicResponse.self, from: data)
+        
+        guard let text = response.content.first(where: { $0.type == "text" })?.text?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return "Sorry, I couldn't generate a summary."
+        }
+        
+        return text
+    }
+    
     // MARK: - Private Helpers
     
     /// Execute a request with automatic retry for transient network failures.
@@ -136,5 +191,28 @@ final class InlineChatService {
         }
         
         throw EnhancementError.networkError(lastError)
+    }
+}
+
+// MARK: - Anthropic API Types (Catch-Up)
+
+private struct CatchUpAnthropicRequest: Encodable {
+    let model: String
+    let max_tokens: Int
+    let system: String
+    let messages: [CatchUpAnthropicMessage]
+}
+
+private struct CatchUpAnthropicMessage: Encodable {
+    let role: String
+    let content: String
+}
+
+private struct CatchUpAnthropicResponse: Decodable {
+    let content: [ContentBlock]
+    
+    struct ContentBlock: Decodable {
+        let type: String
+        let text: String?
     }
 }

@@ -177,18 +177,6 @@ private struct PanelHeader: View {
                         .foregroundColor(showTranscript ? Theme.textPrimary : Theme.textQuaternary)
                 }
                 .buttonStyle(.plain)
-                
-                Button {
-                    appState.stopMeeting()
-                } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 8))
-                        .foregroundColor(.white)
-                        .frame(width: 18, height: 18)
-                        .background(Theme.recording)
-                        .cornerRadius(4)
-                }
-                .buttonStyle(.plain)
             }
         }
         .padding(.horizontal, 20)

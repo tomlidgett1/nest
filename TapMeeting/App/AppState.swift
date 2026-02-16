@@ -50,7 +50,10 @@ final class AppState {
             // Trigger initial data fetch when Supabase auth is established
             if supabaseService?.isAuthenticated == true {
                 configureSemanticSearchStack()
-                Task { await googleCalendarService.fetchEvents() }
+                Task {
+                    await googleCalendarService.fetchAllCalendars()
+                    await googleCalendarService.fetchEvents()
+                }
                 Task {
                     await gmailService.fetchMessages()
                     gmailService.startPolling()
@@ -178,6 +181,9 @@ final class AppState {
         // Wire Google Calendar into the calendar service
         calendarService.googleCalendarService = googleCalendarService
         
+        // Wire Gmail → Calendar so adding an account covers both services
+        gmailService.googleCalendarService = googleCalendarService
+        
         // When Google events arrive, refresh the merged calendar list
         googleCalendarService.onEventsFetched = { [weak self] in
             self?.calendarService.fetchUpcomingEvents()
@@ -185,7 +191,10 @@ final class AppState {
         
         // Fetch Google Calendar events on launch if any accounts are connected
         if !googleCalendarService.accounts.isEmpty {
-            Task { await googleCalendarService.fetchEvents() }
+            Task {
+                await googleCalendarService.fetchAllCalendars()
+                await googleCalendarService.fetchEvents()
+            }
         }
         
         // Fetch Gmail messages on launch if any accounts are connected, then start polling
@@ -612,8 +621,9 @@ final class AppState {
             UserDefaults.standard.stringArray(forKey: Constants.Defaults.processedTodoEmailMessageIds) ?? []
         )
         
-        // Load excluded senders so we can skip them entirely (saves API calls)
+        // Load exclusion rules so we can skip emails entirely (saves API calls)
         let excludedSenders = await MainActor.run { todoRepository.excludedSenders() }
+        let excludedCategories = await MainActor.run { todoRepository.excludedCategories() }
         
         // Collect unprocessed messages, including the user's email for each
         // so the AI can determine if requests are directed at the user or others
@@ -628,6 +638,27 @@ final class AppState {
             if excludedSenders.contains(latestMessage.fromEmail.lowercased()) {
                 processedIds.insert(messageId)
                 continue
+            }
+            
+            // Skip obvious automated/noreply senders — never actionable
+            if Self.isAutomatedSender(latestMessage.fromEmail) {
+                processedIds.insert(messageId)
+                continue
+            }
+            
+            // Skip emails matching excluded categories
+            if !excludedCategories.isEmpty {
+                let detected = EmailCategory.classify(
+                    subject: latestMessage.subject,
+                    fromEmail: latestMessage.fromEmail,
+                    labelIds: latestMessage.labelIds,
+                    attachmentFilenames: latestMessage.attachments.map(\.filename),
+                    attachmentMimeTypes: latestMessage.attachments.map(\.mimeType)
+                )
+                if !detected.intersection(excludedCategories).isEmpty {
+                    processedIds.insert(messageId)
+                    continue
+                }
             }
             
             let email = thread.accountEmail.isEmpty
@@ -654,10 +685,11 @@ final class AppState {
             return map
         }
         
-        // Extract to-dos from all unprocessed messages, with dedup context
+        // Extract to-dos from all unprocessed messages, with dedup context + category exclusions
         let todos = await todoExtractionService.extractFromEmails(
             unprocessed,
-            existingTodosByThread: existingTodosByThread
+            existingTodosByThread: existingTodosByThread,
+            excludedCategories: excludedCategories
         )
         
         if !todos.isEmpty {
@@ -1254,6 +1286,7 @@ final class AppState {
         let inboxThreads = await MainActor.run { gmailService.inboxThreads }
         let defaultEmail = await MainActor.run { gmailService.connectedEmail ?? "" }
         let excludedSenders = await MainActor.run { todoRepository.excludedSenders() }
+        let excludedCategories = await MainActor.run { todoRepository.excludedCategories() }
         
         var unprocessed: [(message: GmailMessage, threadId: String, userEmail: String)] = []
         var newProcessedIds = processedIds
@@ -1266,6 +1299,27 @@ final class AppState {
             if excludedSenders.contains(latestMessage.fromEmail.lowercased()) {
                 newProcessedIds.insert(latestMessage.id)
                 continue
+            }
+            
+            // Skip obvious automated/noreply senders
+            if Self.isAutomatedSender(latestMessage.fromEmail) {
+                newProcessedIds.insert(latestMessage.id)
+                continue
+            }
+            
+            // Skip emails matching excluded categories
+            if !excludedCategories.isEmpty {
+                let detected = EmailCategory.classify(
+                    subject: latestMessage.subject,
+                    fromEmail: latestMessage.fromEmail,
+                    labelIds: latestMessage.labelIds,
+                    attachmentFilenames: latestMessage.attachments.map(\.filename),
+                    attachmentMimeTypes: latestMessage.attachments.map(\.mimeType)
+                )
+                if !detected.intersection(excludedCategories).isEmpty {
+                    newProcessedIds.insert(latestMessage.id)
+                    continue
+                }
             }
             
             let email = thread.accountEmail.isEmpty ? defaultEmail : thread.accountEmail
@@ -1290,7 +1344,8 @@ final class AppState {
         
         let todos = await todoExtractionService.extractFromEmails(
             unprocessed,
-            existingTodosByThread: existingTodosByThread
+            existingTodosByThread: existingTodosByThread,
+            excludedCategories: excludedCategories
         )
         
         if !todos.isEmpty {
@@ -1307,6 +1362,57 @@ final class AppState {
         // Persist processed IDs
         let trimmed = Array(newProcessedIds.suffix(500))
         UserDefaults.standard.set(trimmed, forKey: Constants.Defaults.processedTodoEmailMessageIds)
+    }
+    
+    // MARK: - Automated Sender Detection
+    
+    /// Returns true if the sender email looks like an automated/noreply address.
+    /// These are never actionable so we skip them entirely before calling the AI.
+    static func isAutomatedSender(_ email: String) -> Bool {
+        let lower = email.lowercased()
+        
+        // Noreply / no-reply patterns
+        let noReplyPrefixes = [
+            "noreply@", "no-reply@", "no_reply@", "donotreply@",
+            "do-not-reply@", "do_not_reply@", "mailer-daemon@",
+            "postmaster@", "notifications@", "notification@",
+            "alert@", "alerts@", "info@", "news@", "newsletter@",
+            "marketing@", "promo@", "promotions@", "updates@",
+            "support@", "hello@", "team@", "billing@", "receipt@",
+            "receipts@", "invoice@", "invoices@", "statement@",
+            "statements@", "security@", "verify@", "verification@",
+            "confirm@", "confirmation@", "account@", "accounts@",
+            "service@", "services@", "system@", "auto@", "automated@",
+            "digest@", "summary@", "feedback@", "survey@"
+        ]
+        
+        if noReplyPrefixes.contains(where: { lower.hasPrefix($0) }) {
+            return true
+        }
+        
+        // Common automated sender domains
+        let automatedDomains = [
+            "amazonses.com", "sendgrid.net", "mailchimp.com",
+            "mandrillapp.com", "mailgun.org", "postmarkapp.com",
+            "hubspot.com", "intercom-mail.com", "notify.bugsnag.com",
+            "github.com", "gitlab.com", "atlassian.net",
+            "jira.com", "linear.app", "notion.so",
+            "slack.com", "figma.com", "vercel.com",
+            "stripe.com", "paypal.com", "square.com",
+            "shopify.com", "calendly.com", "zoom.us",
+            "facebookmail.com", "linkedin.com", "twitter.com",
+            "twittermail.com", "pinterest.com", "instagram.com",
+            "youtube.com", "google.com", "apple.com",
+            "microsoft.com", "dropbox.com", "canva.com",
+            "trello.com", "asana.com", "monday.com"
+        ]
+        
+        let domain = lower.components(separatedBy: "@").last ?? ""
+        if automatedDomains.contains(domain) {
+            return true
+        }
+        
+        return false
     }
 }
 

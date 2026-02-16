@@ -254,6 +254,15 @@ final class TranscriptStore {
         }.joined(separator: "\n")
     }
     
+    /// Transcript text filtered to the last N seconds.
+    func transcriptText(lastSeconds seconds: TimeInterval) -> String {
+        let cutoff = Date.now.addingTimeInterval(-seconds)
+        return allUtterances
+            .filter { $0.endTime >= cutoff }
+            .map { "[\($0.source.displayLabel)] \($0.text)" }
+            .joined(separator: "\n")
+    }
+    
     var silenceDuration: TimeInterval {
         guard let lastEnd = allUtterances.last?.endTime else { return 0 }
         return Date.now.timeIntervalSince(lastEnd)

@@ -238,6 +238,14 @@ CREATE TABLE app_config (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Google OAuth token vault (per-user refresh token for server-side token broker)
+CREATE TABLE google_oauth_tokens (
+    user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    refresh_token TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ============================================================
 -- 2. INDEXES
 -- ============================================================
@@ -267,6 +275,7 @@ CREATE INDEX idx_contact_rules_user_id ON contact_rules(user_id);
 CREATE INDEX idx_todos_user_id ON todos(user_id);
 CREATE INDEX idx_todos_user_completed ON todos(user_id, is_completed);
 CREATE INDEX idx_todos_source ON todos(user_id, source_type, source_id);
+CREATE INDEX idx_google_oauth_tokens_user_id ON google_oauth_tokens(user_id);
 
 -- ============================================================
 -- 3. ROW LEVEL SECURITY
@@ -287,6 +296,7 @@ ALTER TABLE search_embeddings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE email_messages ENABLE ROW LEVEL SECURITY;
 ALTER TABLE search_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE todos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE google_oauth_tokens ENABLE ROW LEVEL SECURITY;
 
 -- Profiles
 CREATE POLICY profiles_select ON profiles FOR SELECT USING (id = auth.uid());
@@ -305,6 +315,7 @@ CREATE POLICY search_embeddings_all ON search_embeddings FOR ALL USING (user_id 
 CREATE POLICY email_messages_all ON email_messages FOR ALL USING (user_id = auth.uid());
 CREATE POLICY search_jobs_all ON search_jobs FOR ALL USING (user_id = auth.uid());
 CREATE POLICY todos_all ON todos FOR ALL USING (user_id = auth.uid());
+CREATE POLICY google_oauth_tokens_all ON google_oauth_tokens FOR ALL USING (user_id = auth.uid());
 
 -- Note-tags: accessible if the user owns the note
 CREATE POLICY note_tags_all ON note_tags FOR ALL
@@ -357,6 +368,7 @@ CREATE TRIGGER set_updated_at BEFORE UPDATE ON search_documents FOR EACH ROW EXE
 CREATE TRIGGER set_updated_at BEFORE UPDATE ON email_messages FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER set_updated_at BEFORE UPDATE ON search_jobs FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 CREATE TRIGGER set_updated_at BEFORE UPDATE ON todos FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+CREATE TRIGGER set_updated_at BEFORE UPDATE ON google_oauth_tokens FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- ============================================================
 -- 5. RPC FUNCTIONS (HYBRID + SEMANTIC SEARCH)

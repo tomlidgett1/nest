@@ -230,6 +230,7 @@ struct EmailDraft {
     var bcc: [String] = []
     var subject: String = ""
     var body: String = ""
+    var bodyHTML: String?       // HTML version for forwards/replies with rich content
     var inReplyTo: String?      // for replies
     var references: String?     // for reply threading
     var threadId: String?       // for reply threading
@@ -301,6 +302,43 @@ final class GmailService {
     /// Brief success message after send.
     var sendSuccess: Bool = false
     
+    // MARK: - Pagination
+    
+    /// Next-page tokens per mailbox per account: `[mailbox.rawValue: [account.id: token]]`.
+    private var mailboxPageTokens: [String: [String: String?]] = [:]
+    
+    /// Whether more threads can be loaded for the current mailbox.
+    var canLoadMore: Bool {
+        let key = currentMailbox.rawValue
+        guard let accountTokens = mailboxPageTokens[key] else { return false }
+        return accountTokens.values.contains { $0 != nil }
+    }
+    
+    /// Whether a "load more" operation is in progress.
+    private(set) var isLoadingMore = false
+    
+    // MARK: - Search
+    
+    /// The active search query. Empty string = not searching.
+    var searchQuery: String = ""
+    
+    /// Threads matching the current search query.
+    private(set) var searchResults: [GmailThread] = []
+    
+    /// Whether a search is currently in progress.
+    private(set) var isSearching = false
+    
+    /// Next-page tokens for search results per account: `[account.id: token]`.
+    private var searchPageTokens: [String: String?] = [:]
+    
+    /// Whether more search results can be loaded.
+    var canLoadMoreSearch: Bool {
+        searchPageTokens.values.contains { $0 != nil }
+    }
+    
+    /// Estimated total result count from the last search (from Gmail's `resultSizeEstimate`).
+    private(set) var searchResultEstimate: Int = 0
+    
     // MARK: - Polling
     
     /// Background timer that polls for new emails.
@@ -317,6 +355,9 @@ final class GmailService {
     var supabaseService: SupabaseService? {
         didSet { ensureSupabaseAccount() }
     }
+
+    /// Reference to GoogleCalendarService so adding an additional account also adds Calendar access.
+    weak var googleCalendarService: GoogleCalendarService?
 
     /// Whether connected via Supabase (single Google login) or legacy multi-account.
     var isConnectedViaSupabase: Bool { supabaseService?.isAuthenticated ?? false }
@@ -356,16 +397,21 @@ final class GmailService {
     // MARK: - Account Storage
     
     private func loadAccounts() {
+        // Load persisted additional (non-Supabase) accounts.
         if let data = UserDefaults.standard.data(forKey: Constants.Defaults.gmailAccounts),
            let decoded = try? JSONDecoder().decode([GmailAccount].self, from: data) {
-            accounts = decoded
+            // Keep only additional accounts — the Supabase account is injected dynamically.
+            accounts = decoded.filter { $0.id != "supabase" }
+        } else {
+            accounts = []
         }
+        authError = nil
     }
     
     private func saveAccounts() {
-        // Only persist non-Supabase accounts — the Supabase account is managed dynamically
-        let legacyAccounts = accounts.filter { $0.id != "supabase" }
-        if let data = try? JSONEncoder().encode(legacyAccounts) {
+        // Persist only additional (non-Supabase) accounts.
+        let additional = accounts.filter { $0.id != "supabase" }
+        if let data = try? JSONEncoder().encode(additional) {
             UserDefaults.standard.set(data, forKey: Constants.Defaults.gmailAccounts)
         }
     }
@@ -374,59 +420,58 @@ final class GmailService {
     /// Called when `supabaseService` is set or when authentication state may have changed.
     func ensureSupabaseAccount() {
         guard let supa = supabaseService, supa.isAuthenticated else {
-            // Remove Supabase account when signed out
-            if accounts.contains(where: { $0.id == "supabase" }) {
-                accounts.removeAll { $0.id == "supabase" }
-            }
+            // Remove the Supabase account but keep any additional accounts.
+            accounts.removeAll { $0.id == "supabase" }
             return
         }
         
         let email = supa.currentUserEmail ?? "user"
+        let addedAt = accounts.first(where: { $0.id == "supabase" })?.addedAt ?? .now
+        let supabaseAccount = GmailAccount(id: "supabase", email: email, addedAt: addedAt)
         
-        if let existingIdx = accounts.firstIndex(where: { $0.id == "supabase" }) {
-            // Update email if it changed
-            if accounts[existingIdx].email != email {
-                accounts[existingIdx] = GmailAccount(id: "supabase", email: email, addedAt: accounts[existingIdx].addedAt)
-            }
-        } else {
-            // Insert at the beginning so it's the primary/default account
-            accounts.insert(GmailAccount(id: "supabase", email: email, addedAt: .now), at: 0)
-        }
+        // Ensure Supabase account is first, followed by any additional accounts.
+        let additional = accounts.filter { $0.id != "supabase" }
+        accounts = [supabaseAccount] + additional
     }
     
-    // MARK: - OAuth Flow
+    // MARK: - OAuth Flow (Additional Accounts)
     
-    func signIn() {
-        guard !clientID.isEmpty else {
-            authError = "No Google Client ID configured. Set one in Preferences → Calendars."
-            return
-        }
-        guard !clientSecret.isEmpty else {
-            authError = "No Google Client Secret configured. Set one in Preferences → Calendars."
+    /// Start the Google OAuth sign-in flow to add an additional account.
+    /// Requests both Gmail and Calendar scopes so one flow covers everything.
+    func signInAdditionalAccount() {
+        guard let cid = supabaseService?.googleClientID, !cid.isEmpty,
+              let secret = supabaseService?.googleClientSecret, !secret.isEmpty else {
+            authError = "Google credentials not configured. Contact your admin."
             return
         }
         
+        guard !isAuthenticating else { return }
         isAuthenticating = true
         authError = nil
         
+        // Start loopback server to receive the OAuth callback
+        loopbackServer?.stop()
         loopbackServer = LoopbackServer(
             port: Constants.Gmail.loopbackPort,
-            successTitle: "Connected to Gmail"
+            successTitle: "Google Account Connected"
         ) { [weak self] code in
-            self?.loopbackServer?.stop()
-            self?.loopbackServer = nil
-            Task { await self?.exchangeCodeForTokens(code) }
+            guard let self else { return }
+            Task { await self.exchangeCodeForTokens(code) }
         }
         loopbackServer?.start()
         
+        // Combined scopes: Gmail + Calendar in one consent screen
+        let combinedScopes = Constants.Gmail.scopes + " " + Constants.GoogleCalendar.scopes
+        
+        // Build the Google OAuth URL
         var components = URLComponents(string: Constants.Gmail.authURL)!
         components.queryItems = [
-            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "client_id", value: cid),
             URLQueryItem(name: "redirect_uri", value: Constants.Gmail.redirectURI),
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope", value: Constants.Gmail.scopes),
+            URLQueryItem(name: "scope", value: combinedScopes),
             URLQueryItem(name: "access_type", value: "offline"),
-            URLQueryItem(name: "prompt", value: "consent select_account"),
+            URLQueryItem(name: "prompt", value: "consent"),
         ]
         
         if let url = components.url {
@@ -434,23 +479,27 @@ final class GmailService {
         }
     }
     
+    func signIn() {
+        // Primary Gmail is connected through Supabase; use signInAdditionalAccount() for extras.
+        signInAdditionalAccount()
+    }
+    
     func disconnect(accountId: String) {
-        // Don't allow disconnecting the Supabase primary account (sign out via Supabase instead)
+        // Cannot disconnect the Supabase primary account from here.
         guard accountId != "supabase" else { return }
-        guard let account = accounts.first(where: { $0.id == accountId }) else { return }
         
-        KeychainHelper.delete(key: account.accessTokenKey)
-        KeychainHelper.delete(key: account.refreshTokenKey)
-        latestHistoryIds.removeValue(forKey: account.id)
+        // Remove Gmail tokens and account entry
+        if let account = accounts.first(where: { $0.id == accountId }) {
+            KeychainHelper.delete(key: account.accessTokenKey)
+            KeychainHelper.delete(key: account.refreshTokenKey)
+        }
         accounts.removeAll { $0.id == accountId }
         saveAccounts()
         
-        if accounts.isEmpty {
-            stopPolling()
-        }
+        // Also remove from Calendar service
+        googleCalendarService?.removeAdditionalAccount(id: accountId)
         
-        Task { await fetchMailbox(.inbox) }
-        print("[Gmail] Disconnected: \(account.email)")
+        print("[Gmail] Disconnected additional account: \(accountId)")
     }
     
     func signOut() {
@@ -538,7 +587,7 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             
             // 404 means the historyId is too old / invalid — need full refresh
@@ -577,10 +626,14 @@ final class GmailService {
     // MARK: - Token Exchange
     
     private func exchangeCodeForTokens(_ code: String) async {
+        // Use appConfig credentials directly (same source as the OAuth URL)
+        // to avoid Keychain timing issues.
+        let cid = supabaseService?.googleClientID ?? clientID
+        let secret = supabaseService?.googleClientSecret ?? clientSecret
         let body = [
             "code": code,
-            "client_id": clientID,
-            "client_secret": clientSecret,
+            "client_id": cid,
+            "client_secret": secret,
             "redirect_uri": Constants.Gmail.redirectURI,
             "grant_type": "authorization_code",
         ]
@@ -605,21 +658,36 @@ final class GmailService {
             let accountId = UUID().uuidString
             let account = GmailAccount(id: accountId, email: emailStr, addedAt: .now)
             
+            // Store Gmail tokens
             KeychainHelper.set(key: account.accessTokenKey, value: tokenResponse.accessToken)
             if let refresh = tokenResponse.refreshToken {
                 KeychainHelper.set(key: account.refreshTokenKey, value: refresh)
             }
             
+            // Also register this account in GoogleCalendarService (same tokens, same ID)
+            let calAccount = GoogleCalendarAccount(id: accountId, email: emailStr, addedAt: .now)
+            KeychainHelper.set(key: calAccount.accessTokenKey, value: tokenResponse.accessToken)
+            if let refresh = tokenResponse.refreshToken {
+                KeychainHelper.set(key: calAccount.refreshTokenKey, value: refresh)
+            }
+            
             await MainActor.run {
                 accounts.append(account)
                 saveAccounts()
+                
+                // Add to Calendar service
+                googleCalendarService?.addAdditionalAccount(calAccount)
+                
                 isAuthenticating = false
                 authError = nil
             }
             
-            print("[Gmail] ✓ Connected: \(emailStr)")
+            print("[Gmail] ✓ Connected (Gmail + Calendar): \(emailStr)")
             await fetchMailbox(.inbox)
             await MainActor.run { startPolling() }
+            
+            // Fetch calendar events for the new account
+            await googleCalendarService?.fetchEvents()
             
         } catch {
             await MainActor.run {
@@ -635,10 +703,12 @@ final class GmailService {
             return nil
         }
         
+        let cid = supabaseService?.googleClientID ?? clientID
+        let secret = supabaseService?.googleClientSecret ?? clientSecret
         let body = [
             "refresh_token": refreshToken,
-            "client_id": clientID,
-            "client_secret": clientSecret,
+            "client_id": cid,
+            "client_secret": secret,
             "grant_type": "refresh_token",
         ]
         
@@ -667,7 +737,11 @@ final class GmailService {
             return
         }
         
-        await MainActor.run { isFetching = true }
+        // Clear page tokens for this mailbox (fresh fetch)
+        await MainActor.run {
+            isFetching = true
+            mailboxPageTokens[mailbox.rawValue] = [:]
+        }
         
         var allThreads: [GmailThread] = []
         
@@ -683,7 +757,6 @@ final class GmailService {
         }
         
         let sorted = allThreads.sorted { $0.date > $1.date }
-        let limited = Array(sorted.prefix(25))
         
         // Snapshot the latest historyId per account (for efficient polling)
         await updateHistoryIds()
@@ -692,7 +765,7 @@ final class GmailService {
         var newThreadsToNotify: [GmailThread] = []
         if mailbox == .inbox, onNewEmailsDetected != nil {
             let previousIds = await MainActor.run { Set(inboxThreads.map(\.id)) }
-            let newUnread = limited.filter { $0.isUnread && !previousIds.contains($0.id) }
+            let newUnread = sorted.filter { $0.isUnread && !previousIds.contains($0.id) }
             if !previousIds.isEmpty && !newUnread.isEmpty {
                 newThreadsToNotify = newUnread
             }
@@ -701,23 +774,237 @@ final class GmailService {
         let threadsToNotify = newThreadsToNotify
         await MainActor.run {
             switch mailbox {
-            case .inbox: self.inboxThreads = limited
-            case .sent: self.sentThreads = limited
-            case .drafts: self.draftThreads = limited
-            case .archived: self.archivedThreads = limited
-            case .bin: self.trashThreads = limited
+            case .inbox: self.inboxThreads = sorted
+            case .sent: self.sentThreads = sorted
+            case .drafts: self.draftThreads = sorted
+            case .archived: self.archivedThreads = sorted
+            case .bin: self.trashThreads = sorted
             }
             self.isFetching = false
-            self.onThreadsFetched?(mailbox, limited)
+            self.onThreadsFetched?(mailbox, sorted)
             
             if !threadsToNotify.isEmpty, let callback = self.onNewEmailsDetected {
                 callback(threadsToNotify)
             }
         }
         
-        print("[Gmail] Fetched \(limited.count) \(mailbox.displayName) threads")
+        print("[Gmail] Fetched \(sorted.count) \(mailbox.displayName) threads")
     }
 
+    // MARK: - Load More (Pagination)
+    
+    /// Load the next page of threads for the given mailbox and append them.
+    func loadMoreThreads(_ mailbox: Mailbox) async {
+        let mailboxKey = mailbox.rawValue
+        guard let accountTokens = mailboxPageTokens[mailboxKey] else { return }
+        
+        // Only load accounts that still have a next page
+        let accountsWithMore = accounts.filter { accountTokens[$0.id] != nil && accountTokens[$0.id] != nil }
+        guard !accountsWithMore.isEmpty else { return }
+        
+        await MainActor.run { isLoadingMore = true }
+        
+        var newThreads: [GmailThread] = []
+        
+        await withTaskGroup(of: [GmailThread].self) { group in
+            for account in accountsWithMore {
+                let token = accountTokens[account.id] ?? nil
+                guard let token else { continue }
+                group.addTask { [self] in
+                    await self.fetchThreadsForMailbox(mailbox, account: account, pageToken: token)
+                }
+            }
+            for await accountThreads in group {
+                newThreads.append(contentsOf: accountThreads)
+            }
+        }
+        
+        let sortedNew = newThreads.sorted { $0.date > $1.date }
+        
+        await MainActor.run {
+            switch mailbox {
+            case .inbox: self.inboxThreads.append(contentsOf: sortedNew)
+            case .sent: self.sentThreads.append(contentsOf: sortedNew)
+            case .drafts: self.draftThreads.append(contentsOf: sortedNew)
+            case .archived: self.archivedThreads.append(contentsOf: sortedNew)
+            case .bin: self.trashThreads.append(contentsOf: sortedNew)
+            }
+            self.isLoadingMore = false
+        }
+        
+        print("[Gmail] Loaded \(sortedNew.count) more \(mailbox.displayName) threads")
+    }
+    
+    // MARK: - Search
+    
+    /// Search threads across all connected accounts using Gmail query syntax.
+    func searchThreads(_ query: String) async {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        await MainActor.run {
+            searchQuery = trimmed
+            searchResults = []
+            searchPageTokens = [:]
+            searchResultEstimate = 0
+        }
+        
+        guard !trimmed.isEmpty, !accounts.isEmpty else { return }
+        
+        await MainActor.run { isSearching = true }
+        
+        // Determine which accounts to search
+        let targetAccounts: [GmailAccount]
+        if let filterId = filterAccountId,
+           let account = accounts.first(where: { $0.id == filterId }) {
+            targetAccounts = [account]
+        } else {
+            targetAccounts = accounts
+        }
+        
+        var allThreads: [GmailThread] = []
+        var totalEstimate = 0
+        
+        await withTaskGroup(of: (account: GmailAccount, threads: [GmailThread], result: ThreadListResult?).self) { group in
+            for account in targetAccounts {
+                group.addTask { [self] in
+                    guard let token = await self.validToken(for: account) else {
+                        return (account, [], nil)
+                    }
+                    let listResult = await self.listThreadIds(
+                        token: token,
+                        account: account,
+                        query: trimmed,
+                        maxResults: 50
+                    )
+                    guard let listResult, !listResult.ids.isEmpty else {
+                        return (account, [], listResult)
+                    }
+                    // Fetch full threads
+                    var threads: [GmailThread] = []
+                    await withTaskGroup(of: GmailThread?.self) { innerGroup in
+                        for threadId in listResult.ids {
+                            innerGroup.addTask { [self] in
+                                await self.fetchThread(id: threadId, token: token, account: account)
+                            }
+                        }
+                        for await thread in innerGroup {
+                            if let t = thread {
+                                threads.append(t)
+                            }
+                        }
+                    }
+                    // Tag threads
+                    let tagged = threads.map { thread -> GmailThread in
+                        var t = thread
+                        t.accountId = account.id
+                        t.accountEmail = account.email
+                        return t
+                    }
+                    return (account, tagged, listResult)
+                }
+            }
+            for await result in group {
+                allThreads.append(contentsOf: result.threads)
+                if let lr = result.result {
+                    totalEstimate += lr.resultSizeEstimate ?? 0
+                }
+                await MainActor.run {
+                    searchPageTokens[result.account.id] = result.result?.nextPageToken
+                }
+            }
+        }
+        
+        let sorted = allThreads.sorted { $0.date > $1.date }
+        
+        await MainActor.run {
+            searchResults = sorted
+            searchResultEstimate = totalEstimate
+            isSearching = false
+        }
+        
+        print("[Gmail] Search '\(trimmed)' returned \(sorted.count) threads (est. \(totalEstimate))")
+    }
+    
+    /// Load more search results using stored page tokens.
+    func loadMoreSearchResults() async {
+        let query = searchQuery
+        guard !query.isEmpty else { return }
+        
+        let accountsWithMore = accounts.filter {
+            if let token = searchPageTokens[$0.id] { return token != nil } else { return false }
+        }
+        guard !accountsWithMore.isEmpty else { return }
+        
+        await MainActor.run { isLoadingMore = true }
+        
+        var newThreads: [GmailThread] = []
+        
+        await withTaskGroup(of: (account: GmailAccount, threads: [GmailThread], result: ThreadListResult?).self) { group in
+            for account in accountsWithMore {
+                let pageToken = searchPageTokens[account.id] ?? nil
+                guard let pageToken else { continue }
+                group.addTask { [self] in
+                    guard let token = await self.validToken(for: account) else {
+                        return (account, [], nil)
+                    }
+                    let listResult = await self.listThreadIds(
+                        token: token,
+                        account: account,
+                        query: query,
+                        maxResults: 50,
+                        pageToken: pageToken
+                    )
+                    guard let listResult, !listResult.ids.isEmpty else {
+                        return (account, [], listResult)
+                    }
+                    var threads: [GmailThread] = []
+                    await withTaskGroup(of: GmailThread?.self) { innerGroup in
+                        for threadId in listResult.ids {
+                            innerGroup.addTask { [self] in
+                                await self.fetchThread(id: threadId, token: token, account: account)
+                            }
+                        }
+                        for await thread in innerGroup {
+                            if let t = thread {
+                                threads.append(t)
+                            }
+                        }
+                    }
+                    let tagged = threads.map { thread -> GmailThread in
+                        var t = thread
+                        t.accountId = account.id
+                        t.accountEmail = account.email
+                        return t
+                    }
+                    return (account, tagged, listResult)
+                }
+            }
+            for await result in group {
+                newThreads.append(contentsOf: result.threads)
+                await MainActor.run {
+                    searchPageTokens[result.account.id] = result.result?.nextPageToken
+                }
+            }
+        }
+        
+        let sorted = newThreads.sorted { $0.date > $1.date }
+        
+        await MainActor.run {
+            searchResults.append(contentsOf: sorted)
+            isLoadingMore = false
+        }
+        
+        print("[Gmail] Loaded \(sorted.count) more search results for '\(query)'")
+    }
+    
+    /// Clear the active search and return to normal mailbox view.
+    func clearSearch() {
+        searchQuery = ""
+        searchResults = []
+        searchPageTokens = [:]
+        searchResultEstimate = 0
+    }
+    
     func allThreads() -> [GmailThread] {
         var merged = inboxThreads + sentThreads + draftThreads + archivedThreads + trashThreads
         merged.sort { $0.date > $1.date }
@@ -734,7 +1021,7 @@ final class GmailService {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             
             do {
-                let (data, _) = try await URLSession.shared.data(for: request)
+                let (data, _) = try await resilientData(for: request)
                 if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let historyId = json["historyId"] as? String {
                     await MainActor.run { latestHistoryIds[account.id] = historyId }
@@ -750,15 +1037,20 @@ final class GmailService {
         await fetchMailbox(.inbox)
     }
     
-    /// Get the threads array for the given mailbox, respecting the current account filter.
+    /// Get the threads array for the given mailbox, respecting search and account filter.
     func threadsForMailbox(_ mailbox: Mailbox) -> [GmailThread] {
+        // When a search is active, show search results instead of mailbox contents
         let all: [GmailThread]
-        switch mailbox {
-        case .inbox: all = inboxThreads
-        case .sent: all = sentThreads
-        case .drafts: all = draftThreads
-        case .archived: all = archivedThreads
-        case .bin: all = trashThreads
+        if !searchQuery.isEmpty {
+            all = searchResults
+        } else {
+            switch mailbox {
+            case .inbox: all = inboxThreads
+            case .sent: all = sentThreads
+            case .drafts: all = draftThreads
+            case .archived: all = archivedThreads
+            case .bin: all = trashThreads
+            }
         }
         guard let filterId = filterAccountId else { return all }
         return all.filter { $0.accountId == filterId }
@@ -774,36 +1066,47 @@ final class GmailService {
         }
     }
     
-    private func fetchThreadsForMailbox(_ mailbox: Mailbox, account: GmailAccount) async -> [GmailThread] {
+    private func fetchThreadsForMailbox(_ mailbox: Mailbox, account: GmailAccount, pageToken: String? = nil) async -> [GmailThread] {
         guard let token = await validToken(for: account) else { return [] }
         
         // 1. List thread IDs
-        let threadIds: [String]?
+        let result: ThreadListResult?
         if mailbox == .archived {
             // Archived = not in any system mailbox. Use Gmail search query.
-            threadIds = await listThreadIds(
+            result = await listThreadIds(
                 token: token,
                 account: account,
                 query: "-in:inbox -in:sent -in:draft -in:trash -in:spam",
-                maxResults: 25
+                maxResults: 50,
+                pageToken: pageToken
             )
         } else {
-            threadIds = await listThreadIds(
+            result = await listThreadIds(
                 token: token,
                 account: account,
                 labelId: mailbox.rawValue,
-                maxResults: 25
+                maxResults: 50,
+                pageToken: pageToken
             )
         }
-        guard let threadIds else { return [] }
+        guard let result else { return [] }
+        
+        // Store pagination token for this account + mailbox
+        let mailboxKey = mailbox.rawValue
+        await MainActor.run {
+            if mailboxPageTokens[mailboxKey] == nil {
+                mailboxPageTokens[mailboxKey] = [:]
+            }
+            mailboxPageTokens[mailboxKey]?[account.id] = result.nextPageToken
+        }
         
         // 2. Fetch each thread's full details concurrently
         var threads: [GmailThread] = []
         
         await withTaskGroup(of: GmailThread?.self) { group in
-            for threadId in threadIds {
+            for threadId in result.ids {
                 group.addTask { [self] in
-                    await self.fetchThread(id: threadId, token: token)
+                    await self.fetchThread(id: threadId, token: token, account: account)
                 }
             }
             for await thread in group {
@@ -828,10 +1131,7 @@ final class GmailService {
         // Supabase-managed primary account — use Supabase-provided Google token
         if account.id == "supabase" {
             guard let supa = supabaseService else { return nil }
-            if let token = await supa.getGoogleAccessToken(), !token.isEmpty {
-                return token
-            }
-            if let token = await supa.refreshGoogleAccessToken(), !token.isEmpty {
+            if let token = await supa.validGoogleAccessToken(), !token.isEmpty {
                 return token
             }
             print("[Gmail] No valid Supabase Google token")
@@ -849,10 +1149,18 @@ final class GmailService {
         }
         return token
     }
+
+    /// Refresh token through the appropriate path (Supabase primary vs legacy account).
+    private func refreshTokenAfterUnauthorised(for account: GmailAccount) async -> String? {
+        if account.id == "supabase" {
+            return await supabaseService?.refreshGoogleAccessToken()
+        }
+        return await refreshAccessToken(for: account)
+    }
     
     /// Find a thread in any mailbox by its ID.
     private func findThreadInAnyMailbox(_ threadId: String) -> GmailThread? {
-        for threads in [inboxThreads, sentThreads, draftThreads, archivedThreads, trashThreads] {
+        for threads in [inboxThreads, sentThreads, draftThreads, archivedThreads, trashThreads, searchResults] {
             if let thread = threads.first(where: { $0.id == threadId }) {
                 return thread
             }
@@ -870,11 +1178,38 @@ final class GmailService {
         return accounts.first
     }
     
+    // MARK: - Cancellation-Resistant Network
+    
+    /// Perform a URL request using the callback-based URLSession API so it is
+    /// **not** automatically cancelled when the enclosing Swift `Task` is cancelled.
+    /// This prevents SwiftUI view-lifecycle cancellation from killing in-flight
+    /// Gmail API requests (NSURLErrorDomain Code=-999).
+    private func resilientData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, let response {
+                    continuation.resume(returning: (data, response))
+                } else {
+                    continuation.resume(throwing: URLError(.unknown))
+                }
+            }.resume()
+        }
+    }
+    
     // MARK: - List Thread IDs
+    
+    /// Result from listing thread IDs — includes pagination token.
+    private struct ThreadListResult {
+        let ids: [String]
+        let nextPageToken: String?
+        let resultSizeEstimate: Int?
+    }
     
     /// List thread IDs from `GET /users/me/threads`.
     /// Use `labelId` for standard Gmail labels (INBOX, SENT, etc.) or `query` for search-based filtering (e.g. archived).
-    private func listThreadIds(token: String, account: GmailAccount, labelId: String? = nil, query: String? = nil, maxResults: Int) async -> [String]? {
+    private func listThreadIds(token: String, account: GmailAccount, labelId: String? = nil, query: String? = nil, maxResults: Int, pageToken: String? = nil) async -> ThreadListResult? {
         var components = URLComponents(string: "\(Constants.Gmail.apiBase)/users/me/threads")!
         components.queryItems = [
             URLQueryItem(name: "maxResults", value: "\(maxResults)"),
@@ -892,21 +1227,27 @@ final class GmailService {
             components.queryItems?.append(URLQueryItem(name: "includeSpamTrash", value: "true"))
         }
         
+        if let pageToken {
+            components.queryItems?.append(URLQueryItem(name: "pageToken", value: pageToken))
+        }
+        
         guard let url = components.url else { return nil }
         
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             
             if statusCode == 401 {
-                if let newToken = await refreshAccessToken(for: account) {
+                // Refresh token using the correct path (Supabase vs legacy)
+                let newToken = await refreshTokenAfterUnauthorised(for: account)
+                if let newToken {
                     var retryRequest = URLRequest(url: url)
                     retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
-                    let (retryData, _) = try await URLSession.shared.data(for: retryRequest)
-                    return parseThreadIds(from: retryData)
+                    let (retryData, _) = try await resilientData(for: retryRequest)
+                    return parseThreadListResult(from: retryData)
                 }
                 return nil
             }
@@ -915,7 +1256,7 @@ final class GmailService {
                 print("[Gmail] List threads \(labelId ?? "nil") HTTP \(statusCode): \(String(data: data, encoding: .utf8)?.prefix(300) ?? "nil")")
             }
             
-            return parseThreadIds(from: data)
+            return parseThreadListResult(from: data)
             
         } catch {
             print("[Gmail] List threads failed for \(account.email): \(error)")
@@ -923,26 +1264,31 @@ final class GmailService {
         }
     }
     
-    private func parseThreadIds(from data: Data) -> [String] {
+    private func parseThreadListResult(from data: Data) -> ThreadListResult {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return []
+            return ThreadListResult(ids: [], nextPageToken: nil, resultSizeEstimate: nil)
         }
         if let error = json["error"] as? [String: Any] {
             let code = error["code"] as? Int ?? 0
             let message = error["message"] as? String ?? "Unknown error"
             print("[Gmail] API error \(code): \(message)")
-            return []
+            return ThreadListResult(ids: [], nextPageToken: nil, resultSizeEstimate: nil)
         }
-        guard let threads = json["threads"] as? [[String: Any]] else {
-            return []
+        let ids: [String]
+        if let threads = json["threads"] as? [[String: Any]] {
+            ids = threads.compactMap { $0["id"] as? String }
+        } else {
+            ids = []
         }
-        return threads.compactMap { $0["id"] as? String }
+        let nextPageToken = json["nextPageToken"] as? String
+        let resultSizeEstimate = json["resultSizeEstimate"] as? Int
+        return ThreadListResult(ids: ids, nextPageToken: nextPageToken, resultSizeEstimate: resultSizeEstimate)
     }
     
     // MARK: - Fetch Full Thread
     
     /// Fetch a thread with all messages via `GET /users/me/threads/{id}?format=full`.
-    private func fetchThread(id: String, token: String) async -> GmailThread? {
+    private func fetchThread(id: String, token: String, account: GmailAccount) async -> GmailThread? {
         var components = URLComponents(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(id)")!
         components.queryItems = [
             URLQueryItem(name: "format", value: "full"),
@@ -954,7 +1300,14 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401, let newToken = await refreshTokenAfterUnauthorised(for: account) {
+                var retryRequest = URLRequest(url: url)
+                retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
+                let (retryData, _) = try await resilientData(for: retryRequest)
+                return parseThread(from: retryData)
+            }
             return parseThread(from: data)
         } catch {
             print("[Gmail] Fetch thread \(id) failed: \(error)")
@@ -1153,7 +1506,7 @@ final class GmailService {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 200 {
                 await MainActor.run {
@@ -1231,41 +1584,92 @@ final class GmailService {
         }
         rfc2822 += "MIME-Version: 1.0\r\n"
         
-        if draft.attachments.isEmpty {
-            // Simple text email (no attachments)
+        let hasHTML = draft.bodyHTML != nil && !draft.bodyHTML!.isEmpty
+        let hasAttachments = !draft.attachments.isEmpty
+        
+        if !hasHTML && !hasAttachments {
+            // Simple plain-text email
             rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
             rfc2822 += "\r\n"
             rfc2822 += draft.body
-        } else {
-            // MIME multipart/mixed with attachments
-            let boundary = "TapMeeting-\(UUID().uuidString)"
-            rfc2822 += "Content-Type: multipart/mixed; boundary=\"\(boundary)\"\r\n"
+            
+        } else if hasHTML && !hasAttachments {
+            // multipart/alternative: plain text + HTML (no attachments)
+            let altBoundary = "TapAlt-\(UUID().uuidString)"
+            rfc2822 += "Content-Type: multipart/alternative; boundary=\"\(altBoundary)\"\r\n"
             rfc2822 += "\r\n"
             
-            // Text body part
-            rfc2822 += "--\(boundary)\r\n"
+            // Plain text part
+            rfc2822 += "--\(altBoundary)\r\n"
             rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
             rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
             rfc2822 += "\r\n"
             rfc2822 += draft.body
             rfc2822 += "\r\n"
             
+            // HTML part
+            rfc2822 += "--\(altBoundary)\r\n"
+            rfc2822 += "Content-Type: text/html; charset=\"UTF-8\"\r\n"
+            rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
+            rfc2822 += "\r\n"
+            rfc2822 += draft.bodyHTML!
+            rfc2822 += "\r\n"
+            
+            rfc2822 += "--\(altBoundary)--\r\n"
+            
+        } else {
+            // multipart/mixed: body + attachments
+            // When HTML is present, the body section itself is multipart/alternative
+            let mixedBoundary = "TapMixed-\(UUID().uuidString)"
+            rfc2822 += "Content-Type: multipart/mixed; boundary=\"\(mixedBoundary)\"\r\n"
+            rfc2822 += "\r\n"
+            
+            if hasHTML {
+                // Nested multipart/alternative for text + HTML
+                let altBoundary = "TapAlt-\(UUID().uuidString)"
+                rfc2822 += "--\(mixedBoundary)\r\n"
+                rfc2822 += "Content-Type: multipart/alternative; boundary=\"\(altBoundary)\"\r\n"
+                rfc2822 += "\r\n"
+                
+                rfc2822 += "--\(altBoundary)\r\n"
+                rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
+                rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
+                rfc2822 += "\r\n"
+                rfc2822 += draft.body
+                rfc2822 += "\r\n"
+                
+                rfc2822 += "--\(altBoundary)\r\n"
+                rfc2822 += "Content-Type: text/html; charset=\"UTF-8\"\r\n"
+                rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
+                rfc2822 += "\r\n"
+                rfc2822 += draft.bodyHTML!
+                rfc2822 += "\r\n"
+                
+                rfc2822 += "--\(altBoundary)--\r\n"
+            } else {
+                // Plain text only
+                rfc2822 += "--\(mixedBoundary)\r\n"
+                rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
+                rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
+                rfc2822 += "\r\n"
+                rfc2822 += draft.body
+                rfc2822 += "\r\n"
+            }
+            
             // Attachment parts
             for attachment in draft.attachments {
-                rfc2822 += "--\(boundary)\r\n"
+                rfc2822 += "--\(mixedBoundary)\r\n"
                 rfc2822 += "Content-Type: \(attachment.mimeType); name=\"\(attachment.filename)\"\r\n"
                 rfc2822 += "Content-Disposition: attachment; filename=\"\(attachment.filename)\"\r\n"
                 rfc2822 += "Content-Transfer-Encoding: base64\r\n"
                 rfc2822 += "\r\n"
                 
-                // Base64 encode the attachment data with line wrapping at 76 chars
                 let base64Data = attachment.data.base64EncodedString(options: .lineLength76Characters)
                 rfc2822 += base64Data
                 rfc2822 += "\r\n"
             }
             
-            // Closing boundary
-            rfc2822 += "--\(boundary)--\r\n"
+            rfc2822 += "--\(mixedBoundary)--\r\n"
         }
         
         guard let messageData = rfc2822.data(using: .utf8) else {
@@ -1294,7 +1698,7 @@ final class GmailService {
         request.httpBody = try? JSONSerialization.data(withJSONObject: requestBody)
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             
             if (200...299).contains(status) {
@@ -1306,7 +1710,7 @@ final class GmailService {
                 }
                 
                 if let sentThreadId, !sentThreadId.isEmpty {
-                    await refreshThreadAfterSend(threadId: sentThreadId, token: token)
+                    await refreshThreadAfterSend(threadId: sentThreadId, token: token, account: account)
                 }
                 
                 await MainActor.run {
@@ -1335,8 +1739,8 @@ final class GmailService {
     }
     
     /// Refresh and merge the sent thread into local mailbox state so UI updates immediately.
-    private func refreshThreadAfterSend(threadId: String, token: String) async {
-        guard let refreshedThread = await fetchThread(id: threadId, token: token) else { return }
+    private func refreshThreadAfterSend(threadId: String, token: String, account: GmailAccount) async {
+        guard let refreshedThread = await fetchThread(id: threadId, token: token, account: account) else { return }
         
         await MainActor.run {
             func replaceThreadIfPresent(_ thread: GmailThread, in threads: inout [GmailThread]) {
@@ -1391,15 +1795,15 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             
             if status == 401 {
                 // Try refresh
-                if let newToken = await refreshAccessToken(for: account) {
+                if let newToken = await refreshTokenAfterUnauthorised(for: account) {
                     var retryRequest = URLRequest(url: url)
                     retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
-                    let (retryData, _) = try await URLSession.shared.data(for: retryRequest)
+                    let (retryData, _) = try await resilientData(for: retryRequest)
                     return parseAttachmentData(from: retryData)
                 }
                 return nil
@@ -1489,11 +1893,52 @@ final class GmailService {
     
     // MARK: - Trash / Untrash Thread
     
+    /// Returns the next thread to select after removing `threadId` from the current mailbox list.
+    /// Prefers the thread immediately below; falls back to the one above.
+    private func nextThreadAfterRemoval(of threadId: String) -> GmailThread? {
+        let threads = threadsForMailbox(currentMailbox)
+        guard let idx = threads.firstIndex(where: { $0.id == threadId }) else { return nil }
+        let nextIdx = threads.index(after: idx)
+        if nextIdx < threads.endIndex { return threads[nextIdx] }
+        let prevIdx = threads.index(before: idx)
+        if prevIdx >= threads.startIndex { return threads[prevIdx] }
+        return nil
+    }
+    
     /// Move an entire thread to the bin.
     /// Per Gmail API: POST /users/me/threads/{id}/trash
+    /// Uses optimistic UI — removes thread immediately, rolls back on failure.
     func trashThread(threadId: String) async {
-        guard let account = accountForThread(threadId: threadId),
-              let token = await validToken(for: account) else { return }
+        // Resolve account synchronously (no await) so we can optimistically update first
+        let account = accountForThread(threadId: threadId)
+        guard account != nil else { return }
+        
+        // Optimistic UI: remove thread and update selection BEFORE any async work
+        let snapshot = await MainActor.run { () -> (removedInbox: GmailThread?, removedSent: GmailThread?, removedSearch: GmailThread?, inboxIdx: Int?, sentIdx: Int?, searchIdx: Int?) in
+            let next = selectedThread?.id == threadId ? nextThreadAfterRemoval(of: threadId) : nil
+            
+            let inboxIdx = inboxThreads.firstIndex(where: { $0.id == threadId })
+            let removedInbox = inboxIdx != nil ? inboxThreads.remove(at: inboxIdx!) : nil
+            
+            let sentIdx = sentThreads.firstIndex(where: { $0.id == threadId })
+            let removedSent = sentIdx != nil ? sentThreads.remove(at: sentIdx!) : nil
+            
+            let searchIdx = searchResults.firstIndex(where: { $0.id == threadId })
+            let removedSearch = searchIdx != nil ? searchResults.remove(at: searchIdx!) : nil
+            
+            if selectedThread?.id == threadId {
+                selectedThread = next
+                selectedMessageId = next?.latestMessage?.id
+            }
+            
+            return (removedInbox, removedSent, removedSearch, inboxIdx, sentIdx, searchIdx)
+        }
+        
+        // Now resolve token (may involve async refresh) — UI is already updated
+        guard let token = await validToken(for: account!) else {
+            await rollbackRemoval(snapshot: snapshot, threadId: threadId)
+            return
+        }
         
         let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(threadId)/trash")!
         var request = URLRequest(url: url)
@@ -1501,17 +1946,16 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 200 {
-                await MainActor.run {
-                    inboxThreads.removeAll { $0.id == threadId }
-                    sentThreads.removeAll { $0.id == threadId }
-                    if selectedThread?.id == threadId { selectedThread = nil; selectedMessageId = nil }
-                }
                 print("[Gmail] Trashed thread: \(threadId)")
+            } else {
+                await rollbackRemoval(snapshot: snapshot, threadId: threadId)
+                print("[Gmail] Trash thread failed: HTTP \(status)")
             }
         } catch {
+            await rollbackRemoval(snapshot: snapshot, threadId: threadId)
             print("[Gmail] Trash thread error: \(error)")
         }
     }
@@ -1528,12 +1972,16 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 200 {
                 await MainActor.run {
+                    let next = selectedThread?.id == threadId ? nextThreadAfterRemoval(of: threadId) : nil
                     trashThreads.removeAll { $0.id == threadId }
-                    if selectedThread?.id == threadId { selectedThread = nil; selectedMessageId = nil }
+                    if selectedThread?.id == threadId {
+                        selectedThread = next
+                        selectedMessageId = next?.latestMessage?.id
+                    }
                 }
                 print("[Gmail] Untrashed thread: \(threadId)")
                 await fetchMailbox(.inbox)
@@ -1545,9 +1993,35 @@ final class GmailService {
     
     /// Archive an entire thread (remove from Inbox).
     /// Per Gmail API: POST /users/me/threads/{id}/modify — remove INBOX label.
+    /// Uses optimistic UI — removes thread immediately, rolls back on failure.
     func archiveThread(threadId: String) async {
-        guard let account = accountForThread(threadId: threadId),
-              let token = await validToken(for: account) else { return }
+        // Resolve account synchronously (no await) so we can optimistically update first
+        let account = accountForThread(threadId: threadId)
+        guard account != nil else { return }
+        
+        // Optimistic UI: remove thread and update selection BEFORE any async work
+        let snapshot = await MainActor.run { () -> (removedInbox: GmailThread?, removedSent: GmailThread?, removedSearch: GmailThread?, inboxIdx: Int?, sentIdx: Int?, searchIdx: Int?) in
+            let next = selectedThread?.id == threadId ? nextThreadAfterRemoval(of: threadId) : nil
+            
+            let inboxIdx = inboxThreads.firstIndex(where: { $0.id == threadId })
+            let removedInbox = inboxIdx != nil ? inboxThreads.remove(at: inboxIdx!) : nil
+            
+            let searchIdx = searchResults.firstIndex(where: { $0.id == threadId })
+            let removedSearch = searchIdx != nil ? searchResults.remove(at: searchIdx!) : nil
+            
+            if selectedThread?.id == threadId {
+                selectedThread = next
+                selectedMessageId = next?.latestMessage?.id
+            }
+            
+            return (removedInbox, nil, removedSearch, inboxIdx, nil, searchIdx)
+        }
+        
+        // Now resolve token (may involve async refresh) — UI is already updated
+        guard let token = await validToken(for: account!) else {
+            await rollbackRemoval(snapshot: snapshot, threadId: threadId)
+            return
+        }
         
         let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/threads/\(threadId)/modify")!
         var request = URLRequest(url: url)
@@ -1559,17 +2033,42 @@ final class GmailService {
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
         
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            let (_, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 200 {
-                await MainActor.run {
-                    inboxThreads.removeAll { $0.id == threadId }
-                    if selectedThread?.id == threadId { selectedThread = nil; selectedMessageId = nil }
-                }
                 print("[Gmail] Archived thread: \(threadId)")
+            } else {
+                await rollbackRemoval(snapshot: snapshot, threadId: threadId)
+                print("[Gmail] Archive thread failed: HTTP \(status)")
             }
         } catch {
+            await rollbackRemoval(snapshot: snapshot, threadId: threadId)
             print("[Gmail] Archive thread error: \(error)")
+        }
+    }
+    
+    /// Roll back an optimistic removal by re-inserting threads at their original positions.
+    @MainActor
+    private func rollbackRemoval(snapshot: (removedInbox: GmailThread?, removedSent: GmailThread?, removedSearch: GmailThread?, inboxIdx: Int?, sentIdx: Int?, searchIdx: Int?), threadId: String) {
+        if let thread = snapshot.removedInbox, let idx = snapshot.inboxIdx {
+            let insertAt = min(idx, inboxThreads.count)
+            inboxThreads.insert(thread, at: insertAt)
+        }
+        if let thread = snapshot.removedSent, let idx = snapshot.sentIdx {
+            let insertAt = min(idx, sentThreads.count)
+            sentThreads.insert(thread, at: insertAt)
+        }
+        if let thread = snapshot.removedSearch, let idx = snapshot.searchIdx {
+            let insertAt = min(idx, searchResults.count)
+            searchResults.insert(thread, at: insertAt)
+        }
+        // Re-select the thread if nothing else is selected
+        if selectedThread == nil {
+            let restored = snapshot.removedInbox ?? snapshot.removedSent ?? snapshot.removedSearch
+            if let restored {
+                selectedThread = restored
+                selectedMessageId = restored.latestMessage?.id
+            }
         }
     }
     
@@ -1595,17 +2094,17 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             
             var messageIds: [String] = []
             
             if statusCode == 401 {
                 // Try refresh
-                if let newToken = await refreshAccessToken(for: account) {
+                if let newToken = await refreshTokenAfterUnauthorised(for: account) {
                     var retryRequest = URLRequest(url: url)
                     retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
-                    let (retryData, _) = try await URLSession.shared.data(for: retryRequest)
+                    let (retryData, _) = try await resilientData(for: retryRequest)
                     messageIds = parseMessageIds(from: retryData)
                 }
             } else {
@@ -1620,7 +2119,7 @@ final class GmailService {
             await withTaskGroup(of: GmailMessage?.self) { group in
                 for msgId in messageIds {
                     group.addTask { [self] in
-                        await self.fetchMessage(id: msgId, token: token)
+                        await self.fetchMessage(id: msgId, token: token, account: account)
                     }
                 }
                 for await msg in group {
@@ -1651,7 +2150,7 @@ final class GmailService {
     }
     
     /// Fetch a single message via `GET /users/me/messages/{id}?format=full`.
-    private func fetchMessage(id: String, token: String) async -> GmailMessage? {
+    private func fetchMessage(id: String, token: String, account: GmailAccount) async -> GmailMessage? {
         var components = URLComponents(string: "\(Constants.Gmail.apiBase)/users/me/messages/\(id)")!
         components.queryItems = [
             URLQueryItem(name: "format", value: "full"),
@@ -1663,7 +2162,14 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401, let newToken = await refreshTokenAfterUnauthorised(for: account) {
+                var retryRequest = URLRequest(url: url)
+                retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
+                let (retryData, _) = try await resilientData(for: retryRequest)
+                return parseFullMessage(from: retryData)
+            }
             return parseFullMessage(from: data)
         } catch {
             print("[Gmail] Fetch message \(id) failed: \(error)")
@@ -1718,7 +2224,7 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             // 403 = scope not granted (user needs to re-authenticate); return empty gracefully
             guard status == 200 else {
@@ -1749,7 +2255,7 @@ final class GmailService {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             guard status == 200 else {
                 if status != 403 { print("[Gmail] People otherContacts:search HTTP \(status)") }
@@ -1843,7 +2349,7 @@ final class GmailService {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, _) = try await resilientData(for: request)
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             return json?["email"] as? String
         } catch { return nil }
@@ -1854,7 +2360,7 @@ final class GmailService {
         var request = URLRequest(url: url)
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, _) = try await resilientData(for: request)
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             return json?["emailAddress"] as? String
         } catch { return nil }
@@ -1875,7 +2381,14 @@ final class GmailService {
             .joined(separator: "&")
         request.httpBody = formBody.data(using: .utf8)
         
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await resilientData(for: request)
+        
+        // Debug: log raw response for token exchange troubleshooting
+        let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if httpStatus != 200 || T.self == TokenResponse.self {
+            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(non-utf8)"
+            print("[Gmail] postForm HTTP \(httpStatus): \(preview)")
+        }
         
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

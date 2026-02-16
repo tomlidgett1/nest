@@ -32,24 +32,55 @@ struct GoogleCalendarAccount: Identifiable, Codable, Equatable {
 final class GoogleCalendarService {
     
     // MARK: - State
-    
+
     /// All connected Google Calendar accounts.
     private(set) var accounts: [GoogleCalendarAccount] = []
-    
+
     /// Whether any Google account is connected.
     var isConnected: Bool { !accounts.isEmpty }
-    
+
     /// First connected email (backward compatibility).
     var connectedEmail: String? { accounts.first?.email }
-    
+
     var isAuthenticating = false
     var authError: String?
-    
+
     /// Combined Google Calendar events from all connected accounts.
     private(set) var events: [CalendarEvent] = []
-    
+
     /// Called after events are fetched so the merged calendar service can refresh.
     var onEventsFetched: (() -> Void)?
+
+    // MARK: - Calendar List State
+
+    /// All sub-calendars from all connected accounts (e.g. "Work", "Personal", "Birthdays").
+    private(set) var calendars: [GoogleCalendar] = []
+
+    /// Whether the service is currently loading events for the calendar view.
+    var isLoadingCalendarEvents = false
+
+    // MARK: - Event Cache
+
+    /// In-memory cache for calendar view events, keyed by date range.
+    private struct CachedRange {
+        let events: [CalendarEvent]
+        let fetchedAt: Date
+    }
+
+    /// Cache keyed by "startTimestamp-endTimestamp".
+    private var eventCache: [String: CachedRange] = [:]
+
+    /// How long cached events remain valid before a background refresh.
+    private let cacheTTL: TimeInterval = 5 * 60 // 5 minutes
+
+    /// Events filtered by calendar visibility toggles.
+    var visibleEvents: [CalendarEvent] {
+        let visibleCalIds = Set(calendars.filter(\.isVisible).map(\.id))
+        return events.filter { event in
+            guard let calId = event.calendarId else { return true }
+            return visibleCalIds.contains(calId)
+        }
+    }
     
     // MARK: - Supabase Integration
 
@@ -92,23 +123,26 @@ final class GoogleCalendarService {
 
     init() {
         loadAccounts()
+        loadCalendarVisibility()
     }
     
     // MARK: - Account Storage
     
     private func loadAccounts() {
+        // Load persisted additional (non-Supabase) accounts.
         if let data = UserDefaults.standard.data(forKey: Constants.Defaults.googleCalendarAccounts),
            let decoded = try? JSONDecoder().decode([GoogleCalendarAccount].self, from: data) {
-            accounts = decoded
+            accounts = decoded.filter { $0.id != "supabase" }
         } else {
-            migrateLegacyAccount()
+            accounts = []
         }
+        authError = nil
     }
     
     private func saveAccounts() {
-        // Only persist non-Supabase accounts — the Supabase account is managed dynamically
-        let legacyAccounts = accounts.filter { $0.id != "supabase" }
-        if let data = try? JSONEncoder().encode(legacyAccounts) {
+        // Persist only additional (non-Supabase) accounts.
+        let additional = accounts.filter { $0.id != "supabase" }
+        if let data = try? JSONEncoder().encode(additional) {
             UserDefaults.standard.set(data, forKey: Constants.Defaults.googleCalendarAccounts)
         }
     }
@@ -117,92 +151,74 @@ final class GoogleCalendarService {
     /// Called when `supabaseService` is set or when authentication state may have changed.
     func ensureSupabaseAccount() {
         guard let supa = supabaseService, supa.isAuthenticated else {
-            // Remove Supabase account when signed out
-            if accounts.contains(where: { $0.id == "supabase" }) {
-                accounts.removeAll { $0.id == "supabase" }
-            }
+            accounts.removeAll { $0.id == "supabase" }
             return
         }
         
         let email = supa.currentUserEmail ?? "user"
+        let addedAt = accounts.first(where: { $0.id == "supabase" })?.addedAt ?? .now
+        let supabaseAccount = GoogleCalendarAccount(id: "supabase", email: email, addedAt: addedAt)
         
-        if let existingIdx = accounts.firstIndex(where: { $0.id == "supabase" }) {
-            // Update email if it changed
-            if accounts[existingIdx].email != email {
-                accounts[existingIdx] = GoogleCalendarAccount(id: "supabase", email: email, addedAt: accounts[existingIdx].addedAt)
-            }
-        } else {
-            // Insert at the beginning so it's the primary/default account
-            accounts.insert(GoogleCalendarAccount(id: "supabase", email: email, addedAt: .now), at: 0)
-        }
+        let additional = accounts.filter { $0.id != "supabase" }
+        accounts = [supabaseAccount] + additional
     }
     
-    /// Migrate from the old single-account storage to multi-account.
-    /// Runs once — moves tokens to per-account keys and cleans up legacy keys.
-    private func migrateLegacyAccount() {
-        guard UserDefaults.standard.bool(forKey: Constants.Defaults.googleCalendarConnected) else { return }
-        
-        let email = UserDefaults.standard.string(forKey: Constants.Defaults.googleCalendarEmail) ?? "Unknown"
-        let accountId = UUID().uuidString
-        
-        // Move tokens to per-account keys
-        if let accessToken = KeychainHelper.get(key: Constants.Keychain.googleAccessToken) {
-            KeychainHelper.set(key: "google_access_token_\(accountId)", value: accessToken)
-            KeychainHelper.delete(key: Constants.Keychain.googleAccessToken)
+    /// Add an additional account that was authenticated via GmailService's combined OAuth flow.
+    /// Tokens are already stored in Keychain by the caller.
+    func addAdditionalAccount(_ account: GoogleCalendarAccount) {
+        guard !accounts.contains(where: { $0.email.lowercased() == account.email.lowercased() && $0.id != "supabase" }) else {
+            print("[GoogleCalendar] \(account.email) already connected, skipping")
+            return
         }
-        if let refreshToken = KeychainHelper.get(key: Constants.Keychain.googleRefreshToken) {
-            KeychainHelper.set(key: "google_refresh_token_\(accountId)", value: refreshToken)
-            KeychainHelper.delete(key: Constants.Keychain.googleRefreshToken)
-        }
-        
-        let account = GoogleCalendarAccount(id: accountId, email: email, addedAt: .now)
-        accounts = [account]
+        accounts.append(account)
         saveAccounts()
-        
-        // Clean up legacy keys
-        UserDefaults.standard.removeObject(forKey: Constants.Defaults.googleCalendarConnected)
-        UserDefaults.standard.removeObject(forKey: Constants.Defaults.googleCalendarEmail)
-        
-        print("[GoogleCalendar] Migrated legacy account: \(email)")
+        print("[GoogleCalendar] ✓ Added additional account: \(account.email)")
     }
     
-    // MARK: - OAuth Flow
-    
-    /// Start the Google OAuth sign-in flow to add a new account.
-    /// Opens the consent screen in the browser and waits for the callback.
-    func signIn() {
-        guard !clientID.isEmpty else {
-            authError = "No Google Client ID configured."
-            return
+    /// Remove an additional account (called when Gmail disconnects it).
+    func removeAdditionalAccount(id: String) {
+        guard id != "supabase" else { return }
+        if let account = accounts.first(where: { $0.id == id }) {
+            KeychainHelper.delete(key: account.accessTokenKey)
+            KeychainHelper.delete(key: account.refreshTokenKey)
         }
-        guard !clientSecret.isEmpty else {
-            authError = "No Google Client Secret configured."
+        accounts.removeAll { $0.id == id }
+        saveAccounts()
+    }
+
+    // MARK: - OAuth Flow (Additional Accounts)
+    
+    /// Start the Google OAuth sign-in flow to add an additional account.
+    /// Uses loopback OAuth with Google credentials from app_config.
+    func signInAdditionalAccount() {
+        guard let cid = supabaseService?.googleClientID, !cid.isEmpty,
+              let secret = supabaseService?.googleClientSecret, !secret.isEmpty else {
+            authError = "Google credentials not configured. Contact your admin."
             return
         }
         
+        guard !isAuthenticating else { return }
         isAuthenticating = true
         authError = nil
         
-        // 1. Start loopback server
+        loopbackServer?.stop()
         loopbackServer = LoopbackServer(
             port: Constants.GoogleCalendar.loopbackPort,
-            successTitle: "Connected to Google Calendar"
+            successTitle: "Google Calendar Account Connected"
         ) { [weak self] code in
-            self?.loopbackServer?.stop()
-            self?.loopbackServer = nil
-            Task { await self?.exchangeCodeForTokens(code) }
+            guard let self else { return }
+            Task { await self.exchangeCodeForTokens(code) }
         }
         loopbackServer?.start()
         
-        // 2. Open browser to Google consent with account chooser
         var components = URLComponents(string: Constants.GoogleCalendar.authURL)!
         components.queryItems = [
-            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "client_id", value: cid),
             URLQueryItem(name: "redirect_uri", value: Constants.GoogleCalendar.redirectURI),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "scope", value: Constants.GoogleCalendar.scopes),
             URLQueryItem(name: "access_type", value: "offline"),
-            URLQueryItem(name: "prompt", value: "consent select_account"),
+            URLQueryItem(name: "prompt", value: "consent"),
         ]
         
         if let url = components.url {
@@ -210,21 +226,24 @@ final class GoogleCalendarService {
         }
     }
     
+    /// Start the Google OAuth sign-in flow to add a new account.
+    /// Opens the consent screen in the browser and waits for the callback.
+    func signIn() {
+        signInAdditionalAccount()
+    }
+    
     /// Disconnect a specific account by ID.
     func disconnect(accountId: String) {
-        // Don't allow disconnecting the Supabase primary account (sign out via Supabase instead)
         guard accountId != "supabase" else { return }
-        guard let account = accounts.first(where: { $0.id == accountId }) else { return }
         
-        KeychainHelper.delete(key: account.accessTokenKey)
-        KeychainHelper.delete(key: account.refreshTokenKey)
+        if let account = accounts.first(where: { $0.id == accountId }) {
+            KeychainHelper.delete(key: account.accessTokenKey)
+            KeychainHelper.delete(key: account.refreshTokenKey)
+        }
         accounts.removeAll { $0.id == accountId }
         saveAccounts()
-        
-        // Refresh combined events list
-        Task { await fetchEvents() }
-        
-        print("[GoogleCalendar] Disconnected: \(account.email)")
+        invalidateEventCache()
+        print("[GoogleCalendar] Disconnected additional account: \(accountId)")
     }
     
     /// Sign out — disconnect all accounts.
@@ -236,27 +255,20 @@ final class GoogleCalendarService {
         accounts = []
         events = []
         saveAccounts()
+        invalidateEventCache()
         print("[GoogleCalendar] All accounts signed out")
-    }
-    
-    /// Save the user-provided client ID.
-    func setClientID(_ id: String) {
-        KeychainHelper.set(key: Constants.Keychain.googleClientID, value: id)
-    }
-    
-    /// Save the user-provided client secret.
-    func setClientSecret(_ secret: String) {
-        KeychainHelper.set(key: Constants.Keychain.googleClientSecret, value: secret)
     }
     
     // MARK: - Token Exchange
     
     /// Exchange the authorisation code for access + refresh tokens, then add the account.
     private func exchangeCodeForTokens(_ code: String) async {
+        let cid = supabaseService?.googleClientID ?? clientID
+        let secret = supabaseService?.googleClientSecret ?? clientSecret
         let body = [
             "code": code,
-            "client_id": clientID,
-            "client_secret": clientSecret,
+            "client_id": cid,
+            "client_secret": secret,
             "redirect_uri": Constants.GoogleCalendar.redirectURI,
             "grant_type": "authorization_code",
         ]
@@ -317,10 +329,12 @@ final class GoogleCalendarService {
             return nil
         }
         
+        let cid = supabaseService?.googleClientID ?? clientID
+        let secret = supabaseService?.googleClientSecret ?? clientSecret
         let body = [
             "refresh_token": refreshToken,
-            "client_id": clientID,
-            "client_secret": clientSecret,
+            "client_id": cid,
+            "client_secret": secret,
             "grant_type": "refresh_token",
         ]
         
@@ -337,11 +351,28 @@ final class GoogleCalendarService {
         }
     }
     
-    // MARK: - Fetch Events
+    // MARK: - Cancellation-Resistant Network
     
-    /// Fetch upcoming events from all connected Google Calendar accounts.
+    /// Callback-based URLSession wrapper immune to Swift Task cancellation.
+    private func resilientData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, let response {
+                    continuation.resume(returning: (data, response))
+                } else {
+                    continuation.resume(throwing: URLError(.unknown))
+                }
+            }.resume()
+        }
+    }
+    
+    // MARK: - Fetch Events (Legacy — 24h ahead for MenuBar)
+
+    /// Fetch upcoming events from all connected Google Calendar accounts (24h window).
+    /// Used by MenuBar and CalendarService for meeting detection.
     func fetchEvents() async {
-        // Ensure the Supabase account is up to date before fetching
         await MainActor.run { ensureSupabaseAccount() }
 
         guard !accounts.isEmpty else {
@@ -352,93 +383,262 @@ final class GoogleCalendarService {
             return
         }
 
-        // Fetch from all accounts concurrently
-        let allEvents: [CalendarEvent] = await withTaskGroup(of: [CalendarEvent].self) { group in
+        let now = Date.now
+        let tomorrow = Calendar.current.date(byAdding: .hour, value: 24, to: now)!
+        let fetched = await fetchEventsForRange(start: now, end: tomorrow)
+
+        await MainActor.run {
+            self.events = fetched
+            self.onEventsFetched?()
+        }
+
+        print("[GoogleCalendar] Fetched \(fetched.count) events from \(accounts.count) account(s)")
+    }
+
+    // MARK: - Calendar List
+
+    /// Fetch the list of sub-calendars from all accounts concurrently.
+    func fetchAllCalendars() async {
+        await MainActor.run { ensureSupabaseAccount() }
+        guard !accounts.isEmpty else { return }
+
+        let allCalendars: [GoogleCalendar] = await withTaskGroup(of: [GoogleCalendar].self) { group in
             for account in accounts {
                 group.addTask { [self] in
-                    await self.fetchEvents(for: account)
+                    await self.fetchCalendarList(for: account)
                 }
             }
-
-            var collected: [CalendarEvent] = []
-            for await accountEvents in group {
-                collected.append(contentsOf: accountEvents)
+            var collected: [GoogleCalendar] = []
+            for await cals in group {
+                collected.append(contentsOf: cals)
             }
             return collected
         }
 
+        // Merge with persisted visibility state
+        let hiddenIds = loadHiddenCalendarIds()
+
         await MainActor.run {
-            self.events = allEvents
-            self.onEventsFetched?()
+            self.calendars = allCalendars.map { cal in
+                var c = cal
+                c.isVisible = !hiddenIds.contains(cal.id)
+                return c
+            }
         }
 
-        print("[GoogleCalendar] Fetched \(allEvents.count) total events from \(accounts.count) account(s)")
+        print("[GoogleCalendar] Loaded \(allCalendars.count) calendars from \(accounts.count) account(s)")
     }
-    
-    /// Fetch events for a single account.
-    private func fetchEvents(for account: GoogleCalendarAccount) async -> [CalendarEvent] {
-        // Route to the correct token source based on account type
-        var accessToken: String?
-        if account.id == "supabase", let supa = supabaseService {
-            // Supabase-managed primary account
-            accessToken = await supa.getGoogleAccessToken()
-            if accessToken == nil {
-                accessToken = await supa.refreshGoogleAccessToken()
-            }
-        } else {
-            // Legacy account — use per-account Keychain tokens
-            accessToken = KeychainHelper.get(key: account.accessTokenKey)
-            if accessToken == nil || accessToken?.isEmpty == true {
-                accessToken = await refreshAccessToken(for: account)
-            }
-        }
 
-        guard let token = accessToken, !token.isEmpty else {
-            print("[GoogleCalendar] No valid access token for \(account.email)")
-            return []
-        }
-        
-        let now = ISO8601DateFormatter().string(from: Date.now)
-        let tomorrow = ISO8601DateFormatter().string(
-            from: Calendar.current.date(byAdding: .hour, value: 24, to: .now)!
-        )
-        
-        var components = URLComponents(string: "\(Constants.GoogleCalendar.calendarAPIBase)/calendars/primary/events")!
+    /// Fetch sub-calendars for a single account.
+    private func fetchCalendarList(for account: GoogleCalendarAccount) async -> [GoogleCalendar] {
+        guard let token = await validAccessToken(for: account) else { return [] }
+
+        var components = URLComponents(string: Constants.GoogleCalendar.calendarListEndpoint)!
         components.queryItems = [
-            URLQueryItem(name: "timeMin", value: now),
-            URLQueryItem(name: "timeMax", value: tomorrow),
-            URLQueryItem(name: "singleEvents", value: "true"),
-            URLQueryItem(name: "orderBy", value: "startTime"),
-            URLQueryItem(name: "maxResults", value: "20"),
+            URLQueryItem(name: "minAccessRole", value: "reader"),
+            URLQueryItem(name: "showHidden", value: "false"),
         ]
-        
+
         guard let url = components.url else { return [] }
-        
+
         var request = URLRequest(url: url)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        
+
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            
-            // If 401, try refreshing token once
-            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 401 {
-                if let newToken = await refreshAccessToken(for: account) {
-                    var retryRequest = URLRequest(url: url)
-                    retryRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
-                    let (retryData, _) = try await URLSession.shared.data(for: retryRequest)
-                    return tagEvents(parseEvents(from: retryData), account: account)
+            let (data, response) = try await resilientData(for: request)
+
+            if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+                if let newToken = await refreshTokenAfterUnauthorised(for: account) {
+                    var retry = URLRequest(url: url)
+                    retry.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
+                    let (retryData, _) = try await resilientData(for: retry)
+                    return parseCalendarList(from: retryData, accountId: account.id)
                 }
                 return []
             }
-            
-            return tagEvents(parseEvents(from: data), account: account)
-            
+
+            return parseCalendarList(from: data, accountId: account.id)
         } catch {
-            print("[GoogleCalendar] Fetch events failed for \(account.email): \(error)")
+            print("[GoogleCalendar] Fetch calendar list failed for \(account.email): \(error)")
             return []
         }
     }
-    
+
+    private func parseCalendarList(from data: Data, accountId: String) -> [GoogleCalendar] {
+        guard let decoded = try? JSONDecoder().decode(GoogleCalendarListResponse.self, from: data) else {
+            return []
+        }
+        return (decoded.items ?? []).map { item in
+            GoogleCalendar(
+                id: item.id,
+                accountId: accountId,
+                summary: item.summary ?? "Untitled",
+                backgroundColor: item.backgroundColor,
+                foregroundColor: item.foregroundColor,
+                isPrimary: item.primary ?? false
+            )
+        }
+    }
+
+    // MARK: - Calendar Visibility
+
+    /// Toggle a sub-calendar on or off.
+    func toggleCalendarVisibility(calendarId: String) {
+        guard let index = calendars.firstIndex(where: { $0.id == calendarId }) else { return }
+        calendars[index].isVisible.toggle()
+        saveCalendarVisibility()
+    }
+
+    /// Show all calendars.
+    func showAllCalendars() {
+        for i in calendars.indices { calendars[i].isVisible = true }
+        saveCalendarVisibility()
+    }
+
+    /// Hide all calendars.
+    func hideAllCalendars() {
+        for i in calendars.indices { calendars[i].isVisible = false }
+        saveCalendarVisibility()
+    }
+
+    private func saveCalendarVisibility() {
+        let hidden = calendars.filter { !$0.isVisible }.map(\.id)
+        if let data = try? JSONEncoder().encode(hidden) {
+            UserDefaults.standard.set(data, forKey: Constants.Defaults.calendarVisibilityState)
+        }
+    }
+
+    private func loadCalendarVisibility() {
+        // Applied after calendars are fetched — see fetchAllCalendars()
+    }
+
+    private func loadHiddenCalendarIds() -> Set<String> {
+        guard let data = UserDefaults.standard.data(forKey: Constants.Defaults.calendarVisibilityState),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(ids)
+    }
+
+    // MARK: - Fetch Events for Date Range (Calendar View)
+
+    /// Fetch events within a specific date range from all accounts, across all visible calendars.
+    /// Returns cached results instantly if available and fresh; fetches from API otherwise.
+    func fetchEventsForRange(start: Date, end: Date, forceRefresh: Bool = false) async -> [CalendarEvent] {
+        await MainActor.run { ensureSupabaseAccount() }
+        guard !accounts.isEmpty else { return [] }
+
+        let cacheKey = "\(Int(start.timeIntervalSince1970))-\(Int(end.timeIntervalSince1970))"
+
+        // Return cached events if still fresh
+        if !forceRefresh, let cached = eventCache[cacheKey],
+           Date.now.timeIntervalSince(cached.fetchedAt) < cacheTTL {
+            return cached.events
+        }
+
+        // Ensure calendars are loaded
+        if calendars.isEmpty {
+            await fetchAllCalendars()
+        }
+
+        let iso = ISO8601DateFormatter()
+        let timeMin = iso.string(from: start)
+        let timeMax = iso.string(from: end)
+
+        let allEvents: [CalendarEvent] = await withTaskGroup(of: [CalendarEvent].self) { group in
+            for account in accounts {
+                let accountCalendars = calendars.filter { $0.accountId == account.id }
+                let calIds = accountCalendars.isEmpty ? ["primary"] : accountCalendars.map(\.id)
+
+                for calId in calIds {
+                    group.addTask { [self] in
+                        await self.fetchEventsFromCalendar(
+                            calendarId: calId,
+                            account: account,
+                            timeMin: timeMin,
+                            timeMax: timeMax
+                        )
+                    }
+                }
+            }
+
+            var collected: [CalendarEvent] = []
+            for await batch in group {
+                collected.append(contentsOf: batch)
+            }
+            return collected
+        }
+
+        // Deduplicate by event ID and sort
+        var seen = Set<String>()
+        let unique = allEvents.filter { seen.insert($0.id).inserted }
+        let sorted = unique.sorted { $0.startDate < $1.startDate }
+
+        // Store in cache
+        eventCache[cacheKey] = CachedRange(events: sorted, fetchedAt: .now)
+
+        return sorted
+    }
+
+    /// Clear the event cache (e.g. after calendar visibility changes or account changes).
+    func invalidateEventCache() {
+        eventCache.removeAll()
+    }
+
+    /// Fetch events from a specific calendar for a specific account.
+    private func fetchEventsFromCalendar(
+        calendarId: String,
+        account: GoogleCalendarAccount,
+        timeMin: String,
+        timeMax: String
+    ) async -> [CalendarEvent] {
+        guard let token = await validAccessToken(for: account) else { return [] }
+
+        let encodedCalId = calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? calendarId
+        var components = URLComponents(string: "\(Constants.GoogleCalendar.calendarAPIBase)/calendars/\(encodedCalId)/events")!
+        components.queryItems = [
+            URLQueryItem(name: "timeMin", value: timeMin),
+            URLQueryItem(name: "timeMax", value: timeMax),
+            URLQueryItem(name: "singleEvents", value: "true"),
+            URLQueryItem(name: "orderBy", value: "startTime"),
+            URLQueryItem(name: "maxResults", value: "250"),
+        ]
+
+        guard let url = components.url else { return [] }
+
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        do {
+            let (data, response) = try await resilientData(for: request)
+
+            if let http = response as? HTTPURLResponse, http.statusCode == 401 {
+                if let newToken = await refreshTokenAfterUnauthorised(for: account) {
+                    var retry = URLRequest(url: url)
+                    retry.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
+                    let (retryData, _) = try await resilientData(for: retry)
+                    return parseEventsEnriched(from: retryData, calendarId: calendarId, accountEmail: account.email)
+                }
+                return []
+            }
+
+            return parseEventsEnriched(from: data, calendarId: calendarId, accountEmail: account.email)
+        } catch {
+            print("[GoogleCalendar] Fetch events failed for \(account.email)/\(calendarId): \(error)")
+            return []
+        }
+    }
+
+    /// Get a valid access token for the account, refreshing if needed.
+    private func validAccessToken(for account: GoogleCalendarAccount) async -> String? {
+        if account.id == "supabase", let supa = supabaseService {
+            return await supa.validGoogleAccessToken()
+        }
+        let token = KeychainHelper.get(key: account.accessTokenKey)
+        if let t = token, !t.isEmpty { return t }
+        return await refreshAccessToken(for: account)
+    }
+
     /// Tag parsed events with the account they came from.
     private func tagEvents(_ events: [CalendarEvent], account: GoogleCalendarAccount) -> [CalendarEvent] {
         events.map { event in
@@ -447,57 +647,101 @@ final class GoogleCalendarService {
             return e
         }
     }
-    
-    /// Parse a Google Calendar API events response into CalendarEvent models.
-    private func parseEvents(from data: Data) -> [CalendarEvent] {
+
+    /// Parse events with enriched fields (location, description, organizer, attendee details).
+    private func parseEventsEnriched(from data: Data, calendarId: String, accountEmail: String) -> [CalendarEvent] {
         guard let decoded = try? JSONDecoder().decode(GoogleEventsResponse.self, from: data) else {
             return []
         }
-        
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        
+
+        let isoFull = ISO8601DateFormatter()
+        isoFull.formatOptions = [.withInternetDateTime]
+
+        let dateOnly = DateFormatter()
+        dateOnly.dateFormat = "yyyy-MM-dd"
+
         return (decoded.items ?? []).compactMap { item in
-            // Skip all-day events
-            guard item.start?.dateTime != nil else { return nil }
-            
-            guard let startStr = item.start?.dateTime,
-                  let endStr = item.end?.dateTime,
-                  let startDate = formatter.date(from: startStr),
-                  let endDate = formatter.date(from: endStr) else {
-                return nil
+            let isAllDay = item.start?.date != nil && item.start?.dateTime == nil
+
+            let startDate: Date
+            let endDate: Date
+
+            if isAllDay {
+                guard let startStr = item.start?.date,
+                      let sd = dateOnly.date(from: startStr) else { return nil }
+                startDate = sd
+                if let endStr = item.end?.date, let ed = dateOnly.date(from: endStr) {
+                    endDate = ed
+                } else {
+                    endDate = Foundation.Calendar.current.date(byAdding: .day, value: 1, to: sd)!
+                }
+            } else {
+                guard let startStr = item.start?.dateTime,
+                      let endStr = item.end?.dateTime,
+                      let sd = isoFull.date(from: startStr),
+                      let ed = isoFull.date(from: endStr) else { return nil }
+                startDate = sd
+                endDate = ed
             }
-            
-            // Extract meeting URL: prefer hangoutLink, fall back to conferenceData video entry
+
+            // Meeting URL
             let meetingURLString = item.hangoutLink
                 ?? item.conferenceData?.entryPoints?.first(where: { $0.entryPointType == "video" })?.uri
             let meetingURL = meetingURLString.flatMap { URL(string: $0) }
-            
-            // Extract attendee display names, excluding the calendar owner
-            let attendeeNames: [String] = (item.attendees ?? [])
-                .filter { $0.`self` != true }
-                .compactMap { attendee in
-                    if let name = attendee.displayName, !name.isEmpty {
-                        return name
-                    }
-                    // Fall back to the part before @ in the email
-                    if let email = attendee.email {
-                        return email.components(separatedBy: "@").first?.replacingOccurrences(of: ".", with: " ").capitalized
-                    }
-                    return nil
+
+            // Attendees
+            let allAttendees = item.attendees ?? []
+            let nonSelfAttendees = allAttendees.filter { $0.`self` != true }
+
+            let attendeeNames: [String] = nonSelfAttendees.compactMap { att in
+                if let name = att.displayName, !name.isEmpty { return name }
+                if let email = att.email {
+                    return email.components(separatedBy: "@").first?
+                        .replacingOccurrences(of: ".", with: " ").capitalized
                 }
-            
+                return nil
+            }
+
+            let attendeeEmails: [String] = nonSelfAttendees.compactMap(\.email)
+
+            var responseStatuses: [String: String] = [:]
+            for att in allAttendees {
+                if let email = att.email, let status = att.responseStatus {
+                    responseStatuses[email] = status
+                }
+            }
+
+            // Organizer
+            let organizer: String? = item.organizer?.displayName ?? item.organizer?.email
+            let organizerEmail: String? = item.organizer?.email
+
             return CalendarEvent(
                 id: item.id ?? UUID().uuidString,
                 title: item.summary ?? "Untitled Event",
                 startDate: startDate,
                 endDate: endDate,
-                attendeeCount: item.attendees?.count ?? 0,
-                isAllDay: false,
+                attendeeCount: allAttendees.count,
+                isAllDay: isAllDay,
                 meetingURL: meetingURL,
-                attendeeNames: attendeeNames
+                attendeeNames: attendeeNames,
+                calendarSource: accountEmail,
+                calendarId: calendarId,
+                location: item.location,
+                eventDescription: item.description,
+                organizer: organizer,
+                organizerEmail: organizerEmail,
+                htmlLink: item.htmlLink,
+                colorId: item.colorId,
+                attendeeEmails: attendeeEmails,
+                responseStatuses: responseStatuses
             )
         }
+    }
+
+    /// Parse events (legacy format — used by fetchEvents for MenuBar compatibility).
+    private func parseEvents(from data: Data) -> [CalendarEvent] {
+        parseEventsEnriched(from: data, calendarId: "primary", accountEmail: "")
+            .filter { !$0.isAllDay }
     }
     
     // MARK: - User Info
@@ -509,7 +753,7 @@ final class GoogleCalendarService {
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, _) = try await resilientData(for: request)
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             return json?["email"] as? String
         } catch {
@@ -532,11 +776,19 @@ final class GoogleCalendarService {
             .joined(separator: "&")
         request.httpBody = formBody.data(using: .utf8)
         
-        let (data, _) = try await URLSession.shared.data(for: request)
+        let (data, _) = try await resilientData(for: request)
         
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(T.self, from: data)
+    }
+
+    /// Refresh token through the appropriate path (Supabase primary vs legacy account).
+    private func refreshTokenAfterUnauthorised(for account: GoogleCalendarAccount) async -> String? {
+        if account.id == "supabase" {
+            return await supabaseService?.refreshGoogleAccessToken()
+        }
+        return await refreshAccessToken(for: account)
     }
 }
 
@@ -556,11 +808,21 @@ private struct GoogleEventsResponse: Decodable {
 private struct GoogleEventItem: Decodable {
     let id: String?
     let summary: String?
+    let description: String?
+    let location: String?
     let start: GoogleEventTime?
     let end: GoogleEventTime?
     let attendees: [GoogleAttendee]?
     let hangoutLink: String?
+    let htmlLink: String?
+    let colorId: String?
     let conferenceData: GoogleConferenceData?
+    let organizer: GoogleEventOrganizer?
+}
+
+private struct GoogleEventOrganizer: Decodable {
+    let email: String?
+    let displayName: String?
 }
 
 private struct GoogleConferenceData: Decodable {
@@ -581,5 +843,21 @@ private struct GoogleAttendee: Decodable {
     let email: String?
     let displayName: String?
     let `self`: Bool?
+    let responseStatus: String?
+}
+
+// MARK: - Calendar List Response
+
+private struct GoogleCalendarListResponse: Decodable {
+    let items: [GoogleCalendarListItem]?
+}
+
+private struct GoogleCalendarListItem: Decodable {
+    let id: String
+    let summary: String?
+    let backgroundColor: String?
+    let foregroundColor: String?
+    let primary: Bool?
+    let selected: Bool?
 }
 

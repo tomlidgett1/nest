@@ -292,10 +292,7 @@ struct NoteDetailView: View {
                     askText: $askText,
                     isAskLoading: $isAskLoading,
                     onAsk: { askQuestion() },
-                    onAskWhatDidIMiss: {
-                        askText = "What did I miss"
-                        askQuestion()
-                    },
+                    onCatchUp: { seconds in catchUp(lastSeconds: seconds) },
                     onWriteEmail: { writeFollowUpEmail() }
                 )
             }
@@ -377,6 +374,49 @@ struct NoteDetailView: View {
                     question: question,
                     transcriptContext: transcript,
                     history: chatMessages.dropLast().map { $0 }
+                )
+                await MainActor.run {
+                    chatMessages.append(ChatMessage(role: .assistant, content: response))
+                    isAskLoading = false
+                }
+            } catch {
+                await MainActor.run {
+                    chatMessages.append(ChatMessage(role: .assistant, content: "Error: \(error.localizedDescription)"))
+                    isAskLoading = false
+                }
+            }
+        }
+    }
+    
+    /// Catch up on the last N seconds using Claude Sonnet.
+    private func catchUp(lastSeconds: TimeInterval) {
+        isAskLoading = true
+        
+        let windowLabel: String
+        switch lastSeconds {
+        case ...30: windowLabel = "last 30 seconds"
+        case ...120: windowLabel = "last 2 minutes"
+        default: windowLabel = "last 5 minutes"
+        }
+        
+        chatMessages.append(ChatMessage(role: .user, content: "What did I miss in the \(windowLabel)?"))
+        
+        Task {
+            do {
+                let transcript: String
+                if isLiveNote {
+                    transcript = appState.transcriptStore.transcriptText(lastSeconds: lastSeconds)
+                } else {
+                    let cutoff = Date.now.addingTimeInterval(-lastSeconds)
+                    transcript = note.transcript
+                        .filter { $0.endTime >= cutoff }
+                        .map { "[\($0.source.displayLabel)] \($0.text)" }
+                        .joined(separator: "\n")
+                }
+                
+                let response = try await chatService.catchUp(
+                    transcriptSlice: transcript,
+                    windowLabel: windowLabel
                 )
                 await MainActor.run {
                     chatMessages.append(ChatMessage(role: .assistant, content: response))
@@ -500,7 +540,7 @@ private struct DetailBottomBar: View {
     @Binding var askText: String
     @Binding var isAskLoading: Bool
     let onAsk: () -> Void
-    let onAskWhatDidIMiss: () -> Void
+    let onCatchUp: (TimeInterval) -> Void
     let onWriteEmail: () -> Void
     
     @Environment(AppState.self) private var appState
@@ -515,244 +555,310 @@ private struct DetailBottomBar: View {
         return !note.transcript.isEmpty
     }
     
+    /// Responsive breakpoints
+    private enum BarLayout {
+        case wide      // >= 560pt — full 3-pill row
+        case medium    // >= 420pt — compact labels, 2 rows when live
+        case narrow    // < 420pt  — stacked, icon-only buttons
+        
+        init(width: CGFloat) {
+            if width >= 560 { self = .wide }
+            else if width >= 420 { self = .medium }
+            else { self = .narrow }
+        }
+    }
+    
     var body: some View {
-        VStack(spacing: 8) {
-            // Expandable panels — transcript and/or chat in a white container
-            if (showTranscript && hasTranscript) || (!chatMessages.isEmpty && showChat) {
-                VStack(spacing: 0) {
-                    // Transcript panel
-                    if showTranscript && hasTranscript {
-                        BottomTranscriptPanel(
-                            note: note,
-                            isLiveNote: isLiveNote
-                        )
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        
-                        if !chatMessages.isEmpty && showChat {
-                            Rectangle()
-                                .fill(Theme.divider)
-                                .frame(height: 1)
-                                .padding(.horizontal, 12)
-                        }
-                    }
-                    
-                    // Chat messages
-                    if !chatMessages.isEmpty && showChat {
-                        ScrollViewReader { proxy in
-                            ScrollView {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    ForEach(chatMessages) { message in
-                                        if message.role == .user {
-                                            HStack(spacing: 6) {
-                                                Image(systemName: "person.fill")
-                                                    .font(.system(size: 9))
-                                                    .foregroundColor(Theme.textTertiary)
-                                                Text(message.content)
-                                                    .font(.system(size: 13, weight: .medium))
-                                                    .foregroundColor(Theme.textPrimary)
-                                                Spacer()
-                                            }
-                                            .id(message.id)
-                                        } else {
-                                            HStack(alignment: .top, spacing: 6) {
-                                                Image(systemName: "sparkle")
-                                                    .font(.system(size: 9))
-                                                    .foregroundColor(Theme.olive)
-                                                    .padding(.top, 2)
-                                                
-                                                Text(message.content)
-                                                    .font(.system(size: 13))
-                                                    .foregroundColor(Theme.textSecondary)
-                                                    .textSelection(.enabled)
-                                                    .lineSpacing(3)
-                                                
-                                                Spacer()
-                                            }
-                                            .id(message.id)
-                                        }
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 12)
-                            }
-                            .frame(maxHeight: 240)
-                            .scrollIndicators(.never)
-                            .onChange(of: chatMessages.count) { _, _ in
-                                if let lastMessage = chatMessages.last {
-                                    withAnimation(.easeOut(duration: 0.2)) {
-                                        proxy.scrollTo(lastMessage.id, anchor: .bottom)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                .background(Color.white)
-                .cornerRadius(16)
-                .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
-            }
+        GeometryReader { geo in
+            let layout = BarLayout(width: geo.size.width)
+            let hPad: CGFloat = layout == .narrow ? 12 : (layout == .medium ? 20 : 32)
             
-            // Floating action buttons — resume & regenerate for ended/enhanced notes
-            if !isLiveNote && !note.transcript.isEmpty && (note.status == .ended || note.status == .enhanced) {
-                HStack(spacing: 8) {
-                    if !appState.isMeetingActive {
-                        Button {
-                            appState.resumeMeeting(for: note)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "mic.fill")
-                                    .font(.system(size: 10))
-                                Text("Resume Meeting")
-                                    .font(.system(size: 12, weight: .medium))
-                            }
-                            .foregroundColor(Theme.textSecondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Theme.barBackground)
-                            .cornerRadius(20)
-                            .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Continue recording on this note")
-                    }
-                    
-                    if appState.enhancingNoteId != note.id {
-                        Button {
-                            Task {
-                                await appState.regenerateNotes(for: note)
-                            }
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "arrow.trianglehead.2.counterclockwise")
-                                    .font(.system(size: 10))
-                                Text("Regenerate Notes")
-                                    .font(.system(size: 12, weight: .medium))
-                            }
-                            .foregroundColor(Theme.textSecondary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
-                            .background(Theme.barBackground)
-                            .cornerRadius(20)
-                            .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Regenerate AI notes from transcript")
-                    }
-                }
-            }
-            
-            // Main bar — three separate elements
-            HStack(spacing: 8) {
-                // Left pill — transcript & chat controls
-                HStack(spacing: 6) {
-                    if hasTranscript {
-                        HStack(spacing: 5) {
-                            AnimatedWaveformIcon(
-                                isActive: isLiveNote && !appState.isMeetingPaused,
-                                micLevel: appState.audioCaptureManager.micLevel,
-                                systemLevel: appState.audioCaptureManager.systemLevel
-                            )
-                            .foregroundColor(showTranscript ? Theme.olive : Theme.textTertiary)
-                            
-                            Text("Transcript")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(showTranscript ? Theme.textPrimary : Theme.textTertiary)
-                            
-                            Image(systemName: showTranscript ? "chevron.down" : "chevron.up")
-                                .font(.system(size: 7, weight: .semibold))
-                                .foregroundColor(Theme.textQuaternary)
-                                .animation(.easeInOut(duration: 0.2), value: showTranscript)
-                        }
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                showTranscript.toggle()
-                            }
-                        }
-                    }
-                    
-                    if !chatMessages.isEmpty {
-                        Rectangle()
-                            .fill(Theme.divider)
-                            .frame(width: 1, height: 14)
-                        
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                showChat.toggle()
-                            }
-                        } label: {
-                            Image(systemName: showChat ? "bubble.left.fill" : "bubble.left")
-                                .font(.system(size: 11))
-                                .foregroundColor(showChat ? Theme.textPrimary : Theme.textTertiary)
-                        }
-                        .buttonStyle(.plain)
-                        .help(showChat ? "Collapse conversation" : "Expand conversation")
-                    }
-                }
-                .padding(.horizontal, 14)
-                .frame(height: 50)
-                .background(Theme.barBackground)
-                .cornerRadius(25)
-                .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
+            VStack(spacing: 8) {
+                Spacer()
                 
-                // Centre pill — search bar
-                HStack(spacing: 0) {
-                    if isAskLoading {
-                        HStack(spacing: 6) {
-                            ProgressView()
-                                .controlSize(.mini)
-                            Text("Thinking…")
-                                .font(.system(size: 13))
-                                .foregroundColor(Theme.textTertiary)
-                        }
-                        .padding(.leading, 14)
-                    } else {
-                        TextField("Ask anything", text: $askText)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 14))
-                            .foregroundColor(Theme.textPrimary)
-                            .padding(.leading, 16)
-                            .onSubmit { onAsk() }
-                    }
-                    
-                    Spacer()
-                    
-                    // Action button inside search bar — sends "What did I miss" to conversation
-                    Button(action: onAskWhatDidIMiss) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "questionmark.circle")
-                                .font(.system(size: 11))
-                                .foregroundColor(Theme.olive)
-                            Text("What did I miss")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(Theme.textSecondary)
-                        }
+                // Expandable panels — transcript and/or chat
+                if (showTranscript && hasTranscript) || (!chatMessages.isEmpty && showChat) {
+                    expandablePanels
+                }
+                
+                // Floating action buttons — resume & regenerate
+                if !isLiveNote && !note.transcript.isEmpty && (note.status == .ended || note.status == .enhanced) {
+                    floatingActionButtons(layout: layout)
+                }
+                
+                // Main bar — adapts to width
+                mainBar(layout: layout)
+            }
+            .frame(maxWidth: 640)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, hPad)
+            .padding(.bottom, layout == .narrow ? 10 : 16)
+        }
+    }
+    
+    // MARK: - Expandable Panels
+    
+    private var expandablePanels: some View {
+        VStack(spacing: 0) {
+            if showTranscript && hasTranscript {
+                BottomTranscriptPanel(
+                    note: note,
+                    isLiveNote: isLiveNote
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                
+                if !chatMessages.isEmpty && showChat {
+                    Rectangle()
+                        .fill(Theme.divider)
+                        .frame(height: 1)
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(Theme.oliveFaint)
-                        .cornerRadius(20)
-                    }
-                    .buttonStyle(.plain)
                 }
-                .padding(.leading, 6)
-                .padding(.trailing, 8)
-                .padding(.vertical, 10)
-                .frame(minHeight: 50)
-                .background(Theme.barBackground)
-                .cornerRadius(25)
-                .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
-                
-                // Right pill — recording controls (only during live meeting)
-                if isLiveNote {
-                    RecordingControlsPill()
+            }
+            
+            if !chatMessages.isEmpty && showChat {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(chatMessages) { message in
+                                if message.role == .user {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "person.fill")
+                                            .font(.system(size: 9))
+                                            .foregroundColor(Theme.textTertiary)
+                                        Text(message.content)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundColor(Theme.textPrimary)
+                                        Spacer()
+                                    }
+                                    .id(message.id)
+                                } else {
+                                    HStack(alignment: .top, spacing: 6) {
+                                        Image(systemName: "sparkle")
+                                            .font(.system(size: 9))
+                                            .foregroundColor(Theme.olive)
+                                            .padding(.top, 2)
+                                        
+                                        Text(message.content)
+                                            .font(.system(size: 13))
+                                            .foregroundColor(Theme.textSecondary)
+                                            .textSelection(.enabled)
+                                            .lineSpacing(3)
+                                        
+                                        Spacer()
+                                    }
+                                    .id(message.id)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                    }
+                    .frame(maxHeight: 240)
+                    .scrollIndicators(.never)
+                    .onChange(of: chatMessages.count) { _, _ in
+                        if let lastMessage = chatMessages.last {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                            }
+                        }
+                    }
                 }
             }
         }
-        .frame(maxWidth: 640)
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 32)
-        .padding(.bottom, 16)
+        .background(Color.white)
+        .cornerRadius(16)
+        .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
+    }
+    
+    // MARK: - Floating Action Buttons
+    
+    private func floatingActionButtons(layout: BarLayout) -> some View {
+        HStack(spacing: 8) {
+            if !appState.isMeetingActive {
+                Button {
+                    appState.resumeMeeting(for: note)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "mic.fill")
+                            .font(.system(size: 10))
+                        if layout != .narrow {
+                            Text("Resume Meeting")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                    }
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, layout == .narrow ? 10 : 14)
+                    .padding(.vertical, 8)
+                    .background(Theme.barBackground)
+                    .cornerRadius(20)
+                    .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
+                }
+                .buttonStyle(.plain)
+                .help("Continue recording on this note")
+            }
+            
+            if appState.enhancingNoteId != note.id {
+                Button {
+                    Task {
+                        await appState.regenerateNotes(for: note)
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.trianglehead.2.counterclockwise")
+                            .font(.system(size: 10))
+                        if layout != .narrow {
+                            Text("Regenerate Notes")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                    }
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, layout == .narrow ? 10 : 14)
+                    .padding(.vertical, 8)
+                    .background(Theme.barBackground)
+                    .cornerRadius(20)
+                    .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
+                }
+                .buttonStyle(.plain)
+                .help("Regenerate AI notes from transcript")
+            }
+        }
+    }
+    
+    // MARK: - Main Bar (unified)
+    
+    @ViewBuilder
+    private func mainBar(layout: BarLayout) -> some View {
+        let compact = layout == .narrow
+        let hideLabels = layout != .wide
+        
+        HStack(spacing: 0) {
+            // Transcript toggle section
+            if hasTranscript {
+                transcriptSection(compact: compact)
+                
+                barDivider
+            }
+            
+            // Ask anything section (stretches)
+            searchSection(compact: hideLabels)
+            
+            // Recording controls section (live meetings only)
+            if isLiveNote {
+                barDivider
+                
+                RecordingControlsPill(compact: compact)
+            }
+        }
+        .padding(.leading, compact ? 10 : 14)
+        .padding(.trailing, compact ? 6 : 8)
+        .padding(.vertical, compact ? 4 : 5)
+        .frame(minHeight: compact ? 42 : 50)
+        .background(Theme.barBackground)
+        .cornerRadius(compact ? 21 : 25)
+        .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
+    }
+    
+    private var barDivider: some View {
+        Rectangle()
+            .fill(Theme.divider)
+            .frame(width: 1, height: 22)
+            .padding(.horizontal, 8)
+    }
+    
+    // MARK: - Pill Components
+    
+    private func transcriptSection(compact: Bool) -> some View {
+        HStack(spacing: 6) {
+            if hasTranscript {
+                HStack(spacing: compact ? 4 : 5) {
+                    AnimatedWaveformIcon(
+                        isActive: isLiveNote && !appState.isMeetingPaused,
+                        micLevel: appState.audioCaptureManager.micLevel,
+                        systemLevel: appState.audioCaptureManager.systemLevel
+                    )
+                    .foregroundColor(showTranscript ? Theme.olive : Theme.textTertiary)
+                    
+                    if !compact {
+                        Text("Transcript")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(showTranscript ? Theme.textPrimary : Theme.textTertiary)
+                    }
+                    
+                    Image(systemName: showTranscript ? "chevron.down" : "chevron.up")
+                        .font(.system(size: 7, weight: .semibold))
+                        .foregroundColor(Theme.textQuaternary)
+                        .animation(.easeInOut(duration: 0.2), value: showTranscript)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        showTranscript.toggle()
+                    }
+                }
+            }
+            
+            if !chatMessages.isEmpty {
+                Rectangle()
+                    .fill(Theme.divider)
+                    .frame(width: 1, height: 14)
+                
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showChat.toggle()
+                    }
+                } label: {
+                    Image(systemName: showChat ? "bubble.left.fill" : "bubble.left")
+                        .font(.system(size: 11))
+                        .foregroundColor(showChat ? Theme.textPrimary : Theme.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .help(showChat ? "Collapse conversation" : "Expand conversation")
+            }
+        }
+    }
+    
+    private func searchSection(compact: Bool) -> some View {
+        HStack(spacing: 0) {
+            if isAskLoading {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text("Thinking…")
+                        .font(.system(size: compact ? 12 : 13))
+                        .foregroundColor(Theme.textTertiary)
+                }
+            } else {
+                TextField("Ask anything", text: $askText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: compact ? 13 : 14))
+                    .foregroundColor(Theme.textPrimary)
+                    .onSubmit { onAsk() }
+            }
+            
+            Spacer(minLength: 4)
+            
+            // Time-based catch-up buttons
+            HStack(spacing: 4) {
+                catchUpButton(label: compact ? "30s" : "30s", seconds: 30)
+                catchUpButton(label: compact ? "2m" : "2 min", seconds: 120)
+                catchUpButton(label: compact ? "5m" : "5 min", seconds: 300)
+            }
+        }
+    }
+    
+    private func catchUpButton(label: String, seconds: TimeInterval) -> some View {
+        Button { onCatchUp(seconds) } label: {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Theme.textSecondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Theme.oliveFaint)
+                .cornerRadius(12)
+        }
+        .buttonStyle(.plain)
+        .help("Catch up on the last \(label)")
     }
 }
 
@@ -761,13 +867,15 @@ private struct DetailBottomBar: View {
 /// Pill-shaped recording controls shown in the bottom bar during a live meeting.
 /// Contains the recording indicator, elapsed timer, pause and stop buttons.
 private struct RecordingControlsPill: View {
+    var compact: Bool = false
+    
     @Environment(AppState.self) private var appState
     @State private var elapsed: TimeInterval = 0
     @State private var dotOpacity: Double = 1.0
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: compact ? 6 : 8) {
             // Recording dot
             if !appState.isMeetingPaused {
                 Circle()
@@ -783,19 +891,19 @@ private struct RecordingControlsPill: View {
             
             // Timer
             Text(formattedElapsed)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .font(.system(size: compact ? 10 : 11, weight: .medium, design: .monospaced))
                 .foregroundColor(appState.isMeetingPaused ? Theme.textTertiary : Theme.textSecondary)
             
             Rectangle()
                 .fill(Theme.divider)
-                .frame(width: 1, height: 14)
+                .frame(width: 1, height: compact ? 12 : 14)
             
             // Pause / Resume
             Button {
                 appState.toggleMeetingPause()
             } label: {
                 Image(systemName: appState.isMeetingPaused ? "play.fill" : "pause.fill")
-                    .font(.system(size: 9))
+                    .font(.system(size: compact ? 8 : 9))
                     .foregroundColor(Theme.textSecondary)
             }
             .buttonStyle(.plain)
@@ -806,21 +914,15 @@ private struct RecordingControlsPill: View {
                 appState.stopMeeting()
             } label: {
                 Image(systemName: "stop.fill")
-                    .font(.system(size: 8))
+                    .font(.system(size: compact ? 7 : 8))
                     .foregroundColor(.white)
-                    .frame(width: 22, height: 22)
+                    .frame(width: compact ? 18 : 22, height: compact ? 18 : 22)
                     .background(Theme.recording)
-                    .cornerRadius(11)
+                    .cornerRadius(compact ? 9 : 11)
             }
             .buttonStyle(.plain)
             .help("End meeting")
         }
-        .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .frame(height: 50)
-        .background(Theme.barBackground)
-        .cornerRadius(25)
-        .shadow(color: .black.opacity(0.06), radius: 8, y: 2)
         .onReceive(timer) { _ in
             if let start = appState.currentMeeting?.startedAt, !appState.isMeetingPaused {
                 elapsed = Date.now.timeIntervalSince(start)

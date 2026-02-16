@@ -27,10 +27,18 @@ struct EmailListView: View {
             }
         }
         .frame(maxHeight: .infinity)
-        .background(Theme.background)
+        .background(Color.clear)
     }
     
     // MARK: - Thread List with Date Grouping
+    
+    /// Whether there are more threads to load (mailbox or search).
+    private var showLoadMore: Bool {
+        if !gmail.searchQuery.isEmpty {
+            return gmail.canLoadMoreSearch
+        }
+        return gmail.canLoadMore
+    }
     
     private var threadList: some View {
         ScrollView {
@@ -60,12 +68,44 @@ struct EmailListView: View {
                         }
                         
                         Rectangle()
-                            .fill(Theme.divider)
+                            .fill(Theme.divider.opacity(0.5))
                             .frame(height: 1)
+                            .padding(.horizontal, 12)
                     }
+                }
+                
+                // Load More button
+                if showLoadMore {
+                    Button {
+                        Task {
+                            if !gmail.searchQuery.isEmpty {
+                                await gmail.loadMoreSearchResults()
+                            } else {
+                                await gmail.loadMoreThreads(gmail.currentMailbox)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if gmail.isLoadingMore {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.down.circle")
+                                    .font(.system(size: 11))
+                            }
+                            Text(gmail.isLoadingMore ? "Loading…" : "Load More")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(gmail.isLoadingMore)
                 }
             }
         }
+        .scrollIndicators(.hidden)
     }
     
     // MARK: - Date Grouping
@@ -147,7 +187,7 @@ struct EmailListView: View {
                     if expandedThreadIds.contains(thread.id) {
                         expandedThreadIds.remove(thread.id)
                     } else {
-                        expandedThreadIds.insert(thread.id)
+                        expandedThreadIds = [thread.id]
                     }
                 }
             }
@@ -295,7 +335,7 @@ struct EmailListView: View {
             .padding(.trailing, 12)
             .padding(.vertical, 5)
             .background(
-                isSelected ? Theme.sidebarSelection : Theme.sidebarBackground.opacity(0.4)
+                isSelected ? Theme.sidebarSelection : Theme.sidebarBackground.opacity(0.3)
             )
             .contentShape(Rectangle())
         }
