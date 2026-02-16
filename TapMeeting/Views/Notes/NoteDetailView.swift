@@ -1020,6 +1020,7 @@ private struct BottomTranscriptPanel: View {
         
         return GeometryReader { geometry in
             let bubbleWidth = geometry.size.width * 0.75
+            let utterances = store.recentUtterances
             
             ScrollViewReader { proxy in
                 ScrollView {
@@ -1032,7 +1033,14 @@ private struct BottomTranscriptPanel: View {
                                 .padding(.vertical, 4)
                         }
                         
-                        ForEach(store.recentUtterances, id: \.id) { utterance in
+                        ForEach(Array(utterances.enumerated()), id: \.element.id) { index, utterance in
+                            if shouldShowTimestamp(
+                                current: utterance.startTime,
+                                previous: index > 0 ? utterances[index - 1].startTime : nil
+                            ) {
+                                TranscriptTimestamp(date: utterance.startTime)
+                            }
+                            
                             TranscriptLine(
                                 label: utterance.source.displayLabel,
                                 text: utterance.text,
@@ -1057,16 +1065,39 @@ private struct BottomTranscriptPanel: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                 }
+                .contentMargins(.bottom, 4, for: .scrollContent)
                 .scrollIndicators(.never)
+                .onAppear {
+                    scrollToBottom(proxy: proxy, store: store)
+                }
                 .onChange(of: store.utteranceCount) { _, _ in
-                    if let lastId = store.recentUtterances.last?.id {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        scrollToBottom(proxy: proxy, store: store)
+                    }
+                }
+                .onChange(of: store.interimResult?.text) { _, _ in
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        scrollToBottom(proxy: proxy, store: store)
                     }
                 }
             }
         }
+    }
+    
+    private func scrollToBottom(proxy: ScrollViewProxy, store: TranscriptStore) {
+        if store.interimResult != nil {
+            proxy.scrollTo("interim", anchor: .bottom)
+        } else if let lastId = store.recentUtterances.last?.id {
+            proxy.scrollTo(lastId, anchor: .bottom)
+        }
+    }
+    
+    /// Show a timestamp when the minute changes between consecutive utterances.
+    private func shouldShowTimestamp(current: Date, previous: Date?) -> Bool {
+        guard let previous else { return true }
+        let cal = Calendar.current
+        return cal.component(.minute, from: current) != cal.component(.minute, from: previous)
+            || cal.component(.hour, from: current) != cal.component(.hour, from: previous)
     }
     
     // MARK: - Saved Transcript
@@ -1074,11 +1105,19 @@ private struct BottomTranscriptPanel: View {
     private var savedTranscriptContent: some View {
         GeometryReader { geometry in
             let bubbleWidth = geometry.size.width * 0.75
+            let utterances = note.transcript
             
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(note.transcript, id: \.id) { utterance in
+                        ForEach(Array(utterances.enumerated()), id: \.element.id) { index, utterance in
+                            if shouldShowTimestamp(
+                                current: utterance.startTime,
+                                previous: index > 0 ? utterances[index - 1].startTime : nil
+                            ) {
+                                TranscriptTimestamp(date: utterance.startTime)
+                            }
+                            
                             TranscriptLine(
                                 label: utterance.source.displayLabel,
                                 text: utterance.text,
@@ -1092,6 +1131,7 @@ private struct BottomTranscriptPanel: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 8)
                 }
+                .contentMargins(.bottom, 4, for: .scrollContent)
                 .scrollIndicators(.never)
                 .onAppear {
                     if let lastId = note.transcript.last?.id {
@@ -1100,6 +1140,38 @@ private struct BottomTranscriptPanel: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Transcript Timestamp
+
+/// Centred timestamp separator shown every minute in the transcript flow.
+private struct TranscriptTimestamp: View {
+    let date: Date
+    
+    private static let formatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        return f
+    }()
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(Theme.divider)
+                .frame(height: 0.5)
+            
+            Text(Self.formatter.string(from: date).lowercased())
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(Theme.textQuaternary)
+                .lineLimit(1)
+                .fixedSize()
+            
+            Rectangle()
+                .fill(Theme.divider)
+                .frame(height: 0.5)
+        }
+        .padding(.vertical, 6)
     }
 }
 

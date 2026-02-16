@@ -3,7 +3,7 @@ import SwiftData
 
 /// AI service for all email intelligence tasks.
 ///
-/// Uses the Anthropic Messages API (Claude) directly via user-provided API key.
+/// Uses the Anthropic Messages API (Claude) via server-side proxy.
 /// Handles: reply, compose, summarise, classify, style analysis, and meeting follow-up.
 final class EmailAIService {
     
@@ -69,17 +69,34 @@ final class EmailAIService {
         let instruction: String
     }
     
-    // MARK: - Networking
+    // MARK: - Anthropic API via Proxy
     
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 120
-        config.waitsForConnectivity = true
-        return URLSession(configuration: config)
-    }()
-    
-    private let maxRetries = 2
+    private func callAnthropic(system: String, userContent: String, maxTokens: Int) async throws -> String {
+        let body: [String: Any] = [
+            "model": Constants.AI.anthropicModel,
+            "max_tokens": maxTokens,
+            "system": system,
+            "messages": [
+                ["role": "user", "content": userContent]
+            ]
+        ]
+        
+        let data = try await AIProxyClient.shared.request(
+            provider: .anthropic,
+            endpoint: "/v1/messages",
+            body: body
+        )
+        
+        let apiResponse = try JSONDecoder().decode(AnthropicResponse.self, from: data)
+        
+        guard let text = apiResponse.content.first(where: { $0.type == "text" })?.text?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            throw AIProxyError.emptyResponse
+        }
+        
+        return text
+    }
     
     // MARK: - Generate Reply (Single Variant)
     
@@ -93,7 +110,6 @@ final class EmailAIService {
         contactInstructions: String? = nil,
         oneOffInstructions: String? = nil
     ) async throws -> String {
-        let apiKey = try getAPIKey()
         let idx = replyToIndex ?? (thread.count - 1)
         
         let systemPrompt = buildReplySystemPrompt(
@@ -106,14 +122,11 @@ final class EmailAIService {
         
         let userContent = buildThreadContext(thread: thread, replyToIndex: idx)
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        return try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxEmailReplyTokens
         )
-        
-        return try await executeRequest(request)
     }
     
     // MARK: - Generate Multi-Draft Reply
@@ -184,8 +197,6 @@ final class EmailAIService {
         styleProfile: StyleProfile? = nil,
         globalInstructions: String? = nil
     ) async throws -> ComposedEmail {
-        let apiKey = try getAPIKey()
-        
         let systemPrompt = buildComposeSystemPrompt(
             styleProfile: styleProfile,
             globalInstructions: globalInstructions
@@ -202,14 +213,11 @@ final class EmailAIService {
         Return valid JSON only, no markdown fences.
         """
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        let response = try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxEmailComposeTokens
         )
-        
-        let response = try await executeRequest(request)
         return parseComposedEmail(from: response)
     }
     
@@ -217,8 +225,6 @@ final class EmailAIService {
     
     /// Generate a concise summary of an email thread.
     func summariseThread(thread: [GmailMessage]) async throws -> String {
-        let apiKey = try getAPIKey()
-        
         let systemPrompt = """
         You are an email thread summariser. Generate a concise summary of the email thread.
         
@@ -233,22 +239,17 @@ final class EmailAIService {
         
         let userContent = buildFullThreadText(thread: thread)
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        return try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxSummariseTokens
         )
-        
-        return try await executeRequest(request)
     }
     
     // MARK: - Classify Email (Suggested Actions)
     
     /// Classify an email and return suggested quick actions.
     func classifyEmail(message: GmailMessage) async throws -> [SuggestedAction] {
-        let apiKey = try getAPIKey()
-        
         let systemPrompt = """
         You are an email classifier. Analyse the email and suggest 2-4 appropriate quick actions.
         
@@ -273,14 +274,11 @@ final class EmailAIService {
         \(message.bodyPlain.isEmpty ? message.snippet : message.bodyPlain)
         """
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        let response = try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxClassifyTokens
         )
-        
-        let response = try await executeRequest(request)
         return parseSuggestedActions(from: response)
     }
     
@@ -288,8 +286,6 @@ final class EmailAIService {
     
     /// Analyse sent emails to extract a writing style profile.
     func analyseStyle(sentEmails: [GmailMessage]) async throws -> StyleAnalysisResult {
-        let apiKey = try getAPIKey()
-        
         let systemPrompt = """
         You are a writing style analyst. Analyse the following sent emails and extract the writer's characteristic style.
         
@@ -329,14 +325,11 @@ final class EmailAIService {
         Analyse the writing style and return the JSON profile.
         """
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        let response = try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxStyleAnalysisTokens
         )
-        
-        let response = try await executeRequest(request)
         return parseStyleAnalysis(from: response)
     }
     
@@ -351,8 +344,6 @@ final class EmailAIService {
         styleProfile: StyleProfile? = nil,
         globalInstructions: String? = nil
     ) async throws -> ComposedEmail {
-        let apiKey = try getAPIKey()
-        
         let styleContext = buildStyleContext(styleProfile)
         let globalContext = globalInstructions.map { "\n\n## Global Rules\n\($0)" } ?? ""
         
@@ -387,14 +378,11 @@ final class EmailAIService {
         Generate the follow-up email.
         """
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        let response = try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxEmailFollowUpTokens
         )
-        
-        let response = try await executeRequest(request)
         return parseComposedEmail(from: response)
     }
     
@@ -566,89 +554,6 @@ final class EmailAIService {
         return text
     }
     
-    // MARK: - Anthropic API
-    
-    private func getAPIKey() throws -> String {
-        let apiKey = KeychainHelper.get(key: Constants.Keychain.anthropicAPIKey) ?? ""
-        guard !apiKey.isEmpty else {
-            throw EmailAIError.missingAPIKey
-        }
-        return apiKey
-    }
-    
-    private func buildAnthropicRequest(
-        apiKey: String,
-        system: String,
-        userContent: String,
-        maxTokens: Int
-    ) throws -> URLRequest {
-        let url = URL(string: Constants.AI.anthropicEndpoint)!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue(Constants.AI.anthropicVersion, forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let body = AnthropicRequest(
-            model: Constants.AI.anthropicModel,
-            max_tokens: maxTokens,
-            system: system,
-            messages: [AnthropicMessage(role: "user", content: userContent)]
-        )
-        
-        request.httpBody = try JSONEncoder().encode(body)
-        return request
-    }
-    
-    private func executeRequest(_ request: URLRequest) async throws -> String {
-        let (data, _) = try await performRequest(request)
-        let apiResponse = try JSONDecoder().decode(AnthropicResponse.self, from: data)
-        
-        guard let text = apiResponse.content.first(where: { $0.type == "text" })?.text?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else {
-            throw EmailAIError.emptyResponse
-        }
-        
-        return text
-    }
-    
-    private func performRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        var lastError: Error?
-        
-        for attempt in 0...maxRetries {
-            do {
-                let (data, response) = try await session.data(for: request)
-                
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw EmailAIError.apiError("Invalid response from server")
-                }
-                
-                if (400...499).contains(httpResponse.statusCode) {
-                    let body = String(data: data, encoding: .utf8) ?? ""
-                    throw EmailAIError.apiError("Request rejected (\(httpResponse.statusCode)): \(body)")
-                }
-                
-                guard (200...299).contains(httpResponse.statusCode) else {
-                    throw EmailAIError.apiError("Server error (\(httpResponse.statusCode))")
-                }
-                
-                return (data, httpResponse)
-                
-            } catch let error as EmailAIError {
-                throw error
-            } catch {
-                lastError = error
-                if attempt < maxRetries {
-                    let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
-                    try await Task.sleep(nanoseconds: delay)
-                }
-            }
-        }
-        
-        throw EmailAIError.networkError(lastError)
-    }
-    
     // MARK: - Response Parsers
     
     private func parseComposedEmail(from response: String) -> ComposedEmail {
@@ -727,29 +632,6 @@ final class EmailAIService {
     }
 }
 
-// MARK: - Anthropic API Types
-
-private struct AnthropicRequest: Encodable {
-    let model: String
-    let max_tokens: Int
-    let system: String
-    let messages: [AnthropicMessage]
-}
-
-private struct AnthropicMessage: Encodable {
-    let role: String
-    let content: String
-}
-
-private struct AnthropicResponse: Decodable {
-    let content: [ContentBlock]
-    
-    struct ContentBlock: Decodable {
-        let type: String
-        let text: String?
-    }
-}
-
 // MARK: - Result Types
 
 struct ComposedEmail {
@@ -807,25 +689,7 @@ enum MeetingFollowUpTemplate: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - Errors
+// MARK: - Backward Compatibility
 
-enum EmailAIError: LocalizedError {
-    case missingAPIKey
-    case apiError(String)
-    case emptyResponse
-    case networkError(Error?)
-    
-    var errorDescription: String? {
-        switch self {
-        case .missingAPIKey:
-            return "Anthropic API key not configured. Add it in Preferences → API Keys."
-        case .apiError(let message):
-            return "AI draft failed: \(message)"
-        case .emptyResponse:
-            return "AI returned an empty response."
-        case .networkError(let underlying):
-            let detail = underlying?.localizedDescription ?? "Unknown error"
-            return "Network error: \(detail)"
-        }
-    }
-}
+/// Legacy error type — now mapped to AIProxyError.
+typealias EmailAIError = AIProxyError

@@ -2,21 +2,9 @@ import Foundation
 
 /// AI service for extracting actionable to-do items from meeting notes and emails.
 ///
-/// Uses the Anthropic Messages API (Claude) — same provider as EmailAIService.
+/// Uses the Anthropic Messages API (Claude) via server-side proxy.
 /// Extracts only tasks assigned to / expected of the user.
 final class TodoExtractionService {
-    
-    // MARK: - Networking
-    
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 120
-        config.waitsForConnectivity = true
-        return URLSession(configuration: config)
-    }()
-    
-    private let maxRetries = 2
     
     // MARK: - Extract from Meeting Notes
     
@@ -27,8 +15,6 @@ final class TodoExtractionService {
         noteTitle: String,
         noteId: UUID
     ) async throws -> [TodoItem] {
-        let apiKey = try getAPIKey()
-        
         let systemPrompt = """
         You are a task extraction assistant. Analyse the meeting notes below and extract actionable to-do items that are assigned to or expected of the user (the person who recorded these notes).
 
@@ -63,14 +49,12 @@ final class TodoExtractionService {
         Extract to-do items for the user.
         """
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        let response = try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxTodoExtractionTokens
         )
         
-        let response = try await executeRequest(request)
         return parseTodoItems(
             from: response,
             sourceType: .meeting,
@@ -84,14 +68,6 @@ final class TodoExtractionService {
     /// Extract to-do items from an email message.
     /// Only extracts tasks that require the user's action.
     /// Returns an empty array for newsletters, marketing, notifications, etc.
-    ///
-    /// - Parameters:
-    ///   - message: The specific new email message to analyse.
-    ///   - threadId: The Gmail thread ID (used as `sourceId`).
-    ///   - userEmail: The user's own email address, so the AI can determine
-    ///     whether requests are directed at the user or at other recipients.
-    ///   - existingTodoTitles: Titles of to-dos already created for this thread.
-    ///     Passed to the AI so it can avoid extracting duplicate tasks.
     func extractFromEmail(
         message: GmailMessage,
         threadId: String,
@@ -99,8 +75,6 @@ final class TodoExtractionService {
         existingTodoTitles: [String] = [],
         excludedCategories: Set<EmailCategory> = []
     ) async throws -> [TodoItem] {
-        let apiKey = try getAPIKey()
-        
         let existingTodosContext: String
         if existingTodoTitles.isEmpty {
             existingTodosContext = ""
@@ -116,7 +90,6 @@ final class TodoExtractionService {
             """
         }
         
-        // Determine if the user is a direct recipient (To) or just CC'd
         let userLower = userEmail.lowercased()
         let isDirectRecipient = message.to.contains { $0.lowercased() == userLower }
         let isCCRecipient = message.cc.contains { $0.lowercased() == userLower }
@@ -146,7 +119,6 @@ final class TodoExtractionService {
             """
         }
         
-        // Build excluded categories context for the AI prompt
         let excludedCategoriesContext: String
         if excludedCategories.isEmpty {
             excludedCategoriesContext = ""
@@ -239,14 +211,12 @@ final class TodoExtractionService {
         --- END OF NEW MESSAGE ---
         """
         
-        let request = try buildAnthropicRequest(
-            apiKey: apiKey,
+        let response = try await callAnthropic(
             system: systemPrompt,
             userContent: userContent,
             maxTokens: Constants.AI.maxTodoExtractionTokens
         )
         
-        let response = try await executeRequest(request)
         return parseTodoItems(
             from: response,
             sourceType: .email,
@@ -259,11 +229,6 @@ final class TodoExtractionService {
     // MARK: - Batch Extract from Emails
     
     /// Extract to-dos from multiple email messages, with deduplication awareness.
-    /// Looks up existing to-do titles per thread so the AI avoids duplicates.
-    ///
-    /// - Parameters:
-    ///   - messages: Array of (message, threadId, userEmail) tuples to process.
-    ///   - existingTodosByThread: Dictionary mapping threadId → list of existing to-do titles.
     func extractFromEmails(
         _ messages: [(message: GmailMessage, threadId: String, userEmail: String)],
         existingTodosByThread: [String: [String]] = [:],
@@ -271,10 +236,8 @@ final class TodoExtractionService {
     ) async -> [TodoItem] {
         var allTodos: [TodoItem] = []
         
-        // Process in parallel with a concurrency limit of 3
         await withTaskGroup(of: [TodoItem].self) { group in
             for (index, item) in messages.enumerated() {
-                // Limit concurrent extractions
                 if index >= 3 {
                     if let result = await group.next() {
                         allTodos.append(contentsOf: result)
@@ -307,87 +270,33 @@ final class TodoExtractionService {
         return allTodos
     }
     
-    // MARK: - Anthropic API
+    // MARK: - Anthropic API via Proxy
     
-    private func getAPIKey() throws -> String {
-        let apiKey = KeychainHelper.get(key: Constants.Keychain.anthropicAPIKey) ?? ""
-        guard !apiKey.isEmpty else {
-            throw TodoExtractionError.missingAPIKey
-        }
-        return apiKey
-    }
-    
-    private func buildAnthropicRequest(
-        apiKey: String,
-        system: String,
-        userContent: String,
-        maxTokens: Int
-    ) throws -> URLRequest {
-        let url = URL(string: Constants.AI.anthropicEndpoint)!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue(Constants.AI.anthropicVersion, forHTTPHeaderField: "anthropic-version")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    private func callAnthropic(system: String, userContent: String, maxTokens: Int) async throws -> String {
+        let body: [String: Any] = [
+            "model": Constants.AI.anthropicModel,
+            "max_tokens": maxTokens,
+            "system": system,
+            "messages": [
+                ["role": "user", "content": userContent]
+            ]
+        ]
         
-        let body = AnthropicRequest(
-            model: Constants.AI.anthropicModel,
-            max_tokens: maxTokens,
-            system: system,
-            messages: [AnthropicMessage(role: "user", content: userContent)]
+        let data = try await AIProxyClient.shared.request(
+            provider: .anthropic,
+            endpoint: "/v1/messages",
+            body: body
         )
         
-        request.httpBody = try JSONEncoder().encode(body)
-        return request
-    }
-    
-    private func executeRequest(_ request: URLRequest) async throws -> String {
-        let (data, _) = try await performRequest(request)
         let apiResponse = try JSONDecoder().decode(AnthropicResponse.self, from: data)
         
         guard let text = apiResponse.content.first(where: { $0.type == "text" })?.text?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else {
-            throw TodoExtractionError.emptyResponse
+            throw AIProxyError.emptyResponse
         }
         
         return text
-    }
-    
-    private func performRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        var lastError: Error?
-        
-        for attempt in 0...maxRetries {
-            do {
-                let (data, response) = try await session.data(for: request)
-                
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw TodoExtractionError.apiError("Invalid response from server")
-                }
-                
-                if (400...499).contains(httpResponse.statusCode) {
-                    let body = String(data: data, encoding: .utf8) ?? ""
-                    throw TodoExtractionError.apiError("Request rejected (\(httpResponse.statusCode)): \(body)")
-                }
-                
-                guard (200...299).contains(httpResponse.statusCode) else {
-                    throw TodoExtractionError.apiError("Server error (\(httpResponse.statusCode))")
-                }
-                
-                return (data, httpResponse)
-                
-            } catch let error as TodoExtractionError {
-                throw error
-            } catch {
-                lastError = error
-                if attempt < maxRetries {
-                    let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
-                    try await Task.sleep(nanoseconds: delay)
-                }
-            }
-        }
-        
-        throw TodoExtractionError.networkError(lastError)
     }
     
     // MARK: - Response Parser
@@ -464,48 +373,13 @@ final class TodoExtractionService {
     }
 }
 
-// MARK: - Anthropic API Types (private to this service)
+// MARK: - Anthropic Response Type (shared across Anthropic services)
 
-private struct AnthropicRequest: Encodable {
-    let model: String
-    let max_tokens: Int
-    let system: String
-    let messages: [AnthropicMessage]
-}
-
-private struct AnthropicMessage: Encodable {
-    let role: String
-    let content: String
-}
-
-private struct AnthropicResponse: Decodable {
+struct AnthropicResponse: Decodable {
     let content: [ContentBlock]
     
     struct ContentBlock: Decodable {
         let type: String
         let text: String?
-    }
-}
-
-// MARK: - Errors
-
-enum TodoExtractionError: LocalizedError {
-    case missingAPIKey
-    case apiError(String)
-    case emptyResponse
-    case networkError(Error?)
-    
-    var errorDescription: String? {
-        switch self {
-        case .missingAPIKey:
-            return "Anthropic API key not configured."
-        case .apiError(let message):
-            return "To-do extraction failed: \(message)"
-        case .emptyResponse:
-            return "AI returned an empty response."
-        case .networkError(let underlying):
-            let detail = underlying?.localizedDescription ?? "Unknown error"
-            return "Network error: \(detail)"
-        }
     }
 }

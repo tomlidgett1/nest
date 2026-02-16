@@ -106,11 +106,11 @@ final class SemanticSearchService {
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
-            throw EnhancementError.apiError("Invalid semantic RPC response")
+            throw AIProxyError.apiError("Invalid semantic RPC response")
         }
         guard (200...299).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
-            throw EnhancementError.apiError("Hybrid search failed (\(http.statusCode)): \(body)")
+            throw AIProxyError.apiError("Hybrid search failed (\(http.statusCode)): \(body)")
         }
 
         let decoder = JSONDecoder()

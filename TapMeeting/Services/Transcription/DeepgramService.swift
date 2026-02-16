@@ -91,9 +91,8 @@ final class DeepgramService: TranscriptionServiceProtocol {
         guard !isConnected else { return }
         isIntentionalDisconnect = false
         
-        guard let apiKey = KeychainHelper.get(key: Constants.Keychain.deepgramAPIKey), !apiKey.isEmpty else {
-            throw DeepgramError.missingAPIKey
-        }
+        // Fetch Deepgram token from server-side Edge Function (API key never stored on client).
+        let apiKey = try await DeepgramTokenService.shared.fetchToken()
         
         let url = buildWebSocketURL()
         var request = URLRequest(url: url)

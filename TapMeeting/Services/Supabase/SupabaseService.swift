@@ -46,6 +46,12 @@ final class SupabaseService: NSObject {
     private var googleRefreshSuccesses = 0
     private var googleRefreshFailures = 0
 
+    // MARK: - Shared Instance
+    
+    /// Global accessor so services like `AIProxyClient` can obtain the Supabase JWT
+    /// without needing the SwiftUI environment. Set automatically during init.
+    nonisolated(unsafe) static var shared: SupabaseService!
+    
     // MARK: - Supabase Client
 
     let client: SupabaseClient
@@ -59,6 +65,7 @@ final class SupabaseService: NSObject {
         )
 
         super.init()
+        Self.shared = self
 
         // Check for existing session on launch
         Task { await restoreSession() }
@@ -321,25 +328,40 @@ final class SupabaseService: NSObject {
     }
 
     /// Returns a Supabase access token suitable for Edge Function auth.
-    /// Prefers a freshly refreshed session; falls back to an unexpired current token.
-    private func supabaseAccessTokenForFunctionCall() async -> String? {
+    /// Uses the current token if still valid; only refreshes when expired or about to expire.
+    func supabaseAccessTokenForFunctionCall() async -> String? {
+        // 1. Try the current session first — avoids unnecessary refresh calls
+        //    which can trigger Supabase Auth rate limits.
+        do {
+            let session = try await client.auth.session
+            if !isJWTDefinitelyExpired(session.accessToken, leewaySeconds: 60) {
+                return session.accessToken
+            }
+            print("[SupabaseService] Current JWT is expired or expiring soon, will refresh")
+        } catch {
+            print("[SupabaseService] No current session: \(error.localizedDescription)")
+        }
+
+        // 2. Session is expired or missing — try to refresh.
         do {
             let refreshed = try await client.auth.refreshSession()
             await applySession(refreshed)
             return refreshed.accessToken
         } catch {
-            print("[SupabaseService] refreshSession before broker call failed: \(error.localizedDescription)")
+            print("[SupabaseService] refreshSession failed: \(error.localizedDescription)")
         }
 
+        // 3. Last resort: if refresh fails, check session one more time
+        //    (the SDK may have refreshed internally).
         do {
             let session = try await client.auth.session
-            if !isJWTDefinitelyExpired(session.accessToken, leewaySeconds: 30) {
+            if !isJWTDefinitelyExpired(session.accessToken, leewaySeconds: 10) {
                 return session.accessToken
             }
-            print("[SupabaseService] Current Supabase JWT is expired")
+            print("[SupabaseService] JWT still expired after refresh attempt")
             return nil
         } catch {
-            print("[SupabaseService] No current Supabase session for broker call: \(error.localizedDescription)")
+            print("[SupabaseService] No Supabase session available: \(error.localizedDescription)")
             return nil
         }
     }
@@ -409,7 +431,9 @@ final class SupabaseService: NSObject {
 
     // MARK: - App Config
 
-    /// Fetch shared API keys from the `app_config` table.
+    /// Fetch shared app configuration from the `app_config` table.
+    /// AI provider API keys are no longer stored here — they live as
+    /// Edge Function environment variables on the server.
     func fetchAppConfig() async {
         do {
             let rows: [AppConfigRow] = try await client
@@ -425,10 +449,15 @@ final class SupabaseService: NSObject {
 
             await MainActor.run { appConfig = config }
 
-            // Cache API keys in Keychain so existing services (DeepgramService,
-            // NoteEnhancementService, etc.) work without modification.
-            for (key, value) in config where !value.isEmpty {
+            // Sync non-AI config values to Keychain (e.g. Google client credentials).
+            let aiKeys: Set<String> = ["openai_api_key", "anthropic_api_key", "deepgram_api_key"]
+            for (key, value) in config where !value.isEmpty && !aiKeys.contains(key) {
                 KeychainHelper.set(key: key, value: value)
+            }
+
+            // Clean up any legacy AI API keys from Keychain (they now live server-side only).
+            for legacyKey in aiKeys {
+                KeychainHelper.delete(key: legacyKey)
             }
 
             print("[SupabaseService] App config loaded: \(config.keys.sorted())")
@@ -437,10 +466,7 @@ final class SupabaseService: NSObject {
         }
     }
 
-    /// Convenience accessors for API keys.
-    var deepgramAPIKey: String? { appConfig["deepgram_api_key"] }
-    var openAIAPIKey: String? { appConfig["openai_api_key"] }
-    var anthropicAPIKey: String? { appConfig["anthropic_api_key"] }
+    /// Convenience accessors for non-AI config values.
     var googleClientID: String? { appConfig["google_client_id"] }
     var googleClientSecret: String? { appConfig["google_client_secret"] }
 

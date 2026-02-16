@@ -106,8 +106,9 @@ struct NotesListView: View {
                     .help("Go to Home")
                     .padding(.leading, isSidebarCollapsed ? 0 : 104)
                     
-                    // Account filter — only shown on Email tab with multiple accounts
-                    if sidebarTab == .email, appState.gmailService.accounts.count > 1 {
+                    // Email: account filter — shown on Email tab with multiple accounts
+                    if sidebarTab == .email, appState.gmailService.isConnected,
+                       appState.gmailService.accounts.count > 1 {
                         emailAccountFilterMenu
                     }
                     
@@ -151,16 +152,23 @@ struct NotesListView: View {
                     }
                 }
             }
+            ToolbarItem(placement: .principal) {
+                Group {
+                    if sidebarTab == .email, appState.gmailService.isConnected {
+                        emailToolbarTabs
+                    } else {
+                        EmptyView()
+                    }
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 HStack(spacing: 12) {
                     if appState.isMeetingActive, !isViewingLiveNote {
                         MeetingControlButtons()
                     }
                     
-                    // Email toolbar — mailbox tabs + compose + refresh
+                    // Email: refresh + compose — shown on Email tab
                     if sidebarTab == .email, appState.gmailService.isConnected {
-                        emailToolbarTabs
-                        
                         Button {
                             Task { await appState.gmailService.fetchMailbox(appState.gmailService.currentMailbox) }
                         } label: {
@@ -277,10 +285,9 @@ struct NotesListView: View {
             }
         }
         .onChange(of: sidebarTab) { _, newTab in
-            // Mark all to-dos as seen when the user navigates to the To-Dos page
-            if case .todos = newTab {
-                appState.todoRepository.markAllAsSeen()
-            }
+            // Marking as seen is handled by TodoListView with a brief delay
+            // so the user can see the "New" indicators before they clear.
+            _ = newTab
         }
         .onAppear {
             guard !hasTriggeredLayoutFix else { return }
@@ -317,29 +324,63 @@ struct NotesListView: View {
     private var emailAccountFilterMenu: some View {
         let gmail = appState.gmailService
         
-        return Picker(selection: Binding<String>(
-            get: { gmail.filterAccountId ?? "__all__" },
-            set: { newValue in
-                gmail.filterAccountId = newValue == "__all__" ? nil : newValue
+        return Menu {
+            Button {
+                gmail.filterAccountId = nil
                 gmail.selectedThread = nil
                 gmail.selectedMessageId = nil
+            } label: {
+                HStack {
+                    Text("All Accounts")
+                    if gmail.filterAccountId == nil {
+                        Spacer()
+                        Image(systemName: "checkmark")
+                    }
+                }
             }
-        ), label: EmptyView()) {
-            Text("All Accounts").tag("__all__")
+            
             Divider()
+            
             ForEach(gmail.accounts, id: \.id) { account in
-                Text(account.email).tag(account.id)
+                Button {
+                    gmail.filterAccountId = account.id
+                    gmail.selectedThread = nil
+                    gmail.selectedMessageId = nil
+                } label: {
+                    HStack {
+                        Text(account.email)
+                        if gmail.filterAccountId == account.id {
+                            Spacer()
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                EmailAccountLogoView(
+                    email: {
+                        if let filterId = gmail.filterAccountId,
+                           let account = gmail.accounts.first(where: { $0.id == filterId }) {
+                            return account.email
+                        }
+                        return gmail.accounts.first?.email ?? "gmail.com"
+                    }(),
+                    size: 16
+                )
+                
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .medium))
+                    .foregroundColor(Theme.textTertiary)
             }
         }
-        .pickerStyle(.menu)
-        .fixedSize()
+        .buttonStyle(.plain)
     }
     
     // MARK: - Email Toolbar Tabs (Mailbox switcher)
     
     private var emailToolbarTabs: some View {
         let gmail = appState.gmailService
-        let inboxUnread = gmail.inboxThreads.filter(\.isUnread).count
         let isSearchActive = !gmail.searchQuery.isEmpty
         
         return HStack(spacing: 0) {
@@ -353,28 +394,14 @@ struct NotesListView: View {
                     NotificationCenter.default.post(name: .emailMailboxChanged, object: nil)
                     Task { await gmail.fetchMailbox(mailbox) }
                 } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: mailbox.icon)
-                            .font(.system(size: 10))
-                        Text(mailbox.displayName)
-                            .font(.system(size: 12, weight: .medium))
-                        
-                        if mailbox == .inbox, inboxUnread > 0, !isSearchActive {
-                            Text("\(inboxUnread)")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .background(Theme.olive)
-                                .cornerRadius(4)
-                        }
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .foregroundColor(isActive ? Theme.textPrimary : Theme.textSecondary)
-                    .background(isActive ? Color.white : Color.clear)
-                    .cornerRadius(6)
-                    .shadow(color: isActive ? .black.opacity(0.05) : .clear, radius: 1, y: 1)
+                    Text(mailbox.displayName)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(isActive ? Theme.textPrimary : Theme.textTertiary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(isActive ? Color.white : Color.clear)
+                        .cornerRadius(6)
+                        .shadow(color: isActive ? .black.opacity(0.05) : .clear, radius: 1, y: 1)
                 }
                 .buttonStyle(.plain)
             }

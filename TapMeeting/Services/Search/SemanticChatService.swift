@@ -3,7 +3,6 @@ import Foundation
 final class SemanticChatService {
     private let searchService: SemanticSearchService
     private let telemetry: SearchTelemetryService
-    private let session = URLSession(configuration: .default)
 
     init(searchService: SemanticSearchService, telemetry: SearchTelemetryService) {
         self.searchService = searchService
@@ -50,7 +49,7 @@ final class SemanticChatService {
             return (citations, refusal)
         }
 
-        let request = try buildStreamingRequest(
+        let body = buildStreamingRequestBody(
             query: query,
             intent: intent,
             evidence: evidence,
@@ -66,7 +65,13 @@ final class SemanticChatService {
             "fallback_used": "\(fallbackUsed)"
         ])
 
-        let stream = makeSSEStream(for: request)
+        let (bytes, _) = try await AIProxyClient.shared.stream(
+            provider: .openai,
+            endpoint: "/v1/responses",
+            body: body
+        )
+        
+        let stream = makeSSEStream(from: bytes)
         return (citations, stream)
     }
 
@@ -85,17 +90,14 @@ final class SemanticChatService {
 
     // MARK: - Request Building
 
-    private func buildStreamingRequest(
+    private func buildStreamingRequestBody(
         query: String,
         intent: SemanticIntent,
         evidence: [EvidenceBlock],
         personHint: String?,
         fallbackUsed: Bool,
         conversationHistory: [SemanticChatMessage]
-    ) throws -> URLRequest {
-        let apiKey = KeychainHelper.get(key: Constants.Keychain.openAIAPIKey) ?? ""
-        guard !apiKey.isEmpty else { throw EnhancementError.missingAPIKey }
-
+    ) -> [String: Any] {
         let context = evidence.enumerated().map { index, block in
             """
             [\(index + 1)] \(block.title)
@@ -146,7 +148,7 @@ final class SemanticChatService {
         If the user is asking a follow-up, use conversation history to resolve references.
         """
 
-        let body: [String: Any] = [
+        return [
             "model": Constants.AI.semanticChatModel,
             "instructions": instructions,
             "input": prompt,
@@ -154,28 +156,14 @@ final class SemanticChatService {
             "store": false,
             "stream": true
         ]
-
-        var request = URLRequest(url: URL(string: Constants.AI.responsesEndpoint)!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        return request
     }
 
     // MARK: - SSE Stream
 
-    private func makeSSEStream(for request: URLRequest) -> AsyncStream<String> {
+    private func makeSSEStream(from bytes: URLSession.AsyncBytes) -> AsyncStream<String> {
         AsyncStream { continuation in
             let task = Task {
                 do {
-                    let (bytes, response) = try await session.bytes(for: request)
-                    guard let http = response as? HTTPURLResponse,
-                          (200...299).contains(http.statusCode) else {
-                        continuation.finish()
-                        return
-                    }
-
                     for try await line in bytes.lines {
                         guard !Task.isCancelled else { break }
                         guard line.hasPrefix("data: ") else { continue }

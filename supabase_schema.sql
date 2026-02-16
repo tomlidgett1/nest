@@ -487,7 +487,6 @@ $$;
 -- 6. SEED DATA (API Keys — replace with your actual keys)
 -- ============================================================
 
-INSERT INTO app_config (key, value) VALUES
-    ('deepgram_api_key', 'YOUR_DEEPGRAM_KEY'),
-    ('openai_api_key', 'YOUR_OPENAI_KEY'),
-    ('anthropic_api_key', 'YOUR_ANTHROPIC_KEY');
+-- AI provider API keys (openai, anthropic, deepgram) are no longer stored in app_config.
+-- They are set as Edge Function environment variables in the Supabase dashboard.
+-- See: supabase/functions/ai-proxy/ and supabase/functions/deepgram-token/

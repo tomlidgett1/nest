@@ -386,7 +386,7 @@ struct EmailAIDraftSheet: View {
     private func loadSuggestedActions() {
         let autoSuggest = UserDefaults.standard.object(forKey: Constants.Defaults.autoSuggestActions) as? Bool ?? true
         guard autoSuggest else { return }
-        guard let key = KeychainHelper.get(key: Constants.Keychain.anthropicAPIKey), !key.isEmpty else { return }
+        guard SupabaseService.shared?.isAuthenticated == true else { return }
         
         isLoadingActions = true
         Task {

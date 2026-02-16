@@ -21,6 +21,8 @@ struct TodoListView: View {
     @State private var confirmExcludeSender: String?
     /// Tracks IDs of to-dos that were just completed — triggers the celebration animation.
     @State private var justCompletedIds: Set<UUID> = []
+    /// Captures IDs of to-dos that were unseen when the page loaded — persists for the session.
+    @State private var initialUnseenIds: Set<UUID> = []
     @FocusState private var isNewTodoFieldFocused: Bool
     
     enum ExclusionTab: String, CaseIterable, Identifiable {
@@ -144,6 +146,17 @@ struct TodoListView: View {
                 }
                 .padding(.horizontal, Theme.Spacing.contentPadding)
                 .padding(.top, 4)
+            }
+        }
+        .onAppear {
+            // Capture currently-unseen IDs for visual "New" indicators
+            let unseenTodos = appState.todoRepository.fetchAllTodos().filter { !$0.isSeen }
+            initialUnseenIds = Set(unseenTodos.map { $0.id })
+            
+            // Mark as seen in the data model after a brief delay
+            // (keeps badge counts accurate while giving the user time to see the indicators)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                appState.todoRepository.markAllAsSeen()
             }
         }
         .alert(
@@ -291,18 +304,26 @@ struct TodoListView: View {
     // MARK: - To-Do Group
     
     private func todoGroup(title: String, todos: [TodoItem]) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let isNewGroup = title == "New"
+        
+        return VStack(alignment: .leading, spacing: 0) {
             // Group header
             HStack(spacing: 6) {
+                if isNewGroup {
+                    Circle()
+                        .fill(Theme.olive)
+                        .frame(width: 6, height: 6)
+                }
+                
                 Text(title)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(Theme.textTertiary)
+                    .foregroundColor(isNewGroup ? Theme.olive : Theme.textTertiary)
                     .textCase(.uppercase)
                     .tracking(0.5)
                 
                 Text("\(todos.count)")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Theme.textQuaternary)
+                    .foregroundColor(isNewGroup ? Theme.olive.opacity(0.6) : Theme.textQuaternary)
             }
             .padding(.top, 16)
             .padding(.bottom, 8)
@@ -375,11 +396,24 @@ struct TodoListView: View {
                 
                 // Title + due date only (source shown in expanded detail)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(todo.title)
-                        .font(.system(size: 14, weight: .regular))
-                        .foregroundColor(showChecked ? Theme.textTertiary : Theme.textPrimary)
-                        .strikethrough(showChecked, color: Theme.textTertiary)
-                        .lineLimit(isExpanded ? nil : 1)
+                    HStack(spacing: 6) {
+                        Text(todo.title)
+                            .font(.system(size: 14, weight: .regular))
+                            .foregroundColor(showChecked ? Theme.textTertiary : Theme.textPrimary)
+                            .strikethrough(showChecked, color: Theme.textTertiary)
+                            .lineLimit(isExpanded ? nil : 1)
+                        
+                        // "New" badge for unseen items
+                        if initialUnseenIds.contains(todo.id) {
+                            Text("NEW")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(Theme.olive)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(Theme.oliveFaint)
+                                .cornerRadius(4)
+                        }
+                    }
                     
                     // Due date only in collapsed row
                     if let dueDateStr = todo.formattedDueDate {
@@ -432,15 +466,37 @@ struct TodoListView: View {
             RoundedRectangle(cornerRadius: 8)
                 .fill(Theme.olive.opacity(isCelebrating ? 0.08 : 0))
         )
+        .background(
+            // Subtle warm tint for unseen items
+            RoundedRectangle(cornerRadius: 8)
+                .fill(initialUnseenIds.contains(todo.id) ? Theme.olive.opacity(0.03) : Color.clear)
+        )
         .background(Theme.cardBackground)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .stroke(
-                    isCelebrating ? Theme.olive.opacity(0.4) : Theme.divider.opacity(0.3),
+                    isCelebrating
+                        ? Theme.olive.opacity(0.4)
+                        : initialUnseenIds.contains(todo.id)
+                            ? Theme.olive.opacity(0.25)
+                            : Theme.divider.opacity(0.3),
                     lineWidth: isCelebrating ? 1.5 : 1
                 )
         )
+        // Olive left accent bar for new items
+        .overlay(alignment: .leading) {
+            if initialUnseenIds.contains(todo.id) {
+                UnevenRoundedRectangle(
+                    topLeadingRadius: 8,
+                    bottomLeadingRadius: 8,
+                    bottomTrailingRadius: 0,
+                    topTrailingRadius: 0
+                )
+                .fill(Theme.olive.opacity(0.6))
+                .frame(width: 3)
+            }
+        }
         .animation(.easeOut(duration: 0.3), value: isCelebrating)
     }
     
@@ -896,11 +952,22 @@ struct TodoListView: View {
         var id: String { key }
     }
     
-    /// Group to-dos by their source type for display.
+    /// Group to-dos for display — unseen "New" items first, then by source type.
     private func groupedTodos(_ todos: [TodoItem]) -> [TodoGroup] {
-        var groups: [String: [TodoItem]] = [:]
+        // Separate new (unseen) from seen
+        let newTodos = todos.filter { initialUnseenIds.contains($0.id) }
+        let seenTodos = todos.filter { !initialUnseenIds.contains($0.id) }
         
-        for todo in todos {
+        var result: [TodoGroup] = []
+        
+        // "New" group always appears first
+        if !newTodos.isEmpty {
+            result.append(TodoGroup(key: "New", todos: newTodos))
+        }
+        
+        // Group remaining by source type
+        var groups: [String: [TodoItem]] = [:]
+        for todo in seenTodos {
             let key: String
             switch todo.sourceType {
             case .meeting:
@@ -913,12 +980,14 @@ struct TodoListView: View {
             groups[key, default: []].append(todo)
         }
         
-        // Sort order: Manual first, then Meetings, then Emails
         let order = ["Manual", "From Meetings", "From Emails"]
-        return order.compactMap { key in
-            guard let todos = groups[key], !todos.isEmpty else { return nil }
-            return TodoGroup(key: key, todos: todos)
+        for key in order {
+            if let todos = groups[key], !todos.isEmpty {
+                result.append(TodoGroup(key: key, todos: todos))
+            }
         }
+        
+        return result
     }
     
     // MARK: - Helpers

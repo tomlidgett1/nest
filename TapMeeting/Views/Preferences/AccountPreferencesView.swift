@@ -85,13 +85,13 @@ struct AccountPreferencesView: View {
 
             // API Keys info
             SettingsCard(
-                title: "API Keys",
-                subtitle: "API keys for transcription and AI features are managed automatically. No configuration needed."
+                title: "AI Services",
+                subtitle: "AI features are available automatically when signed in. API keys are managed securely on the server."
             ) {
                 VStack(spacing: 10) {
-                    APIStatusRow(icon: "waveform", name: "Deepgram", description: "Real-time transcription", isConfigured: supabaseService.deepgramAPIKey != nil)
-                    APIStatusRow(icon: "brain", name: "OpenAI", description: "Note enhancement & tagging", isConfigured: supabaseService.openAIAPIKey != nil)
-                    APIStatusRow(icon: "sparkles", name: "Anthropic", description: "AI email drafts", isConfigured: supabaseService.anthropicAPIKey != nil)
+                    APIStatusRow(icon: "waveform", name: "Deepgram", description: "Real-time transcription", isConfigured: supabaseService.isAuthenticated)
+                    APIStatusRow(icon: "brain", name: "OpenAI", description: "Note enhancement & tagging", isConfigured: supabaseService.isAuthenticated)
+                    APIStatusRow(icon: "sparkles", name: "Anthropic", description: "AI email drafts", isConfigured: supabaseService.isAuthenticated)
                 }
             }
         }

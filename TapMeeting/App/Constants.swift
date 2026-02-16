@@ -38,20 +38,17 @@ enum Constants {
     // MARK: - AI
     
     enum AI {
+        // Model identifiers (sent in request bodies via the proxy)
         static let enhancementModel = "gpt-5.2"
         static let autoTaggingModel = "gpt-4.1-mini"
         static let semanticChatModel = "gpt-4.1"
         static let embeddingModel = "text-embedding-3-large"
-        static let responsesEndpoint = "https://api.openai.com/v1/responses"
-        static let embeddingsEndpoint = "https://api.openai.com/v1/embeddings"
-        static let maxEnhancementTokens = 4096
-        static let maxTaggingTokens = 512
-        
-        // Anthropic (Email AI)
         static let anthropicModel = "claude-opus-4-6"
         static let anthropicSonnetModel = "claude-sonnet-4-5"
-        static let anthropicEndpoint = "https://api.anthropic.com/v1/messages"
-        static let anthropicVersion = "2023-06-01"
+        
+        // Token limits
+        static let maxEnhancementTokens = 4096
+        static let maxTaggingTokens = 512
         static let maxEmailReplyTokens = 1024
         static let maxEmailComposeTokens = 1536
         static let maxEmailFollowUpTokens = 2048
@@ -101,6 +98,8 @@ enum Constants {
         static let anonKey = "sb_publishable_TzLkFY46beB_8tQShPUU5g_d668i6ZR"
         static let functionsBaseURL = "\(url)/functions/v1"
         static let googleTokenBrokerPath = "\(functionsBaseURL)/google-token-broker"
+        static let aiProxyPath = "\(functionsBaseURL)/ai-proxy"
+        static let deepgramTokenPath = "\(functionsBaseURL)/deepgram-token"
         static let redirectScheme = "nest"
         static let redirectURL = "nest://auth/callback"
         /// Google OAuth query params required to obtain/rotate refresh tokens.
@@ -172,9 +171,6 @@ enum Constants {
     
     enum Keychain {
         static let service = "com.tap.meeting"
-        static let deepgramAPIKey = "deepgram_api_key"
-        static let openAIAPIKey = "openai_api_key"
-        static let anthropicAPIKey = "anthropic_api_key"
         static let emailEncryptionKey = "email_encryption_key"
         static let googleAccessToken = "google_access_token"
         static let googleRefreshToken = "google_refresh_token"

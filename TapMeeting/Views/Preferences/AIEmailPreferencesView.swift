@@ -508,8 +508,8 @@ struct AIEmailPreferencesView: View {
             return
         }
         
-        guard let key = KeychainHelper.get(key: Constants.Keychain.anthropicAPIKey), !key.isEmpty else {
-            analysisError = "Anthropic API key not configured. Add it in API Keys above."
+        guard SupabaseService.shared?.isAuthenticated == true else {
+            analysisError = "You must be signed in to use AI features."
             return
         }
         

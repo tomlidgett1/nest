@@ -1,22 +1,17 @@
 import Foundation
 
-/// Enhances raw meeting notes using the OpenAI Responses API (GPT-4.1).
+/// Enhances raw meeting notes using the OpenAI Responses API (GPT-4.1) via server-side proxy.
 /// Merges user notes with transcript context to produce structured markdown.
 final class NoteEnhancementService {
     
-    // MARK: - Networking
+    // MARK: - Long Transcript Handling
     
-    /// Configured session with generous timeouts for AI calls (long transcripts can take a while).
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 120     // 120s per request
-        config.timeoutIntervalForResource = 300    // 5 min total (handles chunked long transcripts)
-        config.waitsForConnectivity = true          // wait for network rather than fail instantly
-        return URLSession(configuration: config)
-    }()
+    /// Maximum transcript character count before switching to chunked processing.
+    /// ~100K chars ≈ ~25K tokens — comfortably fits in one API call with system prompt.
+    private let chunkThreshold = 100_000
     
-    /// Maximum number of automatic retries for transient network errors.
-    private let maxRetries = 2
+    /// Target size per chunk (in characters). ~80K chars ≈ ~20K tokens.
+    private let chunkSize = 80_000
     
     /// System prompt guiding the AI enhancement.
     private let systemPrompt = """
@@ -136,88 +131,6 @@ final class NoteEnhancementService {
     - Budget Approval Discussion
     """
     
-    // MARK: - Title Generation
-    
-    /// Generate a short, descriptive meeting title from the transcript.
-    func generateTitle(transcript: String) async throws -> String {
-        let apiKey = KeychainHelper.get(key: Constants.Keychain.openAIAPIKey) ?? ""
-        guard !apiKey.isEmpty else {
-            throw EnhancementError.missingAPIKey
-        }
-        
-        // Send a trimmed transcript (first ~2000 chars is enough for a title)
-        let trimmedTranscript = String(transcript.prefix(2000))
-        
-        let requestBody = ResponsesAPIRequest(
-            model: Constants.AI.enhancementModel,
-            instructions: titlePrompt,
-            input: trimmedTranscript,
-            store: false
-        )
-        
-        let request = try buildRequest(apiKey: apiKey, body: requestBody)
-        let (data, _) = try await performRequest(request)
-        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
-        
-        guard let text = apiResponse.outputText?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else {
-            throw EnhancementError.emptyResponse
-        }
-        
-        return text
-    }
-    
-    // MARK: - Standalone Enhancement
-    
-    /// System prompt for structuring standalone notes (no transcript context).
-    private let standalonePrompt = """
-    You are a notes assistant that structures and improves raw notes. The user has typed \
-    free-form notes without a meeting transcript. Your job is to:
-    
-    - Organise the content into logical sections with ## headings
-    - Use - for all bullet points (hyphen followed by a space)
-    - Clean up grammar and clarity while preserving the user's intent
-    - Extract any action items into a final ## Action Items section
-    - Use Australian English spelling
-    - Be concise and telegraphic — note fragments, not prose
-    - Do not add content that wasn't in the original notes
-    - Do not use bold (**) or italic formatting within bullets
-    """
-    
-    /// Enhance standalone notes (no transcript context).
-    func enhanceStandalone(rawNotes: String) async throws -> String {
-        let apiKey = KeychainHelper.get(key: Constants.Keychain.openAIAPIKey) ?? ""
-        guard !apiKey.isEmpty else {
-            throw EnhancementError.missingAPIKey
-        }
-        
-        let requestBody = ResponsesAPIRequest(
-            model: Constants.AI.enhancementModel,
-            instructions: standalonePrompt,
-            input: rawNotes,
-            store: false
-        )
-        
-        let request = try buildRequest(apiKey: apiKey, body: requestBody)
-        let (data, _) = try await performRequest(request)
-        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
-        
-        guard let text = apiResponse.outputText else {
-            throw EnhancementError.emptyResponse
-        }
-        
-        return text
-    }
-    
-    // MARK: - Long Transcript Handling
-    
-    /// Maximum transcript character count before switching to chunked processing.
-    /// ~100K chars ≈ ~25K tokens — comfortably fits in one API call with system prompt.
-    private let chunkThreshold = 100_000
-    
-    /// Target size per chunk (in characters). ~80K chars ≈ ~20K tokens.
-    private let chunkSize = 80_000
-    
     /// System prompt for summarising a single chunk of a long transcript.
     private let chunkSummaryPrompt = """
     You are a meeting notes assistant. You are processing one segment of a very long \
@@ -235,6 +148,168 @@ final class NoteEnhancementService {
     - Do not add commentary or interpretation
     - Output ONLY the bullet points — no headings, no intro, no conclusion
     """
+    
+    /// System prompt for structuring standalone notes (no transcript context).
+    private let standalonePrompt = """
+    You are a notes assistant that structures and improves raw notes. The user has typed \
+    free-form notes without a meeting transcript. Your job is to:
+    
+    - Organise the content into logical sections with ## headings
+    - Use - for all bullet points (hyphen followed by a space)
+    - Clean up grammar and clarity while preserving the user's intent
+    - Extract any action items into a final ## Action Items section
+    - Use Australian English spelling
+    - Be concise and telegraphic — note fragments, not prose
+    - Do not add content that wasn't in the original notes
+    - Do not use bold (**) or italic formatting within bullets
+    """
+    
+    // MARK: - Title Generation
+    
+    /// Generate a short, descriptive meeting title from the transcript.
+    func generateTitle(transcript: String) async throws -> String {
+        let trimmedTranscript = String(transcript.prefix(2000))
+        
+        let body: [String: Any] = [
+            "model": Constants.AI.enhancementModel,
+            "instructions": titlePrompt,
+            "input": trimmedTranscript,
+            "store": false
+        ]
+        
+        let data = try await AIProxyClient.shared.request(
+            provider: .openai,
+            endpoint: "/v1/responses",
+            body: body
+        )
+        
+        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
+        
+        guard let text = apiResponse.outputText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            throw AIProxyError.emptyResponse
+        }
+        
+        return text
+    }
+    
+    // MARK: - Standalone Enhancement
+    
+    /// Enhance standalone notes (no transcript context).
+    func enhanceStandalone(rawNotes: String) async throws -> String {
+        let body: [String: Any] = [
+            "model": Constants.AI.enhancementModel,
+            "instructions": standalonePrompt,
+            "input": rawNotes,
+            "store": false
+        ]
+        
+        let data = try await AIProxyClient.shared.request(
+            provider: .openai,
+            endpoint: "/v1/responses",
+            body: body
+        )
+        
+        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
+        
+        guard let text = apiResponse.outputText else {
+            throw AIProxyError.emptyResponse
+        }
+        
+        return text
+    }
+    
+    // MARK: - Enhancement
+    
+    /// Enhance raw notes using transcript context via the AI proxy.
+    /// For long transcripts (3+ hour meetings), automatically chunks the transcript,
+    /// summarises each chunk, then produces final structured notes from the combined summaries.
+    func enhance(rawNotes: String, transcript: String) async throws -> String {
+        if transcript.count <= chunkThreshold {
+            return try await enhanceDirect(rawNotes: rawNotes, transcript: transcript)
+        }
+        
+        print("[NoteEnhancement] Long transcript detected (\(transcript.count) chars). Using chunked processing.")
+        
+        let chunks = splitTranscript(transcript, maxChunkSize: chunkSize)
+        print("[NoteEnhancement] Split into \(chunks.count) chunks")
+        
+        var chunkSummaries: [String] = []
+        for (index, chunk) in chunks.enumerated() {
+            let summary = try await summariseChunk(chunk, chunkIndex: index, totalChunks: chunks.count)
+            chunkSummaries.append(summary)
+        }
+        
+        let combinedSummary = chunkSummaries.enumerated().map { index, summary in
+            "--- Part \(index + 1) of \(chunks.count) ---\n\(summary)"
+        }.joined(separator: "\n\n")
+        
+        print("[NoteEnhancement] Combined summaries: \(combinedSummary.count) chars. Running final enhancement pass.")
+        
+        let userMessage = """
+        ## My Notes
+        \(rawNotes)
+        
+        ## Meeting Content (pre-summarised from a \(chunks.count)-part transcript)
+        \(combinedSummary)
+        """
+        
+        let body: [String: Any] = [
+            "model": Constants.AI.enhancementModel,
+            "instructions": systemPrompt,
+            "input": userMessage,
+            "store": false
+        ]
+        
+        let data = try await AIProxyClient.shared.request(
+            provider: .openai,
+            endpoint: "/v1/responses",
+            body: body
+        )
+        
+        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
+        
+        guard let text = apiResponse.outputText else {
+            throw AIProxyError.emptyResponse
+        }
+        
+        print("[NoteEnhancement] Final enhancement complete for long transcript.")
+        return text
+    }
+    
+    /// Direct single-call enhancement for normal-length transcripts.
+    private func enhanceDirect(rawNotes: String, transcript: String) async throws -> String {
+        let userMessage = """
+        ## My Notes
+        \(rawNotes)
+        
+        ## Meeting Transcript
+        \(transcript)
+        """
+        
+        let body: [String: Any] = [
+            "model": Constants.AI.enhancementModel,
+            "instructions": systemPrompt,
+            "input": userMessage,
+            "store": false
+        ]
+        
+        let data = try await AIProxyClient.shared.request(
+            provider: .openai,
+            endpoint: "/v1/responses",
+            body: body
+        )
+        
+        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
+        
+        guard let text = apiResponse.outputText else {
+            throw AIProxyError.emptyResponse
+        }
+        
+        return text
+    }
+    
+    // MARK: - Chunking
     
     /// Split a transcript into chunks, splitting at line boundaries to avoid cutting mid-utterance.
     private func splitTranscript(_ transcript: String, maxChunkSize: Int) -> [String] {
@@ -261,193 +336,42 @@ final class NoteEnhancementService {
     }
     
     /// Summarise a single chunk of transcript, extracting all key information.
-    private func summariseChunk(_ chunk: String, chunkIndex: Int, totalChunks: Int, apiKey: String) async throws -> String {
+    private func summariseChunk(_ chunk: String, chunkIndex: Int, totalChunks: Int) async throws -> String {
         let input = """
         [Segment \(chunkIndex + 1) of \(totalChunks)]
         
         \(chunk)
         """
         
-        let requestBody = ResponsesAPIRequest(
-            model: Constants.AI.enhancementModel,
-            instructions: chunkSummaryPrompt,
-            input: input,
-            store: false
+        let body: [String: Any] = [
+            "model": Constants.AI.enhancementModel,
+            "instructions": chunkSummaryPrompt,
+            "input": input,
+            "store": false
+        ]
+        
+        let data = try await AIProxyClient.shared.request(
+            provider: .openai,
+            endpoint: "/v1/responses",
+            body: body
         )
         
-        let request = try buildRequest(apiKey: apiKey, body: requestBody)
-        let (data, _) = try await performRequest(request)
         let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
         
         guard let text = apiResponse.outputText?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else {
-            throw EnhancementError.emptyResponse
+            throw AIProxyError.emptyResponse
         }
         
         print("[NoteEnhancement] Chunk \(chunkIndex + 1)/\(totalChunks) summarised (\(chunk.count) chars → \(text.count) chars)")
         return text
     }
-    
-    // MARK: - Enhancement
-    
-    /// Enhance raw notes using transcript context via the OpenAI Responses API.
-    /// For long transcripts (3+ hour meetings), automatically chunks the transcript,
-    /// summarises each chunk, then produces final structured notes from the combined summaries.
-    func enhance(rawNotes: String, transcript: String) async throws -> String {
-        let apiKey = KeychainHelper.get(key: Constants.Keychain.openAIAPIKey) ?? ""
-        guard !apiKey.isEmpty else {
-            throw EnhancementError.missingAPIKey
-        }
-        
-        // Short transcript — process in a single call (existing behaviour)
-        if transcript.count <= chunkThreshold {
-            return try await enhanceDirect(rawNotes: rawNotes, transcript: transcript, apiKey: apiKey)
-        }
-        
-        // Long transcript — chunk, summarise each, then combine
-        print("[NoteEnhancement] Long transcript detected (\(transcript.count) chars). Using chunked processing.")
-        
-        let chunks = splitTranscript(transcript, maxChunkSize: chunkSize)
-        print("[NoteEnhancement] Split into \(chunks.count) chunks")
-        
-        // Summarise each chunk (sequentially to avoid rate limits)
-        var chunkSummaries: [String] = []
-        for (index, chunk) in chunks.enumerated() {
-            let summary = try await summariseChunk(chunk, chunkIndex: index, totalChunks: chunks.count, apiKey: apiKey)
-            chunkSummaries.append(summary)
-        }
-        
-        // Combine all chunk summaries and do the final enhancement pass
-        let combinedSummary = chunkSummaries.enumerated().map { index, summary in
-            "--- Part \(index + 1) of \(chunks.count) ---\n\(summary)"
-        }.joined(separator: "\n\n")
-        
-        print("[NoteEnhancement] Combined summaries: \(combinedSummary.count) chars. Running final enhancement pass.")
-        
-        let userMessage = """
-        ## My Notes
-        \(rawNotes)
-        
-        ## Meeting Content (pre-summarised from a \(chunks.count)-part transcript)
-        \(combinedSummary)
-        """
-        
-        let requestBody = ResponsesAPIRequest(
-            model: Constants.AI.enhancementModel,
-            instructions: systemPrompt,
-            input: userMessage,
-            store: false
-        )
-        
-        let request = try buildRequest(apiKey: apiKey, body: requestBody)
-        let (data, _) = try await performRequest(request)
-        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
-        
-        guard let text = apiResponse.outputText else {
-            throw EnhancementError.emptyResponse
-        }
-        
-        print("[NoteEnhancement] Final enhancement complete for long transcript.")
-        return text
-    }
-    
-    /// Direct single-call enhancement for normal-length transcripts.
-    private func enhanceDirect(rawNotes: String, transcript: String, apiKey: String) async throws -> String {
-        let userMessage = """
-        ## My Notes
-        \(rawNotes)
-        
-        ## Meeting Transcript
-        \(transcript)
-        """
-        
-        let requestBody = ResponsesAPIRequest(
-            model: Constants.AI.enhancementModel,
-            instructions: systemPrompt,
-            input: userMessage,
-            store: false
-        )
-        
-        let request = try buildRequest(apiKey: apiKey, body: requestBody)
-        let (data, _) = try await performRequest(request)
-        let apiResponse = try JSONDecoder().decode(ResponsesAPIResponse.self, from: data)
-        
-        guard let text = apiResponse.outputText else {
-            throw EnhancementError.emptyResponse
-        }
-        
-        return text
-    }
-    
-    // MARK: - Private Helpers
-    
-    /// Build a URLRequest for the OpenAI Responses API.
-    private func buildRequest(apiKey: String, body: ResponsesAPIRequest) throws -> URLRequest {
-        let url = URL(string: Constants.AI.responsesEndpoint)!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(body)
-        return request
-    }
-    
-    /// Execute a request with automatic retry for transient network failures.
-    private func performRequest(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        var lastError: Error?
-        
-        for attempt in 0...maxRetries {
-            do {
-                let (data, response) = try await session.data(for: request)
-                
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    throw EnhancementError.apiError("Invalid response from server")
-                }
-                
-                // Don't retry client errors (4xx) — only server/network errors
-                if (400...499).contains(httpResponse.statusCode) {
-                    let body = String(data: data, encoding: .utf8) ?? ""
-                    throw EnhancementError.apiError("Request rejected (\(httpResponse.statusCode)): \(body)")
-                }
-                
-                guard (200...299).contains(httpResponse.statusCode) else {
-                    throw EnhancementError.apiError("Server error (\(httpResponse.statusCode))")
-                }
-                
-                return (data, httpResponse)
-                
-            } catch let error as EnhancementError {
-                // Don't retry known non-transient errors
-                throw error
-            } catch {
-                lastError = error
-                
-                // Only retry if we haven't exhausted attempts
-                if attempt < maxRetries {
-                    // Exponential back-off: 1s, 2s
-                    let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000
-                    try await Task.sleep(nanoseconds: delay)
-                }
-            }
-        }
-        
-        // All retries exhausted — throw a descriptive network error
-        throw EnhancementError.networkError(lastError)
-    }
 }
 
-// MARK: - API Types
-
-/// Request body for the OpenAI Responses API.
-private struct ResponsesAPIRequest: Encodable {
-    let model: String
-    let instructions: String
-    let input: String
-    let store: Bool
-}
+// MARK: - API Response Types
 
 /// Simplified response from the OpenAI Responses API.
-private struct ResponsesAPIResponse: Decodable {
+struct ResponsesAPIResponse: Decodable {
     let id: String
     let output: [OutputItem]
     
@@ -467,28 +391,5 @@ private struct ResponsesAPIResponse: Decodable {
     struct ContentItem: Decodable {
         let type: String
         let text: String?
-    }
-}
-
-// MARK: - Errors
-
-enum EnhancementError: LocalizedError {
-    case missingAPIKey
-    case apiError(String)
-    case emptyResponse
-    case networkError(Error?)
-    
-    var errorDescription: String? {
-        switch self {
-        case .missingAPIKey:
-            return "OpenAI API key not configured. Add it in Preferences."
-        case .apiError(let message):
-            return "AI enhancement failed: \(message)"
-        case .emptyResponse:
-            return "AI returned an empty response."
-        case .networkError(let underlying):
-            let detail = underlying?.localizedDescription ?? "Unknown error"
-            return "Network connection failed. Please check your internet connection and try again. (\(detail))"
-        }
     }
 }

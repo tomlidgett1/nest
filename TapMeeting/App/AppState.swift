@@ -871,13 +871,10 @@ final class AppState {
     /// Create a single multichannel Deepgram service and wire result callbacks.
     /// Must happen BEFORE audio starts flowing so the optional chain doesn't drop data.
     private func setupTranscriptionServices() {
-        guard let apiKey = supabaseService?.deepgramAPIKey ?? KeychainHelper.get(key: "deepgram_api_key"),
-              !apiKey.isEmpty else {
-            print("[AppState] ⚠ No Deepgram API key — transcription disabled.")
-            return
-        }
-
-        print("[AppState] Creating Deepgram multichannel service (key: \(apiKey.prefix(8))…)")
+        // Deepgram token is now fetched server-side when the WebSocket connects.
+        // No local API key check needed.
+        
+        print("[AppState] Creating Deepgram multichannel service")
         
         let service = DeepgramService(source: .mic, multichannel: true)
         service.onUtterance = { [weak self] result in
