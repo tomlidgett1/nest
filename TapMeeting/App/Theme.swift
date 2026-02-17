@@ -100,7 +100,7 @@ enum Theme {
         static let mainContentTopPadding: CGFloat = 7
         /// Expected height of the unified title bar + toolbar on macOS.
         /// Used to compensate when SwiftUI reports stale safe area insets on first layout.
-        static let unifiedToolbarHeight: CGFloat = 40
+        static let unifiedToolbarHeight: CGFloat = 52
         static let sidebarItemHeight: CGFloat = 30
         static let sidebarPadding: CGFloat = 12
         /// Tighter padding for selectable sidebar items (icon + text) so content aligns with overlay.

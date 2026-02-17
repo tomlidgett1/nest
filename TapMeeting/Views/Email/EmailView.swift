@@ -22,6 +22,7 @@ struct EmailView: View {
     @State private var isDraggingDivider = false
     @State private var searchText: String = ""
     @State private var isInReplyMode = false
+    @State private var showMailboxPopover = false
     @FocusState private var isSearchFocused: Bool
     
     private let minListWidth: CGFloat = 340
@@ -202,7 +203,9 @@ struct EmailView: View {
                         .stroke(Theme.divider.opacity(0.3), lineWidth: 0.5)
                 )
             }
-            .padding(10)
+            .padding(.horizontal, 10)
+            .padding(.top, 2)
+            .padding(.bottom, 10)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
@@ -213,6 +216,32 @@ struct EmailView: View {
     
     private var listPanelHeader: some View {
         HStack(spacing: 6) {
+            // Mailbox dropdown
+            Button {
+                showMailboxPopover.toggle()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: gmail.currentMailbox.icon)
+                        .font(.system(size: 12, weight: .medium))
+                    Text(gmail.currentMailbox.displayName)
+                        .font(.system(size: 12, weight: .medium))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundColor(Theme.textTertiary)
+                }
+                .foregroundColor(Theme.textPrimary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Theme.sidebarBackground)
+                .cornerRadius(6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showMailboxPopover, arrowEdge: .bottom) {
+                mailboxPopover
+            }
+            
+            // Search bar
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11, weight: .medium))
@@ -262,7 +291,56 @@ struct EmailView: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.top, 6)
+        .padding(.bottom, 8)
+    }
+    
+    private var mailboxPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(Mailbox.allCases.enumerated()), id: \.element.id) { index, mailbox in
+                if index > 0 {
+                    Divider()
+                        .padding(.horizontal, 14)
+                }
+                
+                Button {
+                    gmail.currentMailbox = mailbox
+                    gmail.selectedThread = nil
+                    gmail.selectedMessageId = nil
+                    gmail.clearSearch()
+                    searchText = ""
+                    NotificationCenter.default.post(name: .emailMailboxChanged, object: nil)
+                    Task { await gmail.fetchMailbox(mailbox) }
+                    showMailboxPopover = false
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: mailbox.icon)
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary)
+                            .frame(width: 18)
+                        
+                        Text(mailbox.displayName)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(Theme.textPrimary)
+                        
+                        Spacer()
+                        
+                        if gmail.currentMailbox == mailbox {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(Theme.olive)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 6)
+        .frame(width: 200)
+        .background(Color.white)
     }
     
     // MARK: - Detail Panel Header (Actions bar)
@@ -292,7 +370,9 @@ struct EmailView: View {
         HStack(spacing: 6) {
             panelActionButton(icon: "trash", label: "Delete") {
                 if let thread = gmail.selectedThread {
-                    Task { await gmail.trashThread(threadId: thread.id) }
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        Task { await gmail.trashThread(threadId: thread.id) }
+                    }
                 }
             }
             .help("Move to Bin")
@@ -300,59 +380,51 @@ struct EmailView: View {
             
             panelActionButton(icon: "archivebox", label: "Archive") {
                 if let thread = gmail.selectedThread {
-                    Task { await gmail.archiveThread(threadId: thread.id) }
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        Task { await gmail.archiveThread(threadId: thread.id) }
+                    }
                 }
             }
             .help("Archive")
             .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
             
-            // Subtle separator between standard and AI actions
             Rectangle()
                 .fill(Theme.divider.opacity(0.4))
                 .frame(width: 1, height: 18)
                 .padding(.horizontal, 2)
             
-            // AI Summarise
-            Button {
+            panelActionButton(icon: "text.alignleft", label: "Summarise") {
                 postDetailToolbarAction(.summarise)
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "text.alignleft")
-                        .font(.system(size: 10, weight: .medium))
-                    Text("Summarise")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .foregroundColor(Theme.olive)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Theme.olive.opacity(0.08))
-                .cornerRadius(6)
             }
-            .buttonStyle(.plain)
             .help("AI Summarise")
             .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
             
-            // AI Draft Reply
-            Button {
+            panelActionButton(icon: "sparkles", label: "AI Draft") {
                 postDetailToolbarAction(.aiDraft)
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 10, weight: .medium))
-                    Text("AI Draft")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .foregroundColor(Theme.olive)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Theme.olive.opacity(0.08))
-                .cornerRadius(6)
             }
-            .buttonStyle(.plain)
             .help("AI Draft Reply")
             .opacity(gmail.selectedThread != nil ? 1.0 : 0.4)
             
             Spacer()
+            
+            if !isInReplyMode {
+                Button {
+                    NotificationCenter.default.post(name: .emailComposeToggle, object: nil)
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "square.and.pencil")
+                            .font(.system(size: 12, weight: .medium))
+                        Text("Compose")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Theme.olive)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
             
             if isInReplyMode {
                 // Reply-mode compose actions

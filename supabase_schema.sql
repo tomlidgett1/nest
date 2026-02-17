@@ -55,6 +55,8 @@ CREATE TABLE notes (
     note_type TEXT NOT NULL DEFAULT 'meeting',
     is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
     linked_note_ids UUID[] DEFAULT '{}',
+    is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+    archived_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -255,6 +257,7 @@ CREATE INDEX idx_notes_folder_id ON notes(folder_id);
 CREATE INDEX idx_notes_created_at ON notes(user_id, created_at DESC);
 CREATE INDEX idx_notes_status ON notes(user_id, status);
 CREATE INDEX idx_notes_note_type ON notes(user_id, note_type);
+CREATE INDEX idx_notes_archived ON notes(user_id, is_archived);
 CREATE INDEX idx_utterances_note_id ON utterances(note_id);
 CREATE INDEX idx_utterances_user_id ON utterances(user_id);
 CREATE INDEX idx_search_documents_user_type ON search_documents(user_id, source_type);

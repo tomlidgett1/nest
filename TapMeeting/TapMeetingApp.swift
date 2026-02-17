@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import Sparkle
 
 /// Nest — a macOS app for meeting notes.
 /// Runs as a regular dock app with a menu bar extra for quick access.
@@ -10,6 +11,7 @@ struct TapMeetingApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     private let modelContainer = DataController.shared
+    @StateObject private var updaterService = UpdaterService()
 
     @State private var appState: AppState
     @State private var supabaseService = SupabaseService()
@@ -43,6 +45,7 @@ struct TapMeetingApp: App {
             AuthGateView {
                 NotesListView()
             }
+            .environmentObject(updaterService)
             .environment(appState)
             .environment(supabaseService)
             .modelContainer(modelContainer)
@@ -57,7 +60,7 @@ struct TapMeetingApp: App {
         }
         .keyboardShortcut("1", modifiers: .command)
         .defaultSize(width: 800, height: 600)
-        .windowToolbarStyle(.unifiedCompact)
+        .windowToolbarStyle(.unified)
 
         // MARK: - Preferences Window
 
@@ -65,6 +68,7 @@ struct TapMeetingApp: App {
             AuthGateView {
                 PreferencesView()
             }
+            .environmentObject(updaterService)
             .environment(appState)
             .environment(supabaseService)
             .modelContainer(modelContainer)
@@ -82,6 +86,11 @@ struct TapMeetingApp: App {
         }
         .windowResizability(.contentSize)
         .defaultPosition(.center)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesView(updaterService: updaterService)
+            }
+        }
     }
 
     /// Called once after successful authentication to wire up sync and migrate data.

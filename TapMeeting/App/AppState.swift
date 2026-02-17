@@ -360,7 +360,7 @@ final class AppState {
                     await self?.enhanceNotes(for: note)
                 } else {
                     await MainActor.run {
-                        repo.deleteNote(note)
+                        repo.permanentlyDeleteNote(note)
                         self?.enhancingNoteId = nil
                     }
                     print("[AppState] ■ Discarded note — insufficient transcript (\(wordCount) words)")
@@ -850,9 +850,12 @@ final class AppState {
         await gmailService.fetchMailbox(.inbox)
         await gmailService.fetchMailbox(.sent)
         calendarService.fetchUpcomingEvents()
-        let notes = noteRepository.fetchAllNotes()
-        let threads = gmailService.allThreads()
-        let events = calendarService.upcomingEvents
+        let (notes, threads, events) = await MainActor.run {
+            let n = noteRepository.fetchAllNotes()
+            let t = gmailService.allThreads()
+            let e = calendarService.upcomingEvents
+            return (n, t, e)
+        }
         await ingestion.runMandatoryBackfill(notes: notes, threads: threads, calendarEvents: events)
     }
 

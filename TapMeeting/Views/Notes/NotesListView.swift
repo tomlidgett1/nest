@@ -18,6 +18,8 @@ struct NotesListView: View {
     @State private var calendarCurrentDate: Date = .now
     @State private var showCalendarSelector = false
     
+    @State private var showNewPopover = false
+    
     /// Forces a layout recalculation after window is ready. SwiftUI's unified toolbar
     /// reports stale safe-area insets on first layout; a hierarchy change fixes it.
     @State private var hasTriggeredLayoutFix = false
@@ -63,6 +65,7 @@ struct NotesListView: View {
                 // Main content — only this gets toolbar safe-area compensation
                 mainContent
                     .modifier(ToolbarSafeAreaCompensation())
+                    .animation(nil, value: sidebarTab)
             }
             .animation(.easeInOut(duration: 0.25), value: isSidebarCollapsed)
 
@@ -73,9 +76,9 @@ struct NotesListView: View {
                         .padding(.horizontal, Theme.Spacing.contentPadding)
                         .padding(.bottom, 16)
                 }
-                .transition(.opacity)
             }
         }
+        .animation(nil, value: sidebarTab)
         .frame(minWidth: 780, minHeight: 540)
         .background(Theme.background)
         .toolbar {
@@ -88,23 +91,23 @@ struct NotesListView: View {
                     } label: {
                         Image(systemName: "sidebar.left")
                             .font(.system(size: 13))
-                            .foregroundColor(Theme.textSecondary)
+                            .foregroundColor(Theme.textPrimary)
                     }
                     .buttonStyle(.plain)
                     .help("Toggle Sidebar")
                     
                     Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            sidebarTab = .home
-                        }
+                        sidebarTab = .home
                     } label: {
                         Image(systemName: "house")
                             .font(.system(size: 13))
-                            .foregroundColor(Theme.textSecondary)
+                            .foregroundColor(Theme.textPrimary)
                     }
                     .buttonStyle(.plain)
                     .help("Go to Home")
                     .padding(.leading, isSidebarCollapsed ? 0 : 104)
+                    
+                    newButtonView
                     
                     // Email: account filter — shown on Email tab with multiple accounts
                     if sidebarTab == .email, appState.gmailService.isConnected,
@@ -118,6 +121,7 @@ struct NotesListView: View {
                             Button { calendarNavigatePrevious() } label: {
                                 Image(systemName: "chevron.left")
                                     .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
                                     .frame(width: 28, height: 28)
                             }
                             .buttonStyle(.plain)
@@ -129,7 +133,7 @@ struct NotesListView: View {
                                     .foregroundColor(Theme.textPrimary)
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 5)
-                                    .background(Theme.sidebarBackground)
+                                    .background(Theme.divider.opacity(0.5))
                                     .cornerRadius(6)
                             }
                             .buttonStyle(.plain)
@@ -138,6 +142,7 @@ struct NotesListView: View {
                             Button { calendarNavigateNext() } label: {
                                 Image(systemName: "chevron.right")
                                     .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(Theme.textPrimary)
                                     .frame(width: 28, height: 28)
                             }
                             .buttonStyle(.plain)
@@ -153,13 +158,7 @@ struct NotesListView: View {
                 }
             }
             ToolbarItem(placement: .principal) {
-                Group {
-                    if sidebarTab == .email, appState.gmailService.isConnected {
-                        emailToolbarTabs
-                    } else {
-                        EmptyView()
-                    }
-                }
+                EmptyView()
             }
             ToolbarItem(placement: .primaryAction) {
                 HStack(spacing: 12) {
@@ -167,14 +166,14 @@ struct NotesListView: View {
                         MeetingControlButtons()
                     }
                     
-                    // Email: refresh + compose — shown on Email tab
+                    // Email: refresh — shown on Email tab
                     if sidebarTab == .email, appState.gmailService.isConnected {
                         Button {
                             Task { await appState.gmailService.fetchMailbox(appState.gmailService.currentMailbox) }
                         } label: {
                             Image(systemName: "arrow.clockwise")
                                 .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(Theme.textSecondary)
+                                .foregroundColor(Theme.textPrimary)
                                 .frame(width: 28, height: 28)
                                 .rotationEffect(.degrees(appState.gmailService.isFetching ? 360 : 0))
                                 .animation(appState.gmailService.isFetching ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: appState.gmailService.isFetching)
@@ -182,24 +181,6 @@ struct NotesListView: View {
                         .buttonStyle(.plain)
                         .disabled(appState.gmailService.isFetching)
                         .help("Refresh")
-                        
-                        Button {
-                            NotificationCenter.default.post(name: .emailComposeToggle, object: nil)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: "square.and.pencil")
-                                    .font(.system(size: 11, weight: .medium))
-                                Text("Compose")
-                                    .font(.system(size: 12, weight: .medium))
-                            }
-                            .foregroundColor(Theme.textPrimary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Theme.cardBackground)
-                            .cornerRadius(6)
-                            .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
-                        }
-                        .buttonStyle(.plain)
                     }
                     
                     // Calendar view mode + selector — shown on Calendar tab
@@ -216,14 +197,15 @@ struct NotesListView: View {
                                         .foregroundColor(calendarViewMode == mode ? Theme.textPrimary : Theme.textSecondary)
                                         .padding(.horizontal, 10)
                                         .padding(.vertical, 5)
-                                        .background(calendarViewMode == mode ? Theme.sidebarBackground : Color.clear)
+                                        .background(calendarViewMode == mode ? Color.white : Color.clear)
                                         .cornerRadius(6)
+                                        .shadow(color: calendarViewMode == mode ? .black.opacity(0.05) : .clear, radius: 1, y: 1)
                                 }
                                 .buttonStyle(.plain)
                             }
                         }
                         .padding(2)
-                        .background(Color(red: 0.96, green: 0.95, blue: 0.93))
+                        .background(Theme.divider.opacity(0.5))
                         .cornerRadius(6)
 
                         Button {
@@ -235,10 +217,10 @@ struct NotesListView: View {
                                 Text("Calendars")
                                     .font(.system(size: 12, weight: .medium))
                             }
-                            .foregroundColor(Theme.textSecondary)
+                            .foregroundColor(Theme.textPrimary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
-                            .background(Theme.sidebarBackground)
+                            .background(Theme.divider.opacity(0.5))
                             .cornerRadius(6)
                         }
                         .buttonStyle(.plain)
@@ -248,9 +230,14 @@ struct NotesListView: View {
                         }
                     }
                     
-                    HStack(spacing: 4) {
+                    // Next calendar event indicator
+                    NextEventToolbarBadge(
+                        events: appState.calendarService.upcomingEvents.filter { !$0.isAllDay }
+                    )
+                    
+                    HStack(spacing: 5) {
                         Image(systemName: "bird.fill")
-                            .font(.system(size: 11))
+                            .font(.system(size: 12))
                             .symbolRenderingMode(.hierarchical)
                         Text("Nest")
                             .font(.system(size: 12, weight: .medium))
@@ -319,62 +306,238 @@ struct NotesListView: View {
         sidebarTab = .note(note.id)
     }
     
+    // MARK: - New Button (Toolbar)
+    
+    private var newButtonView: some View {
+        Button {
+            showNewPopover.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .medium))
+                Text("New")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundColor(Theme.textPrimary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.white)
+            .cornerRadius(6)
+            .shadow(color: .black.opacity(0.05), radius: 1, y: 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Create new…")
+        .popover(isPresented: $showNewPopover, arrowEdge: .bottom) {
+            newItemPopover
+        }
+    }
+    
+    private var newItemPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                showNewPopover = false
+                startNewMeeting()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "video")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 18)
+                    
+                    Text("New Meeting")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                    
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            
+            Divider()
+                .padding(.horizontal, 14)
+            
+            Button {
+                showNewPopover = false
+                sidebarTab = .email
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    NotificationCenter.default.post(name: .emailComposeToggle, object: nil)
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "envelope")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 18)
+                    
+                    Text("New Email")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                    
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            
+            Divider()
+                .padding(.horizontal, 14)
+            
+            Button {
+                showNewPopover = false
+                startNewStandaloneNote()
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "note.text")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 18)
+                    
+                    Text("New Note")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                    
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 6)
+        .frame(width: 200)
+        .background(Color.white)
+    }
+    
     // MARK: - Email Account Filter (Toolbar)
     
+    @State private var showAccountPopover = false
+    
+    private var selectedAccountEmail: String {
+        let gmail = appState.gmailService
+        if let filterId = gmail.filterAccountId,
+           let account = gmail.accounts.first(where: { $0.id == filterId }) {
+            return account.email
+        }
+        return gmail.accounts.first?.email ?? "gmail.com"
+    }
+    
     private var emailAccountFilterMenu: some View {
+        Button {
+            showAccountPopover.toggle()
+        } label: {
+            HStack(spacing: 5) {
+                EmailAccountLogoView(email: selectedAccountEmail, size: 15)
+                
+                Text(appState.gmailService.filterAccountId == nil ? "All Accounts" : selectedAccountEmail)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundColor(Theme.textTertiary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.white)
+            .cornerRadius(6)
+            .shadow(color: .black.opacity(0.05), radius: 1, y: 1)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showAccountPopover, arrowEdge: .bottom) {
+            emailAccountPopover
+        }
+    }
+    
+    private var emailAccountPopover: some View {
         let gmail = appState.gmailService
         
-        return Menu {
+        return VStack(alignment: .leading, spacing: 0) {
+            Text("Accounts")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(Theme.textTertiary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+            
+            // All Accounts option
             Button {
                 gmail.filterAccountId = nil
                 gmail.selectedThread = nil
                 gmail.selectedMessageId = nil
+                showAccountPopover = false
             } label: {
-                HStack {
+                HStack(spacing: 10) {
+                    Image("gmail")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16)
+                    
                     Text("All Accounts")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                    
+                    Spacer()
+                    
                     if gmail.filterAccountId == nil {
-                        Spacer()
                         Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(Theme.olive)
                     }
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             
             Divider()
+                .padding(.horizontal, 14)
             
             ForEach(gmail.accounts, id: \.id) { account in
                 Button {
                     gmail.filterAccountId = account.id
                     gmail.selectedThread = nil
                     gmail.selectedMessageId = nil
+                    showAccountPopover = false
                 } label: {
-                    HStack {
-                        Text(account.email)
+                    HStack(spacing: 10) {
+                        EmailAccountLogoView(email: account.email, size: 16)
+                        
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(account.email)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(Theme.textPrimary)
+                                .lineLimit(1)
+                        }
+                        
+                        Spacer()
+                        
                         if gmail.filterAccountId == account.id {
-                            Spacer()
                             Image(systemName: "checkmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(Theme.olive)
                         }
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
                 }
-            }
-        } label: {
-            HStack(spacing: 3) {
-                EmailAccountLogoView(
-                    email: {
-                        if let filterId = gmail.filterAccountId,
-                           let account = gmail.accounts.first(where: { $0.id == filterId }) {
-                            return account.email
-                        }
-                        return gmail.accounts.first?.email ?? "gmail.com"
-                    }(),
-                    size: 16
-                )
-                
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .medium))
-                    .foregroundColor(Theme.textTertiary)
+                .buttonStyle(.plain)
             }
         }
-        .buttonStyle(.plain)
+        .padding(.bottom, 6)
+        .frame(width: 280)
+        .background(Color.white)
     }
     
     // MARK: - Email Toolbar Tabs (Mailbox switcher)
@@ -638,8 +801,8 @@ private struct NoteSidebar: View {
                 icon: "checklist",
                 label: "To-Dos",
                 isSelected: isTodosSelected,
-                badge: appState.todoRepository.pendingCount(),
-                newBadge: appState.todoRepository.unseenCount()
+                badge: appState.todoRepository.livePendingCount,
+                newBadge: appState.todoRepository.liveUnseenCount
             ) {
                 selectedTab = .todos
             }
@@ -944,7 +1107,7 @@ private struct SidebarTagItem: View {
                 .foregroundColor(isSelected ? Theme.textPrimary : Theme.textSecondary)
                 .frame(width: 18)
             
-            Text("\(tag.name) (\(tag.notes.count))")
+            Text("\(tag.name) (\(tag.notes.filter { !$0.isArchived }.count))")
                 .font(.system(size: 13, weight: isSelected ? .medium : .regular))
                 .foregroundColor(isSelected ? Theme.textPrimary : Theme.textSecondary)
                 .lineLimit(1)
@@ -1152,11 +1315,12 @@ private struct SidebarNoteItem: View {
                 Button {
                     onDelete()
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "archivebox")
                         .font(.system(size: 11))
                         .foregroundColor(Theme.textTertiary)
                 }
                 .buttonStyle(.plain)
+                .help("Archived")
                 .onHover { hovering in
                     if hovering {
                         NSCursor.pointingHand.push()
@@ -1182,7 +1346,7 @@ private struct SidebarNoteItem: View {
                 appState.noteRepository.togglePin(note)
             }
             Divider()
-            Button("Delete", role: .destructive) {
+            Button("Archived", role: .destructive) {
                 onDelete()
             }
         }
@@ -1802,11 +1966,12 @@ private struct NoteRow: View {
                 Button {
                     onDelete()
                 } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "archivebox")
                         .font(.system(size: 12))
                         .foregroundColor(Theme.textTertiary)
                 }
                 .buttonStyle(.plain)
+                .help("Archived")
                 .onHover { hovering in
                     if hovering {
                         NSCursor.pointingHand.push()
@@ -1840,7 +2005,7 @@ private struct NoteRow: View {
                 Divider()
             }
             
-            Button("Delete", role: .destructive) {
+            Button("Archived", role: .destructive) {
                 onDelete()
             }
         }
@@ -2011,13 +2176,15 @@ private struct FolderContentView: View {
 
 // MARK: - Meetings Content View
 
-/// Full-page meetings list — shows all meetings grouped by date.
+/// Full-page meetings list — shows all meetings grouped by date, with archive support.
 private struct MeetingsContentView: View {
 
     @Binding var isSidebarCollapsed: Bool
     let onSelectNote: (UUID) -> Void
     let onNewNote: () -> Void
     @Environment(AppState.self) private var appState
+    @State private var showArchive = false
+    @State private var confirmPermanentDelete: Note? = nil
     
     private var folders: [Folder] {
         appState.noteRepository.fetchAllFolders()
@@ -2027,13 +2194,49 @@ private struct MeetingsContentView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    // Page title + Quick Start button
+                    // Page title + buttons
                     HStack(alignment: .center, spacing: 12) {
                         Text("Meetings")
                             .font(Theme.titleFont(28))
                             .foregroundColor(Theme.textPrimary)
                         
                         Spacer(minLength: 0)
+                        
+                        // Archive toggle
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showArchive.toggle()
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "archivebox")
+                                    .font(.system(size: 12))
+                                Text("Archived")
+                                    .font(.system(size: 13, weight: .medium))
+                                
+                                let archiveCount = appState.noteRepository.fetchArchivedNotes().count
+                                if archiveCount > 0 {
+                                    Text("\(archiveCount)")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundColor(showArchive ? Theme.textPrimary : Theme.textTertiary)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(showArchive ? Theme.divider : Theme.divider.opacity(0.5))
+                                        .cornerRadius(4)
+                                }
+                            }
+                            .foregroundColor(showArchive ? Theme.textPrimary : Theme.textSecondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(showArchive ? Theme.sidebarSelection : Theme.cardBackground)
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Theme.divider.opacity(0.5), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("View archived meetings & notes")
                         
                         Button(action: onNewNote) {
                             HStack(spacing: 6) {
@@ -2058,33 +2261,10 @@ private struct MeetingsContentView: View {
                     .padding(.top, Theme.Spacing.mainContentTopPadding)
                     .padding(.bottom, 12)
                     
-                    let grouped = groupedNotes
-                    
-                    if grouped.isEmpty {
-                        VStack(spacing: 8) {
-                            Text("No meetings yet")
-                                .font(Theme.headingFont())
-                                .foregroundColor(Theme.textTertiary)
-                            Text("Start a meeting from the menu bar.")
-                                .font(Theme.captionFont())
-                                .foregroundColor(Theme.textQuaternary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 60)
+                    if showArchive {
+                        archivedContent
                     } else {
-                        ForEach(grouped, id: \.date) { group in
-                            DateGroupSection(
-                                group: group,
-                                folders: folders,
-                                onSelectNote: onSelectNote,
-                                onDeleteNote: { note in
-                                    appState.noteRepository.deleteNote(note)
-                                },
-                                onMoveNote: { note, folder in
-                                    appState.noteRepository.moveNote(note, to: folder)
-                                }
-                            )
-                        }
+                        activeContent
                     }
                     
                     Spacer(minLength: 40)
@@ -2094,7 +2274,106 @@ private struct MeetingsContentView: View {
             }
         }
         .background(Theme.background)
+        .alert("Permanently Delete?", isPresented: .init(
+            get: { confirmPermanentDelete != nil },
+            set: { if !$0 { confirmPermanentDelete = nil } }
+        )) {
+            Button("Cancel", role: .cancel) {
+                confirmPermanentDelete = nil
+            }
+            Button("Delete Forever", role: .destructive) {
+                if let note = confirmPermanentDelete {
+                    appState.noteRepository.permanentlyDeleteNote(note)
+                    confirmPermanentDelete = nil
+                }
+            }
+        } message: {
+            Text("This will permanently delete the note and all its data. This action cannot be undone.")
+        }
     }
+    
+    // MARK: - Active Notes
+    
+    @ViewBuilder
+    private var activeContent: some View {
+        let grouped = groupedNotes
+        
+        if grouped.isEmpty {
+            VStack(spacing: 8) {
+                Text("No meetings yet")
+                    .font(Theme.headingFont())
+                    .foregroundColor(Theme.textTertiary)
+                Text("Start a meeting from the menu bar.")
+                    .font(Theme.captionFont())
+                    .foregroundColor(Theme.textQuaternary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 60)
+        } else {
+            ForEach(grouped, id: \.date) { group in
+                DateGroupSection(
+                    group: group,
+                    folders: folders,
+                    onSelectNote: onSelectNote,
+                    onDeleteNote: { note in
+                        appState.noteRepository.archiveNote(note)
+                    },
+                    onMoveNote: { note, folder in
+                        appState.noteRepository.moveNote(note, to: folder)
+                    }
+                )
+            }
+        }
+    }
+    
+    // MARK: - Archived Notes
+    
+    @ViewBuilder
+    private var archivedContent: some View {
+        let archived = appState.noteRepository.fetchArchivedNotes()
+        
+        if archived.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "archivebox")
+                    .font(.system(size: 28))
+                    .foregroundColor(Theme.textQuaternary)
+                Text("No archived items")
+                    .font(Theme.headingFont())
+                    .foregroundColor(Theme.textTertiary)
+                Text("Archived meetings and notes will appear here.")
+                    .font(Theme.captionFont())
+                    .foregroundColor(Theme.textQuaternary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, 60)
+        } else {
+            VStack(spacing: 0) {
+                ForEach(Array(archived.enumerated()), id: \.element.id) { index, note in
+                    if index > 0 {
+                        Rectangle()
+                            .fill(Theme.divider)
+                            .frame(height: 1)
+                            .padding(.leading, 36)
+                    }
+                    
+                    ArchivedNoteRow(
+                        note: note,
+                        onRestore: {
+                            withAnimation(.easeInOut(duration: 0.25)) {
+                                appState.noteRepository.restoreNote(note)
+                            }
+                        },
+                        onPermanentDelete: {
+                            confirmPermanentDelete = note
+                        },
+                        onSelect: { onSelectNote(note.id) }
+                    )
+                }
+            }
+        }
+    }
+    
+    // MARK: - Helpers
     
     private var groupedNotes: [DateGroup] {
         let notes = appState.noteRepository.fetchAllNotes()
@@ -2128,6 +2407,115 @@ private struct MeetingsContentView: View {
     }
 }
 
+// MARK: - Archived Note Row
+
+/// A row for displaying an archived note with restore and permanent delete actions.
+private struct ArchivedNoteRow: View {
+    let note: Note
+    let onRestore: () -> Void
+    let onPermanentDelete: () -> Void
+    let onSelect: () -> Void
+    
+    @State private var isHovered = false
+    
+    private var archivedDateText: String {
+        if let archivedAt = note.archivedAt {
+            return "Archived \(archivedAt.formatted(date: .abbreviated, time: .shortened))"
+        }
+        return "Archived"
+    }
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: note.noteType == .standalone ? "doc.text" : "calendar.badge.clock")
+                .font(.system(size: 14))
+                .foregroundColor(Theme.textQuaternary)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(note.title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                
+                HStack(spacing: 6) {
+                    Text(archivedDateText)
+                        .font(Theme.captionFont(11))
+                        .foregroundColor(Theme.textTertiary)
+                    
+                    Text("·")
+                        .foregroundColor(Theme.textQuaternary)
+                    
+                    Text(note.noteType.displayName)
+                        .font(Theme.captionFont(11))
+                        .foregroundColor(Theme.textTertiary)
+                }
+            }
+            
+            Spacer()
+            
+            if isHovered {
+                Button {
+                    onRestore()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 11))
+                        Text("Restore")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Theme.cardBackground)
+                    .cornerRadius(6)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Theme.divider.opacity(0.5), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("Restore this note")
+                
+                Button {
+                    onPermanentDelete()
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 12))
+                        .foregroundColor(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .help("Permanently delete")
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 10)
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+        .onHover { isHovered = $0 }
+        .contextMenu {
+            Button {
+                onRestore()
+            } label: {
+                Label("Restore", systemImage: "arrow.uturn.backward")
+            }
+            
+            Divider()
+            
+            Button(role: .destructive) {
+                onPermanentDelete()
+            } label: {
+                Label("Delete Permanently", systemImage: "trash")
+            }
+        }
+    }
+}
+
 // MARK: - Tag Content View
 
 /// Full-page list of notes with a specific tag.
@@ -2158,12 +2546,14 @@ private struct TagContentView: View {
                         .padding(.top, Theme.Spacing.mainContentTopPadding)
                         .padding(.bottom, 4)
                         
-                        Text("\(tag.notes.count) note\(tag.notes.count == 1 ? "" : "s")")
+                        let activeTagNotes = tag.notes.filter { !$0.isArchived }
+                        
+                        Text("\(activeTagNotes.count) note\(activeTagNotes.count == 1 ? "" : "s")")
                             .font(Theme.captionFont())
                             .foregroundColor(Theme.textTertiary)
                             .padding(.bottom, 16)
                         
-                        let notes = tag.notes.sorted { $0.createdAt > $1.createdAt }
+                        let notes = activeTagNotes.sorted { $0.createdAt > $1.createdAt }
                         
                         if notes.isEmpty {
                             VStack(spacing: 8) {
@@ -2869,6 +3259,184 @@ private struct AppleNoteTextEditor: NSViewRepresentable {
             text.wrappedValue = textView.string
             isEditing = false
         }
+    }
+}
+
+// MARK: - Next Event Toolbar Badge
+
+/// Compact badge shown in the toolbar displaying the next upcoming calendar event.
+/// Format: "5 mins · Meeting Name" or "Now · Meeting Name" if happening now.
+/// Clicking reveals a popover with up to 4 upcoming events.
+private struct NextEventToolbarBadge: View {
+    let events: [CalendarEvent]
+    
+    @State private var now = Date()
+    @State private var showPopover = false
+    
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    
+    private var nextEvent: CalendarEvent? { events.first }
+    
+    var body: some View {
+        if let event = nextEvent {
+            Button {
+                showPopover.toggle()
+            } label: {
+                HStack(spacing: 5) {
+                    Image("GoogleCalendarIcon")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 15, height: 15)
+                    
+                    Text(timeLabel(for: event))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textPrimary)
+                        .monospacedDigit()
+                    
+                    Text("·")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textTertiary)
+                    
+                    Text(event.title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 160, alignment: .leading)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.white)
+                .cornerRadius(6)
+                .shadow(color: .black.opacity(0.05), radius: 1, y: 1)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onReceive(timer) { _ in
+                now = Date()
+            }
+            .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+                upcomingEventsPopover
+            }
+        }
+    }
+    
+    // MARK: - Popover
+    
+    private var upcomingEventsPopover: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Coming Up")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(Theme.textTertiary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 14)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+            
+            let upcoming = Array(events.prefix(4))
+            
+            ForEach(Array(upcoming.enumerated()), id: \.element.id) { index, event in
+                if index > 0 {
+                    Divider()
+                        .padding(.horizontal, 14)
+                }
+                
+                eventRow(event)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                    .onHover { hovering in
+                        if event.meetingURL != nil {
+                            if hovering {
+                                NSCursor.pointingHand.push()
+                            } else {
+                                NSCursor.pop()
+                            }
+                        }
+                    }
+                    .onTapGesture {
+                        if let url = event.meetingURL {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+            }
+        }
+        .padding(.bottom, 6)
+        .frame(width: 280)
+        .background(Color.white)
+    }
+    
+    // MARK: - Event Row
+    
+    private func eventRow(_ event: CalendarEvent) -> some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(dotColour(for: event))
+                .frame(width: 6, height: 6)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                
+                HStack(spacing: 4) {
+                    Text(timeLabel(for: event))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(Theme.textSecondary)
+                        .monospacedDigit()
+                    
+                    Text("·")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textTertiary)
+                    
+                    Text(event.formattedTime)
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textTertiary)
+                }
+            }
+            
+            Spacer()
+            
+            if event.meetingURL != nil {
+                Image(systemName: "video.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(Theme.textTertiary)
+            }
+        }
+    }
+    
+    // MARK: - Helpers
+    
+    private func timeLabel(for event: CalendarEvent) -> String {
+        if event.isHappeningNow {
+            return "Now"
+        }
+        let seconds = event.startDate.timeIntervalSince(now)
+        if seconds < 60 {
+            return "< 1 min"
+        }
+        let minutes = Int(seconds / 60)
+        if minutes < 60 {
+            return "\(minutes) min\(minutes == 1 ? "" : "s")"
+        }
+        let hours = minutes / 60
+        let remainingMins = minutes % 60
+        if remainingMins == 0 {
+            return "\(hours)h"
+        }
+        return "\(hours)h \(remainingMins)m"
+    }
+    
+    private func dotColour(for event: CalendarEvent) -> Color {
+        if event.isHappeningNow {
+            return .green
+        }
+        let minutes = event.startDate.timeIntervalSince(now) / 60
+        if minutes <= 5 {
+            return .orange
+        }
+        return Theme.textTertiary
     }
 }
 

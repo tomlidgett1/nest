@@ -4,7 +4,6 @@ import SwiftUI
 struct EmailListView: View {
     
     @Environment(AppState.self) private var appState
-    @State private var hoveredThreadId: String?
     @State private var expandedThreadIds: Set<String> = []
     
     private var gmail: GmailService { appState.gmailService }
@@ -57,20 +56,48 @@ struct EmailListView: View {
                     
                     ForEach(group.threads) { thread in
                         VStack(spacing: 0) {
-                            threadRow(thread)
+                            EmailThreadRow(
+                                thread: thread,
+                                isSelected: gmail.selectedThread?.id == thread.id,
+                                isExpanded: expandedThreadIds.contains(thread.id),
+                                hasMultipleAccounts: hasMultipleAccounts,
+                                onSelect: {
+                                    gmail.selectedThread = thread
+                                    gmail.selectedMessageId = nil
+                                    if thread.isUnread {
+                                        Task { await gmail.markThreadAsRead(threadId: thread.id) }
+                                    }
+                                    if thread.messageCount > 1 {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            if expandedThreadIds.contains(thread.id) {
+                                                expandedThreadIds.remove(thread.id)
+                                            } else {
+                                                expandedThreadIds = [thread.id]
+                                            }
+                                        }
+                                    }
+                                }
+                            )
                             
                             // Expanded child messages (newest at top)
                             if expandedThreadIds.contains(thread.id) && thread.messageCount > 1 {
                                 ForEach(Array(thread.messages.reversed())) { message in
-                                    childMessageRow(message, thread: thread)
+                                    EmailChildMessageRow(
+                                        message: message,
+                                        isSelected: gmail.selectedThread?.id == thread.id && gmail.selectedMessageId == message.id,
+                                        onSelect: {
+                                            gmail.selectedThread = thread
+                                            gmail.selectedMessageId = message.id
+                                        }
+                                    )
                                 }
                             }
+                            
+                            Rectangle()
+                                .fill(Theme.divider.opacity(0.5))
+                                .frame(height: 1)
+                                .padding(.horizontal, 12)
                         }
-                        
-                        Rectangle()
-                            .fill(Theme.divider.opacity(0.5))
-                            .frame(height: 1)
-                            .padding(.horizontal, 12)
                     }
                 }
                 
@@ -168,56 +195,79 @@ struct EmailListView: View {
         return result
     }
     
-    // MARK: - Thread Row
+    // MARK: - Thread Row and Child Message Row are extracted as separate structs below for scroll performance.
     
-    private func threadRow(_ thread: GmailThread) -> some View {
-        let isSelected = gmail.selectedThread?.id == thread.id
-        let isHovered = hoveredThreadId == thread.id
+    // MARK: - States
+    
+    private var loadingState: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            ProgressView()
+                .controlSize(.small)
+            Text("Loading \(gmail.currentMailbox.displayName.lowercased())…")
+                .font(Theme.captionFont(11))
+                .foregroundColor(Theme.textTertiary)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Spacer()
+            Image(systemName: gmail.currentMailbox.icon)
+                .font(.system(size: 24))
+                .foregroundColor(Theme.textQuaternary)
+            Text("No emails in \(gmail.currentMailbox.displayName)")
+                .font(Theme.captionFont(12))
+                .foregroundColor(Theme.textTertiary)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    
+}
+
+// MARK: - Email Thread Row (isolated hover state for smooth scrolling)
+
+/// Each row owns its own hover state so mouse movement only re-renders the hovered row,
+/// not the entire LazyVStack. This is the key optimisation for smooth list scrolling.
+private struct EmailThreadRow: View {
+    let thread: GmailThread
+    let isSelected: Bool
+    let isExpanded: Bool
+    let hasMultipleAccounts: Bool
+    let onSelect: () -> Void
+    
+    @State private var isHovered = false
+    
+    var body: some View {
         let latestMessage = thread.latestMessage
-        let isExpanded = expandedThreadIds.contains(thread.id)
         
-        return Button {
-            gmail.selectedThread = thread
-            gmail.selectedMessageId = nil
-            if thread.isUnread {
-                Task { await gmail.markThreadAsRead(threadId: thread.id) }
-            }
-            if thread.messageCount > 1 {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    if expandedThreadIds.contains(thread.id) {
-                        expandedThreadIds.remove(thread.id)
-                    } else {
-                        expandedThreadIds = [thread.id]
-                    }
-                }
-            }
-        } label: {
+        Button(action: onSelect) {
             HStack(alignment: .top, spacing: 0) {
-                // Unread dot + chevron column
-                VStack(spacing: 0) {
+                // Chevron + Unread dot column
+                VStack(spacing: 4) {
+                    if thread.messageCount > 1 {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(Theme.textTertiary)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                            .animation(.easeInOut(duration: 0.2), value: isExpanded)
+                    } else {
+                        Color.clear.frame(width: 9, height: 9)
+                    }
+                    
                     if thread.isUnread {
                         Circle()
                             .fill(Theme.olive)
-                            .frame(width: 8, height: 8)
+                            .frame(width: 7, height: 7)
                     } else {
-                        Color.clear.frame(width: 8, height: 8)
+                        Color.clear.frame(width: 7, height: 7)
                     }
                 }
-                .frame(width: 12)
-                .padding(.top, 14)
-                
-                // Thread expand chevron
-                if thread.messageCount > 1 {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(Theme.textTertiary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .animation(.easeInOut(duration: 0.2), value: isExpanded)
-                        .frame(width: 10)
-                        .padding(.top, 12)
-                } else {
-                    Color.clear.frame(width: 10)
-                }
+                .frame(width: 16)
+                .padding(.top, 6)
                 
                 // Avatar
                 SenderAvatarView(
@@ -246,7 +296,7 @@ struct EmailListView: View {
                         
                         // Account indicator (only when multiple accounts)
                         if hasMultipleAccounts, !thread.accountEmail.isEmpty {
-                            Text(shortAccountLabel(thread.accountEmail))
+                            Text(Self.shortAccountLabel(thread.accountEmail))
                                 .font(.system(size: 9, weight: .medium))
                                 .foregroundColor(Theme.textQuaternary)
                                 .padding(.horizontal, 5)
@@ -262,7 +312,7 @@ struct EmailListView: View {
                                 .foregroundColor(Theme.textTertiary)
                         }
                         
-                        Text(relativeDate(thread.date))
+                        Text(Self.relativeDate(thread.date))
                             .font(.system(size: 11))
                             .foregroundColor(thread.isUnread ? Theme.olive : Theme.textTertiary)
                     }
@@ -294,86 +344,13 @@ struct EmailListView: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering in
-            hoveredThreadId = hovering ? thread.id : nil
+            isHovered = hovering
         }
     }
     
-    // MARK: - Child Message Row
+    // MARK: Helpers
     
-    private func childMessageRow(_ message: GmailMessage, thread: GmailThread) -> some View {
-        let isSelected = gmail.selectedThread?.id == thread.id && gmail.selectedMessageId == message.id
-        
-        return Button {
-            gmail.selectedThread = thread
-            gmail.selectedMessageId = message.id
-        } label: {
-            HStack(alignment: .center, spacing: 8) {
-                SenderAvatarView(
-                    email: message.fromEmail,
-                    name: message.from,
-                    size: 26
-                )
-                
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 4) {
-                        Text(message.from)
-                            .font(.system(size: 11, weight: message.isUnread ? .semibold : .regular))
-                            .foregroundColor(Theme.textPrimary)
-                            .lineLimit(1)
-                        Spacer(minLength: 4)
-                        Text(relativeDate(message.date))
-                            .font(.system(size: 10))
-                            .foregroundColor(Theme.textTertiary)
-                    }
-                    Text(message.snippet)
-                        .font(.system(size: 11))
-                        .foregroundColor(Theme.textTertiary)
-                        .lineLimit(1)
-                }
-            }
-            .padding(.leading, 50)
-            .padding(.trailing, 12)
-            .padding(.vertical, 5)
-            .background(
-                isSelected ? Theme.sidebarSelection : Theme.sidebarBackground.opacity(0.3)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-    
-    // MARK: - States
-    
-    private var loadingState: some View {
-        VStack(spacing: 8) {
-            Spacer()
-            ProgressView()
-                .controlSize(.small)
-            Text("Loading \(gmail.currentMailbox.displayName.lowercased())…")
-                .font(Theme.captionFont(11))
-                .foregroundColor(Theme.textTertiary)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-    
-    private var emptyState: some View {
-        VStack(spacing: 8) {
-            Spacer()
-            Image(systemName: gmail.currentMailbox.icon)
-                .font(.system(size: 24))
-                .foregroundColor(Theme.textQuaternary)
-            Text("No emails in \(gmail.currentMailbox.displayName)")
-                .font(Theme.captionFont(12))
-                .foregroundColor(Theme.textTertiary)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-    
-    // MARK: - Helpers
-    
-    private func relativeDate(_ date: Date) -> String {
+    static func relativeDate(_ date: Date) -> String {
         let calendar = Calendar.current
         
         if calendar.isDateInToday(date) {
@@ -399,13 +376,57 @@ struct EmailListView: View {
         return formatter.string(from: date)
     }
     
-    /// Abbreviate an email to a short label, e.g. "john@example.com" → "john@ex…"
-    private func shortAccountLabel(_ email: String) -> String {
+    private static func shortAccountLabel(_ email: String) -> String {
         let parts = email.split(separator: "@")
         guard parts.count == 2 else { return email }
         let user = parts[0]
         let domain = parts[1]
         let shortDomain = domain.prefix(3)
         return "\(user)@\(shortDomain)…"
+    }
+}
+
+// MARK: - Email Child Message Row (isolated for scroll performance)
+
+private struct EmailChildMessageRow: View {
+    let message: GmailMessage
+    let isSelected: Bool
+    let onSelect: () -> Void
+    
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(alignment: .center, spacing: 8) {
+                SenderAvatarView(
+                    email: message.fromEmail,
+                    name: message.from,
+                    size: 26
+                )
+                
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(message.from)
+                            .font(.system(size: 11, weight: message.isUnread ? .semibold : .regular))
+                            .foregroundColor(Theme.textPrimary)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        Text(EmailThreadRow.relativeDate(message.date))
+                            .font(.system(size: 10))
+                            .foregroundColor(Theme.textTertiary)
+                    }
+                    Text(message.snippet)
+                        .font(.system(size: 11))
+                        .foregroundColor(Theme.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.leading, 50)
+            .padding(.trailing, 12)
+            .padding(.vertical, 5)
+            .background(
+                isSelected ? Theme.sidebarSelection : Theme.sidebarBackground.opacity(0.3)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }

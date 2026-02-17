@@ -128,8 +128,8 @@ struct StandaloneNoteDetailView: View {
                                         appState.shareService.copyAsMarkdown(note: note)
                                     }
                                     Divider()
-                                    Button("Delete Note", role: .destructive) {
-                                        appState.noteRepository.deleteNote(note)
+                                    Button("Archived Note", role: .destructive) {
+                                        appState.noteRepository.archiveNote(note)
                                         (onGoHome ?? {})()
                                     }
                                 } label: {

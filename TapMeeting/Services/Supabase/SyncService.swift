@@ -145,6 +145,8 @@ final class SyncService {
                     local.noteTypeRaw = r.note_type
                     local.isPinned = r.is_pinned
                     local.linkedNoteIds = r.linked_note_ids.isEmpty ? nil : r.linked_note_ids.map(\.uuidString).joined(separator: ",")
+                    local.isArchived = r.is_archived
+                    local.archivedAt = r.archived_at
                     local.createdAt = r.created_at
                     local.folder = r.folder_id.flatMap { folderById[$0] }
                 } else {
@@ -161,7 +163,9 @@ final class SyncService {
                         status: MeetingStatus(rawValue: r.status) ?? .inProgress,
                         noteType: NoteType(rawValue: r.note_type) ?? .meeting,
                         isPinned: r.is_pinned,
-                        linkedNoteIds: r.linked_note_ids.isEmpty ? nil : r.linked_note_ids.map(\.uuidString).joined(separator: ",")
+                        linkedNoteIds: r.linked_note_ids.isEmpty ? nil : r.linked_note_ids.map(\.uuidString).joined(separator: ","),
+                        isArchived: r.is_archived,
+                        archivedAt: r.archived_at
                     )
                     note.folder = r.folder_id.flatMap { folderById[$0] }
                     modelContext.insert(note)
@@ -444,6 +448,8 @@ final class SyncService {
                     note_type: note.noteTypeRaw,
                     is_pinned: note.isPinned,
                     linked_note_ids: note.linkedNoteIdList,
+                    is_archived: note.isArchived,
+                    archived_at: note.archivedAt,
                     created_at: note.createdAt,
                     updated_at: Date.now
                 )
@@ -784,6 +790,8 @@ struct RemoteNote: Codable {
     let note_type: String
     let is_pinned: Bool
     let linked_note_ids: [UUID]
+    let is_archived: Bool
+    let archived_at: Date?
     let created_at: Date
     let updated_at: Date
 }

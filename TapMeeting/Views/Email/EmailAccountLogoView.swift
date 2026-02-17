@@ -44,9 +44,9 @@ struct EmailAccountLogoView: View {
     }
     
     private var fallbackIcon: some View {
-        Image(systemName: "envelope.fill")
-            .font(.system(size: size * 0.55))
-            .foregroundColor(Theme.textTertiary)
+        Image("gmail")
+            .resizable()
+            .aspectRatio(contentMode: .fit)
             .frame(width: size, height: size)
     }
     

@@ -25,6 +25,8 @@ final class Note {
     var noteTypeRaw: String = NoteType.meeting.rawValue
     var isPinned: Bool = false
     var linkedNoteIds: String?
+    var isArchived: Bool = false
+    var archivedAt: Date?
     
     /// Computed status using the raw string storage.
     var status: MeetingStatus {
@@ -76,7 +78,9 @@ final class Note {
         status: MeetingStatus = .inProgress,
         noteType: NoteType = .meeting,
         isPinned: Bool = false,
-        linkedNoteIds: String? = nil
+        linkedNoteIds: String? = nil,
+        isArchived: Bool = false,
+        archivedAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -94,6 +98,8 @@ final class Note {
         self.noteTypeRaw = noteType.rawValue
         self.isPinned = isPinned
         self.linkedNoteIds = linkedNoteIds
+        self.isArchived = isArchived
+        self.archivedAt = archivedAt
     }
 }
 

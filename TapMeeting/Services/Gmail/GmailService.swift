@@ -339,6 +339,14 @@ final class GmailService {
     /// Estimated total result count from the last search (from Gmail's `resultSizeEstimate`).
     private(set) var searchResultEstimate: Int = 0
     
+    // MARK: - Contact Cache
+    
+    /// Preloaded contacts for instant autocomplete (saved contacts + people you've emailed).
+    private(set) var contactCache: [ContactSuggestion] = []
+    
+    /// Whether the contact cache has been loaded.
+    private var contactCacheLoaded = false
+    
     // MARK: - Polling
     
     /// Background timer that polls for new emails.
@@ -789,6 +797,11 @@ final class GmailService {
         }
         
         print("[Gmail] Fetched \(sorted.count) \(mailbox.displayName) threads")
+        
+        // Auto-load contact cache once we have sent or inbox threads
+        if (mailbox == .sent || mailbox == .inbox) && !contactCacheLoaded {
+            Task { await loadContactCacheIfNeeded() }
+        }
     }
 
     // MARK: - Load More (Pagination)
@@ -1709,15 +1722,20 @@ final class GmailService {
                     sentThreadId = responseThreadId
                 }
                 
-                if let sentThreadId, !sentThreadId.isEmpty {
-                    await refreshThreadAfterSend(threadId: sentThreadId, token: token, account: account)
-                }
-                
+                // Update UI immediately — don't block on the thread refresh
                 await MainActor.run {
                     isSending = false
                     sendSuccess = true
                 }
                 print("[Gmail] ✓ Email sent to \(draft.to.joined(separator: ", "))")
+                
+                // Refresh the thread in the background so the mailbox list updates
+                if let sentThreadId, !sentThreadId.isEmpty {
+                    Task.detached { [weak self] in
+                        await self?.refreshThreadAfterSend(threadId: sentThreadId, token: token, account: account)
+                    }
+                }
+                
                 return true
             } else {
                 let errorText = String(data: data, encoding: .utf8) ?? "Unknown error"
@@ -2177,23 +2195,37 @@ final class GmailService {
         }
     }
     
-    // MARK: - Contact Suggestions (People API)
+    // MARK: - Contact Cache (Preloaded for Instant Autocomplete)
     
-    /// Search contacts and "other contacts" (people emailed before) using the Google People API.
-    /// Combines both sources and deduplicates by email address.
-    func searchContactSuggestions(query: String) async -> [ContactSuggestion] {
-        // Use the primary (first) account for contact search
-        guard !query.isEmpty,
-              let account = accounts.first,
-              let token = await validToken(for: account) else { return [] }
+    /// Preloads all saved contacts and "other contacts" (people you've emailed) into a local cache.
+    /// Called lazily when the compose view appears. Results are available instantly for autocomplete.
+    func loadContactCacheIfNeeded() async {
+        guard !contactCacheLoaded else { return }
         
-        // Search saved contacts and "other contacts" in parallel
-        async let saved = searchPeopleContacts(query: query, token: token)
-        async let other = searchOtherContacts(query: query, token: token)
+        contactCacheLoaded = true // prevent re-entry
         
-        let all = await saved + other
+        // Wait briefly for threads to load if they haven't yet
+        for _ in 0..<10 {
+            if !sentThreads.isEmpty || !inboxThreads.isEmpty { break }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
         
-        // Deduplicate by email (case-insensitive), preserving order
+        // 1. Extract contacts from already-fetched sent emails (always works, no API call)
+        let sentContacts = extractContactsFromSentThreads()
+        debugLog("[Gmail] Extracted \(sentContacts.count) contacts from sent/inbox emails (sentThreads=\(sentThreads.count), inboxThreads=\(inboxThreads.count))")
+        
+        // 2. Try People API for richer data (may fail if API not enabled)
+        var apiContacts: [ContactSuggestion] = []
+        if let account = accounts.first, let token = await validToken(for: account) {
+            print("[Gmail] Loading People API contacts for \(account.email)...")
+            async let savedContacts = fetchAllSavedContacts(token: token)
+            async let otherContacts = fetchAllOtherContactsList(token: token)
+            apiContacts = await savedContacts + otherContacts
+        }
+        
+        // 3. Merge: API contacts first (richer data with names), then sent email contacts
+        let all = apiContacts + sentContacts
+        
         var seen = Set<String>()
         var unique: [ContactSuggestion] = []
         for contact in all {
@@ -2204,12 +2236,210 @@ final class GmailService {
             }
         }
         
-        return unique
+        await MainActor.run {
+            contactCache = unique
+        }
+        
+        debugLog("[Gmail] Contact cache loaded: \(unique.count) contacts (\(apiContacts.count) from API, \(sentContacts.count) from sent emails)")
+        if !unique.isEmpty {
+            debugLog("[Gmail] Sample contacts: \(unique.prefix(5).map { "\($0.name) <\($0.email)>" }.joined(separator: ", "))")
+        }
+    }
+    
+    /// Extract unique email addresses from already-fetched sent and inbox email threads.
+    /// This provides a baseline of contacts even when the People API is unavailable.
+    private func extractContactsFromSentThreads() -> [ContactSuggestion] {
+        let myEmails = Set(accounts.map { $0.email.lowercased() })
+        var seen = Set<String>()
+        var contacts: [ContactSuggestion] = []
+        
+        // Scan sent threads for recipients (To/Cc)
+        for thread in sentThreads {
+            for message in thread.messages {
+                for email in message.to + message.cc {
+                    let lower = email.lowercased().trimmingCharacters(in: .whitespaces)
+                    guard !lower.isEmpty, lower.contains("@"),
+                          !myEmails.contains(lower),
+                          !seen.contains(lower) else { continue }
+                    seen.insert(lower)
+                    contacts.append(ContactSuggestion(
+                        id: "sent-\(lower)",
+                        name: "",
+                        email: email.trimmingCharacters(in: .whitespaces)
+                    ))
+                }
+            }
+        }
+        
+        // Also scan inbox threads for senders (people who emailed you)
+        for thread in inboxThreads {
+            for message in thread.messages {
+                let email = message.fromEmail.lowercased().trimmingCharacters(in: .whitespaces)
+                guard !email.isEmpty, email.contains("@"),
+                      !myEmails.contains(email),
+                      !seen.contains(email) else { continue }
+                seen.insert(email)
+                contacts.append(ContactSuggestion(
+                    id: "inbox-\(email)",
+                    name: message.from,
+                    email: message.fromEmail.trimmingCharacters(in: .whitespaces)
+                ))
+            }
+        }
+        
+        return contacts
+    }
+    
+    /// Search the local contact cache for instant results (no network call).
+    /// Returns matches ranked by relevance: exact email match → name starts with → email starts with → contains.
+    func searchLocalContactCache(query: String) -> [ContactSuggestion] {
+        guard !query.isEmpty else { return [] }
+        let q = query.lowercased()
+        
+        // Score contacts for relevance ranking
+        struct ScoredContact {
+            let contact: ContactSuggestion
+            let score: Int // lower = better match
+        }
+        
+        var scored: [ScoredContact] = []
+        
+        for contact in contactCache {
+            let email = contact.email.lowercased()
+            let name = contact.name.lowercased()
+            
+            if email == q {
+                scored.append(ScoredContact(contact: contact, score: 0))
+            } else if name.hasPrefix(q) {
+                scored.append(ScoredContact(contact: contact, score: 1))
+            } else if email.hasPrefix(q) {
+                scored.append(ScoredContact(contact: contact, score: 2))
+            } else if name.contains(q) {
+                scored.append(ScoredContact(contact: contact, score: 3))
+            } else if email.contains(q) {
+                scored.append(ScoredContact(contact: contact, score: 4))
+            }
+            // If the query has multiple words, check if all words match
+            else {
+                let queryWords = q.components(separatedBy: " ").filter { !$0.isEmpty }
+                if queryWords.count > 1 {
+                    let combined = name + " " + email
+                    let allMatch = queryWords.allSatisfy { combined.contains($0) }
+                    if allMatch {
+                        scored.append(ScoredContact(contact: contact, score: 5))
+                    }
+                }
+            }
+        }
+        
+        return scored.sorted { $0.score < $1.score }.map(\.contact)
+    }
+    
+    /// Fetch all saved contacts (up to 1000) via People API `people/me/connections`.
+    private func fetchAllSavedContacts(token: String) async -> [ContactSuggestion] {
+        var components = URLComponents(string: "\(Constants.Gmail.peopleAPIBase)/people/me/connections")!
+        components.queryItems = [
+            URLQueryItem(name: "personFields", value: "names,emailAddresses"),
+            URLQueryItem(name: "pageSize", value: "1000"),
+            URLQueryItem(name: "sortOrder", value: "LAST_MODIFIED_DESCENDING"),
+        ]
+        
+        guard let url = components.url else { return [] }
+        
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        
+        do {
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                print("[Gmail] People connections.list HTTP \(status)")
+                if let body = String(data: data, encoding: .utf8) { print("[Gmail]   Response: \(body.prefix(300))") }
+                return []
+            }
+            let contacts = parseContactsList(from: data, arrayKey: "connections")
+            print("[Gmail] connections.list returned \(contacts.count) saved contacts")
+            return contacts
+        } catch {
+            print("[Gmail] People connections.list error: \(error)")
+            return []
+        }
+    }
+    
+    /// Fetch all "other contacts" (people you've emailed but haven't explicitly saved) via People API.
+    private func fetchAllOtherContactsList(token: String) async -> [ContactSuggestion] {
+        var components = URLComponents(string: "\(Constants.Gmail.peopleAPIBase)/otherContacts")!
+        components.queryItems = [
+            URLQueryItem(name: "readMask", value: "names,emailAddresses"),
+            URLQueryItem(name: "pageSize", value: "1000"),
+        ]
+        
+        guard let url = components.url else { return [] }
+        
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        
+        do {
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                print("[Gmail] People otherContacts.list HTTP \(status)")
+                if let body = String(data: data, encoding: .utf8) { print("[Gmail]   Response: \(body.prefix(300))") }
+                return []
+            }
+            let contacts = parseContactsList(from: data, arrayKey: "otherContacts")
+            print("[Gmail] otherContacts.list returned \(contacts.count) other contacts")
+            return contacts
+        } catch {
+            print("[Gmail] People otherContacts.list error: \(error)")
+            return []
+        }
+    }
+    
+    /// Parse a People API list response (connections or otherContacts).
+    /// Both return `{ "arrayKey": [{ "resourceName": ..., "names": [...], "emailAddresses": [...] }] }`.
+    private func parseContactsList(from data: Data, arrayKey: String) -> [ContactSuggestion] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json[arrayKey] as? [[String: Any]] else {
+            return []
+        }
+        return parsePersonObjects(items)
+    }
+    
+    // MARK: - Contact Suggestions (People API Live Search)
+    
+    /// Search contacts via the People API. Merges local cache (instant) with live API results.
+    /// The compose view calls `searchLocalContactCache` immediately for instant results,
+    /// then calls this method after a debounce for supplementary live results.
+    func searchContactSuggestions(query: String) async -> [ContactSuggestion] {
+        guard !query.isEmpty,
+              let account = accounts.first,
+              let token = await validToken(for: account) else { return [] }
+        
+        // Search saved contacts and "other contacts" via People API in parallel
+        async let saved = searchPeopleContacts(query: query, token: token)
+        async let other = searchOtherContacts(query: query, token: token)
+        
+        let apiResults = await saved + other
+        
+        // Merge with local cache results (local first for instant feel, then API for fresh data)
+        let localResults = searchLocalContactCache(query: query)
+        
+        var seen = Set<String>()
+        var merged: [ContactSuggestion] = []
+        for contact in localResults + apiResults {
+            let key = contact.email.lowercased()
+            if !seen.contains(key) {
+                seen.insert(key)
+                merged.append(contact)
+            }
+        }
+        
+        return merged
     }
     
     /// Search saved Google Contacts via People API.
     /// `GET /v1/people:searchContacts`
-    /// Requires scope: `contacts.readonly`
     private func searchPeopleContacts(query: String, token: String) async -> [ContactSuggestion] {
         var components = URLComponents(string: "\(Constants.Gmail.peopleAPIBase)/people:searchContacts")!
         components.queryItems = [
@@ -2226,7 +2456,6 @@ final class GmailService {
         do {
             let (data, response) = try await resilientData(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            // 403 = scope not granted (user needs to re-authenticate); return empty gracefully
             guard status == 200 else {
                 if status != 403 { print("[Gmail] People searchContacts HTTP \(status)") }
                 return []
@@ -2240,7 +2469,6 @@ final class GmailService {
     
     /// Search "Other Contacts" (people you've emailed but haven't saved) via People API.
     /// `GET /v1/otherContacts:search`
-    /// Requires scope: `contacts.other.readonly`
     private func searchOtherContacts(query: String, token: String) async -> [ContactSuggestion] {
         var components = URLComponents(string: "\(Constants.Gmail.peopleAPIBase)/otherContacts:search")!
         components.queryItems = [
@@ -2275,13 +2503,15 @@ final class GmailService {
               let results = json["results"] as? [[String: Any]] else {
             return []
         }
-        
+        let persons = results.compactMap { $0["person"] as? [String: Any] }
+        return parsePersonObjects(persons)
+    }
+    
+    /// Shared parser for People API person objects (used by both search and list endpoints).
+    private func parsePersonObjects(_ persons: [[String: Any]]) -> [ContactSuggestion] {
         var suggestions: [ContactSuggestion] = []
         
-        for result in results {
-            guard let person = result["person"] as? [String: Any] else { continue }
-            
-            // Must have at least one email
+        for person in persons {
             guard let emailAddresses = person["emailAddresses"] as? [[String: Any]],
                   let primaryEmail = emailAddresses.first?["value"] as? String else {
                 continue
@@ -2403,4 +2633,20 @@ private struct TokenResponse: Decodable {
     let refreshToken: String?
     let expiresIn: Int?
     let tokenType: String?
+}
+
+// MARK: - Debug Logging
+
+/// Write debug logs to a file (Swift print() is unreliable when app isn't launched from terminal)
+private func debugLog(_ message: String) {
+    let entry = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+    print(message)
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("nest_contact_debug.log")
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(entry.data(using: .utf8) ?? Data())
+        handle.closeFile()
+    } else {
+        try? entry.data(using: .utf8)?.write(to: url)
+    }
 }

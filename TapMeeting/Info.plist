@@ -26,5 +26,13 @@
 		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 	</dict>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/tomlidgett1/nest/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>oQxYE9sAaY501miohbPOD/Z5dw/t9GCiF9Ppc2JeK0Y=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>3600</integer>
 </dict>
 </plist>

@@ -1,8 +1,10 @@
 import SwiftUI
 import ServiceManagement
+import Sparkle
 
 struct GeneralPreferencesView: View {
     
+    @EnvironmentObject private var updaterService: UpdaterService
     @AppStorage(Constants.Defaults.launchAtLogin) private var launchAtLogin = false
     @AppStorage(Constants.Defaults.captureMicAudio) private var captureMic = true
     @AppStorage(Constants.Defaults.captureSystemAudio) private var captureSystem = true
@@ -58,6 +60,47 @@ struct GeneralPreferencesView: View {
                 }
                 .padding(.top, 4)
             }
+
+            // Updates
+            SettingsCard(title: "Updates", subtitle: "Nest checks for updates automatically on launch.") {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Theme.olive.opacity(0.08))
+                            .frame(width: 32, height: 32)
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 13))
+                            .foregroundColor(Theme.olive)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Software Update")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(Theme.textPrimary)
+                        Text("Version \(Bundle.main.shortVersionString)")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textTertiary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        updaterService.checkForUpdates()
+                    } label: {
+                        Text("Check for Updates")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .disabled(!updaterService.canCheckForUpdates)
+                }
+            }
         }
+    }
+}
+
+// MARK: - Bundle helper
+
+private extension Bundle {
+    var shortVersionString: String {
+        infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
     }
 }

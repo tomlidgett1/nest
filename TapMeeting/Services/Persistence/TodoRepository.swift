@@ -12,8 +12,17 @@ final class TodoRepository {
     /// Optional sync service — set after Supabase authentication.
     var syncService: SyncService?
     
+    /// Live count of pending (incomplete, non-deleted) to-dos.
+    /// Automatically refreshed after every mutation so the sidebar badge stays current.
+    private(set) var livePendingCount: Int = 0
+    
+    /// Live count of unseen, non-deleted, non-completed to-dos.
+    /// Automatically refreshed after every mutation so the sidebar "new" badge stays current.
+    private(set) var liveUnseenCount: Int = 0
+    
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
+        refreshBadgeCounts()
     }
     
     // MARK: - Create
@@ -321,6 +330,15 @@ final class TodoRepository {
         excludedSenders().count + excludedCategories().count
     }
     
+    // MARK: - Badge Counts
+    
+    /// Re-fetch pending and unseen counts from SwiftData and update the stored properties.
+    /// Called automatically after every `save()` so the sidebar badges stay in sync.
+    func refreshBadgeCounts() {
+        livePendingCount = pendingCount()
+        liveUnseenCount = unseenCount()
+    }
+    
     // MARK: - Private
     
     private func save() {
@@ -329,5 +347,6 @@ final class TodoRepository {
         } catch {
             print("[TodoRepository] Save failed: \(error.localizedDescription)")
         }
+        refreshBadgeCounts()
     }
 }

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		01277943C204428E3CDFD768 /* Supabase in Frameworks */ = {isa = PBXBuildFile; productRef = 49D51D281CFAABB4E311E837 /* Supabase */; };
+		A1B2C3D4E5F60001SPARKLE1 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F60002SPARKLE2 /* Sparkle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +58,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				01277943C204428E3CDFD768 /* Supabase in Frameworks */,
+				A1B2C3D4E5F60001SPARKLE1 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -118,6 +120,7 @@
 			name = Nest;
 			packageProductDependencies = (
 				49D51D281CFAABB4E311E837 /* Supabase */,
+				A1B2C3D4E5F60002SPARKLE2 /* Sparkle */,
 			);
 			productName = TapMeeting;
 			productReference = CEC70B0B2F3D900900AD49F2 /* Nest.app */;
@@ -199,6 +202,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				E80A6A55D2875124E61DDDF2 /* XCRemoteSwiftPackageReference "supabase-swift" */,
+				A1B2C3D4E5F60003SPARKLE3 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = CEC70B0C2F3D900900AD49F2 /* Products */;
@@ -572,6 +576,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		A1B2C3D4E5F60003SPARKLE3 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.0.0;
+			};
+		};
 		E80A6A55D2875124E61DDDF2 /* XCRemoteSwiftPackageReference "supabase-swift" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/supabase/supabase-swift";
@@ -587,6 +599,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = E80A6A55D2875124E61DDDF2 /* XCRemoteSwiftPackageReference "supabase-swift" */;
 			productName = Supabase;
+		};
+		A1B2C3D4E5F60002SPARKLE2 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1B2C3D4E5F60003SPARKLE3 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

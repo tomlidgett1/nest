@@ -36,19 +36,63 @@ final class NoteRepository {
 
     // MARK: - Read
 
-    /// Fetch all notes, sorted by creation date (newest first).
+    /// Fetch all active (non-archived) notes, sorted by creation date (newest first).
     func fetchAllNotes() -> [Note] {
+        let predicate = #Predicate<Note> { note in
+            note.isArchived == false
+        }
         let descriptor = FetchDescriptor<Note>(
+            predicate: predicate,
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         return (try? modelContext.fetch(descriptor)) ?? []
     }
 
-    /// Search notes by title, content, or tag names.
+    /// Fetch all archived notes, sorted by archive date (newest first).
+    func fetchArchivedNotes() -> [Note] {
+        let predicate = #Predicate<Note> { note in
+            note.isArchived == true
+        }
+        let descriptor = FetchDescriptor<Note>(
+            predicate: predicate,
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    /// Fetch archived meeting notes only.
+    func fetchArchivedMeetingNotes() -> [Note] {
+        let meetingRaw = NoteType.meeting.rawValue
+        let predicate = #Predicate<Note> { note in
+            note.isArchived == true && note.noteTypeRaw == meetingRaw
+        }
+        let descriptor = FetchDescriptor<Note>(
+            predicate: predicate,
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    /// Fetch archived standalone notes only.
+    func fetchArchivedStandaloneNotes() -> [Note] {
+        let standaloneRaw = NoteType.standalone.rawValue
+        let predicate = #Predicate<Note> { note in
+            note.isArchived == true && note.noteTypeRaw == standaloneRaw
+        }
+        let descriptor = FetchDescriptor<Note>(
+            predicate: predicate,
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    /// Search active (non-archived) notes by title, content, or tag names.
     func searchNotes(query: String) -> [Note] {
         let predicate = #Predicate<Note> { note in
-            note.title.localizedStandardContains(query) ||
-            note.rawNotes.localizedStandardContains(query)
+            note.isArchived == false && (
+                note.title.localizedStandardContains(query) ||
+                note.rawNotes.localizedStandardContains(query)
+            )
         }
 
         let descriptor = FetchDescriptor<Note>(
@@ -58,11 +102,11 @@ final class NoteRepository {
 
         var results = (try? modelContext.fetch(descriptor)) ?? []
 
-        // Also include notes matching tag names
+        // Also include notes matching tag names (excluding archived)
         let allTags = fetchAllTags()
         let matchingTags = allTags.filter { $0.name.localizedCaseInsensitiveContains(query) }
         for tag in matchingTags {
-            for note in tag.notes {
+            for note in tag.notes where !note.isArchived {
                 if !results.contains(where: { $0.id == note.id }) {
                     results.append(note)
                 }
@@ -72,11 +116,11 @@ final class NoteRepository {
         return results.sorted { $0.createdAt > $1.createdAt }
     }
 
-    /// Fetch notes by status.
+    /// Fetch active (non-archived) notes by status.
     func fetchNotes(withStatus status: MeetingStatus) -> [Note] {
         let statusRaw = status.rawValue
         let predicate = #Predicate<Note> { note in
-            note.statusRaw == statusRaw
+            note.isArchived == false && note.statusRaw == statusRaw
         }
 
         let descriptor = FetchDescriptor<Note>(
@@ -174,11 +218,11 @@ final class NoteRepository {
         return note
     }
 
-    /// Fetch only standalone notes.
+    /// Fetch only active (non-archived) standalone notes.
     func fetchStandaloneNotes() -> [Note] {
         let standaloneRaw = NoteType.standalone.rawValue
         let predicate = #Predicate<Note> { note in
-            note.noteTypeRaw == standaloneRaw
+            note.isArchived == false && note.noteTypeRaw == standaloneRaw
         }
         let descriptor = FetchDescriptor<Note>(
             predicate: predicate,
@@ -187,11 +231,11 @@ final class NoteRepository {
         return (try? modelContext.fetch(descriptor)) ?? []
     }
 
-    /// Fetch only meeting notes.
+    /// Fetch only active (non-archived) meeting notes.
     func fetchMeetingNotes() -> [Note] {
         let meetingRaw = NoteType.meeting.rawValue
         let predicate = #Predicate<Note> { note in
-            note.noteTypeRaw == meetingRaw
+            note.isArchived == false && note.noteTypeRaw == meetingRaw
         }
         let descriptor = FetchDescriptor<Note>(
             predicate: predicate,
@@ -257,9 +301,9 @@ final class NoteRepository {
         syncService?.deleteRemote(table: "tags", id: tagId)
     }
 
-    /// Fetch notes that have a specific tag.
+    /// Fetch active (non-archived) notes that have a specific tag.
     func fetchNotes(withTag tag: Tag) -> [Note] {
-        return tag.notes.sorted { $0.createdAt > $1.createdAt }
+        return tag.notes.filter { !$0.isArchived }.sorted { $0.createdAt > $1.createdAt }
     }
 
     // MARK: - Linking
@@ -297,14 +341,35 @@ final class NoteRepository {
         syncService?.pushNote(noteB)
     }
 
-    // MARK: - Delete
+    // MARK: - Archive / Restore / Delete
 
-    /// Delete a note and all associated utterances.
-    func deleteNote(_ note: Note) {
+    /// Soft-delete: archive a note instead of permanently deleting it.
+    func archiveNote(_ note: Note) {
+        note.isArchived = true
+        note.archivedAt = Date.now
+        save()
+        syncService?.pushNote(note)
+    }
+
+    /// Restore an archived note back to the active list.
+    func restoreNote(_ note: Note) {
+        note.isArchived = false
+        note.archivedAt = nil
+        save()
+        syncService?.pushNote(note)
+    }
+
+    /// Permanently delete a note and all associated utterances (irreversible).
+    func permanentlyDeleteNote(_ note: Note) {
         let noteId = note.id
         modelContext.delete(note)
         save()
         syncService?.deleteRemote(table: "notes", id: noteId)
+    }
+
+    /// Legacy alias — archives the note (soft delete).
+    func deleteNote(_ note: Note) {
+        archiveNote(note)
     }
 
     // MARK: - Folders
@@ -350,10 +415,10 @@ final class NoteRepository {
         syncService?.deleteRemote(table: "folders", id: folderId)
     }
 
-    /// Fetch notes in a folder, or all notes without a folder if folder is nil.
+    /// Fetch active (non-archived) notes in a folder, or all uncategorised active notes if folder is nil.
     func fetchNotes(in folder: Folder?) -> [Note] {
         if let folder {
-            return folder.notes.sorted { $0.createdAt > $1.createdAt }
+            return folder.notes.filter { !$0.isArchived }.sorted { $0.createdAt > $1.createdAt }
         }
         return fetchAllNotes().filter { $0.folder == nil }
     }

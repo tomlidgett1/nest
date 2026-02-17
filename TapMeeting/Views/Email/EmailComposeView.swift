@@ -38,11 +38,19 @@ struct EmailComposeView: View {
     @Query private var styleProfiles: [StyleProfile]
     
     @State private var draft: EmailDraft
-    @State private var toText: String
-    @State private var ccText: String
-    @State private var bccText: String
     @State private var showCcField: Bool
     @State private var showBccField: Bool
+    
+    // Token-based recipient state
+    @State private var toTokens: [RecipientToken]
+    @State private var toInputText: String = ""
+    @State private var ccTokens: [RecipientToken]
+    @State private var ccInputText: String = ""
+    @State private var bccTokens: [RecipientToken]
+    @State private var bccInputText: String = ""
+    
+    // Dynamic row height measurement for dropdown positioning
+    
     
     // AI Assist state
     @State private var aiAssistEnabled: Bool = false
@@ -86,9 +94,9 @@ struct EmailComposeView: View {
         onSent: (() -> Void)? = nil
     ) {
         self._draft = State(initialValue: draft)
-        self._toText = State(initialValue: draft.to.joined(separator: ", "))
-        self._ccText = State(initialValue: draft.cc.joined(separator: ", "))
-        self._bccText = State(initialValue: draft.bcc.joined(separator: ", "))
+        self._toTokens = State(initialValue: draft.to.map { RecipientToken(email: $0) })
+        self._ccTokens = State(initialValue: draft.cc.map { RecipientToken(email: $0) })
+        self._bccTokens = State(initialValue: draft.bcc.map { RecipientToken(email: $0) })
         self._showCcField = State(initialValue: !draft.cc.isEmpty)
         self._showBccField = State(initialValue: !draft.bcc.isEmpty)
         self.mode = mode
@@ -137,16 +145,17 @@ struct EmailComposeView: View {
                     .foregroundColor(Theme.textTertiary)
                     .frame(width: 55, alignment: .trailing)
                 
-                TextField("Recipients", text: $toText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundColor(Theme.textPrimary)
-                    .onChange(of: toText) { _, newValue in
-                        draft.to = parseEmails(newValue)
-                        onRecipientTextChanged(field: .to, text: newValue)
+                RecipientTokenField(
+                    tokens: $toTokens,
+                    inputText: $toInputText,
+                    placeholder: "Recipients",
+                    onSearchQueryChanged: { query in
+                        onRecipientInputChanged(field: .to, text: query)
                     }
-                
-                Spacer()
+                )
+                .onChange(of: toTokens) { _, _ in
+                    draft.to = toTokens.map(\.email)
+                }
                 
                 HStack(spacing: 12) {
                     if !showCcField {
@@ -163,13 +172,14 @@ struct EmailComposeView: View {
                     }
                 }
             }
-            .overlay(alignment: .topLeading) {
-                if activeRecipientField == .to && !contactSuggestions.isEmpty {
-                    suggestionDropdownView
-                        .offset(x: 75, y: 38)
-                }
+            
+            // Inline suggestion dropdown for To field
+            if activeRecipientField == .to && !contactSuggestions.isEmpty {
+                suggestionDropdownView
+                    .padding(.leading, 75)
+                    .padding(.trailing, 20)
+                    .padding(.vertical, 2)
             }
-            .zIndex(activeRecipientField == .to ? 10 : 1)
             
             // — Cc (shown on toggle or pre-filled) —
             if showCcField {
@@ -180,24 +190,28 @@ struct EmailComposeView: View {
                         .foregroundColor(Theme.textTertiary)
                         .frame(width: 55, alignment: .trailing)
                     
-                    TextField("", text: $ccText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(Theme.textPrimary)
-                        .onChange(of: ccText) { _, newValue in
-                            draft.cc = parseEmails(newValue)
-                            onRecipientTextChanged(field: .cc, text: newValue)
+                    RecipientTokenField(
+                        tokens: $ccTokens,
+                        inputText: $ccInputText,
+                        placeholder: "",
+                        onSearchQueryChanged: { query in
+                            onRecipientInputChanged(field: .cc, text: query)
                         }
+                    )
+                    .onChange(of: ccTokens) { _, _ in
+                        draft.cc = ccTokens.map(\.email)
+                    }
                     
                     Spacer()
                 }
-                .overlay(alignment: .topLeading) {
-                    if activeRecipientField == .cc && !contactSuggestions.isEmpty {
-                        suggestionDropdownView
-                            .offset(x: 75, y: 38)
-                    }
+                
+                // Inline suggestion dropdown for Cc field
+                if activeRecipientField == .cc && !contactSuggestions.isEmpty {
+                    suggestionDropdownView
+                        .padding(.leading, 75)
+                        .padding(.trailing, 20)
+                        .padding(.vertical, 2)
                 }
-                .zIndex(activeRecipientField == .cc ? 10 : 1)
             }
             
             // — Bcc (shown on toggle or pre-filled) —
@@ -209,24 +223,28 @@ struct EmailComposeView: View {
                         .foregroundColor(Theme.textTertiary)
                         .frame(width: 55, alignment: .trailing)
                     
-                    TextField("", text: $bccText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(Theme.textPrimary)
-                        .onChange(of: bccText) { _, newValue in
-                            draft.bcc = parseEmails(newValue)
-                            onRecipientTextChanged(field: .bcc, text: newValue)
+                    RecipientTokenField(
+                        tokens: $bccTokens,
+                        inputText: $bccInputText,
+                        placeholder: "",
+                        onSearchQueryChanged: { query in
+                            onRecipientInputChanged(field: .bcc, text: query)
                         }
+                    )
+                    .onChange(of: bccTokens) { _, _ in
+                        draft.bcc = bccTokens.map(\.email)
+                    }
                     
                     Spacer()
                 }
-                .overlay(alignment: .topLeading) {
-                    if activeRecipientField == .bcc && !contactSuggestions.isEmpty {
-                        suggestionDropdownView
-                            .offset(x: 75, y: 38)
-                    }
+                
+                // Inline suggestion dropdown for Bcc field
+                if activeRecipientField == .bcc && !contactSuggestions.isEmpty {
+                    suggestionDropdownView
+                        .padding(.leading, 75)
+                        .padding(.trailing, 20)
+                        .padding(.vertical, 2)
                 }
-                .zIndex(activeRecipientField == .bcc ? 10 : 1)
             }
             
             rowDivider()
@@ -312,6 +330,9 @@ struct EmailComposeView: View {
             }
         }
         .background(Color.clear)
+        .task {
+            await gmail.loadContactCacheIfNeeded()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .emailComposeToolbarAction)) { notification in
             guard let rawAction = notification.userInfo?["action"] as? String,
                   let action = EmailComposeToolbarAction(rawValue: rawAction) else { return }
@@ -332,6 +353,9 @@ struct EmailComposeView: View {
     }
     
     private func sendDraft() {
+        // Auto-commit any pending text in recipient fields before sending
+        commitPendingRecipients()
+        
         Task {
             var finalDraft = draft
             
@@ -512,87 +536,94 @@ struct EmailComposeView: View {
     
     // MARK: - Contact Autocomplete Logic
     
-    /// Called when text changes in any recipient field. Debounces and searches contacts.
-    private func onRecipientTextChanged(field: RecipientField, text: String) {
+    /// Called when the inline input text changes in any recipient token field.
+    /// Shows instant local cache results, then supplements with People API after a debounce.
+    private func onRecipientInputChanged(field: RecipientField, text: String) {
         searchTask?.cancel()
         
-        // Extract the token currently being typed (text after the last comma)
-        let token = text
-            .components(separatedBy: ",")
-            .last?
-            .trimmingCharacters(in: .whitespaces) ?? ""
-        
-        // Need at least 2 characters to search
-        guard token.count >= 2 else {
+        let query = text.trimmingCharacters(in: .whitespaces)
+        // Need at least 1 character for local cache, 2 for API
+        guard !query.isEmpty else {
             contactSuggestions = []
             activeRecipientField = nil
             return
         }
         
         activeRecipientField = field
+        let existingEmails = allExistingRecipientEmails()
         
-        // Debounce: wait 300ms before hitting the API
+        // 1. Instant local cache results (no debounce)
+        let localResults = gmail.searchLocalContactCache(query: query)
+            .filter { !existingEmails.contains($0.email.lowercased()) }
+        
+        contactSuggestions = localResults
+        if !localResults.isEmpty {
+            activeRecipientField = field
+        } else if query.count < 2 {
+            activeRecipientField = nil
+        }
+        
+        // 2. Debounced People API search for supplementary results
+        guard query.count >= 2 else { return }
+        
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
             
-            let results = await gmail.searchContactSuggestions(query: token)
+            let apiResults = await gmail.searchContactSuggestions(query: query)
             guard !Task.isCancelled else { return }
             
             await MainActor.run {
-                // Filter out emails already in To/Cc/Bcc
-                let existingEmails = Set(
-                    (draft.to + draft.cc + draft.bcc)
-                        .map { $0.lowercased() }
-                )
-                contactSuggestions = results.filter {
-                    !existingEmails.contains($0.email.lowercased())
+                // Merge local + API, deduplicate, filter existing recipients
+                let currentExisting = allExistingRecipientEmails()
+                var seen = Set<String>()
+                var merged: [ContactSuggestion] = []
+                
+                for contact in localResults + apiResults {
+                    let key = contact.email.lowercased()
+                    if !seen.contains(key) && !currentExisting.contains(key) {
+                        seen.insert(key)
+                        merged.append(contact)
+                    }
                 }
                 
-                // Hide dropdown if no results after filtering
-                if contactSuggestions.isEmpty {
-                    activeRecipientField = nil
-                }
+                contactSuggestions = merged
+                activeRecipientField = merged.isEmpty ? nil : field
             }
         }
     }
     
-    /// Insert the selected contact's email into the active recipient field.
+    /// Insert the selected contact as a token in the active recipient field.
     private func selectSuggestion(_ suggestion: ContactSuggestion) {
         guard let field = activeRecipientField else { return }
         
-        // Get the current text for the active field
-        let currentText: String
-        switch field {
-        case .to: currentText = toText
-        case .cc: currentText = ccText
-        case .bcc: currentText = bccText
-        }
+        let token = RecipientToken(
+            name: suggestion.name,
+            email: suggestion.email
+        )
         
-        // Split into completed emails, drop the partial token, append the selected email
-        var parts = currentText
-            .components(separatedBy: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        
-        if !parts.isEmpty {
-            parts.removeLast() // remove the partial token being typed
-        }
-        parts.append(suggestion.email)
-        
-        let newText = parts.joined(separator: ", ") + ", "
-        
-        // Update the correct field
         switch field {
         case .to:
-            toText = newText
-            draft.to = parseEmails(newText)
+            if !toTokens.contains(where: { $0.email.lowercased() == suggestion.email.lowercased() }) {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    toTokens.append(token)
+                }
+            }
+            toInputText = ""
         case .cc:
-            ccText = newText
-            draft.cc = parseEmails(newText)
+            if !ccTokens.contains(where: { $0.email.lowercased() == suggestion.email.lowercased() }) {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    ccTokens.append(token)
+                }
+            }
+            ccInputText = ""
         case .bcc:
-            bccText = newText
-            draft.bcc = parseEmails(newText)
+            if !bccTokens.contains(where: { $0.email.lowercased() == suggestion.email.lowercased() }) {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    bccTokens.append(token)
+                }
+            }
+            bccInputText = ""
         }
         
         // Clear suggestions
@@ -601,7 +632,50 @@ struct EmailComposeView: View {
         hoveredSuggestionId = nil
     }
     
-    /// First letter for the avatar circle.
+    /// All email addresses currently in To/Cc/Bcc tokens (lowercased), used to filter suggestions.
+    private func allExistingRecipientEmails() -> Set<String> {
+        Set(
+            (toTokens.map(\.email) + ccTokens.map(\.email) + bccTokens.map(\.email))
+                .map { $0.lowercased() }
+        )
+    }
+    
+    /// Auto-commit any text left in the recipient input fields (e.g., user typed but didn't press Enter).
+    private func commitPendingRecipients() {
+        // Commit To input
+        let toEmail = toInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !toEmail.isEmpty {
+            if !toTokens.contains(where: { $0.email.lowercased() == toEmail.lowercased() }) {
+                toTokens.append(RecipientToken(email: toEmail))
+            }
+            toInputText = ""
+        }
+        
+        // Commit Cc input
+        let ccEmail = ccInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ccEmail.isEmpty {
+            if !ccTokens.contains(where: { $0.email.lowercased() == ccEmail.lowercased() }) {
+                ccTokens.append(RecipientToken(email: ccEmail))
+            }
+            ccInputText = ""
+        }
+        
+        // Commit Bcc input
+        let bccEmail = bccInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !bccEmail.isEmpty {
+            if !bccTokens.contains(where: { $0.email.lowercased() == bccEmail.lowercased() }) {
+                bccTokens.append(RecipientToken(email: bccEmail))
+            }
+            bccInputText = ""
+        }
+        
+        // Sync draft
+        draft.to = toTokens.map(\.email)
+        draft.cc = ccTokens.map(\.email)
+        draft.bcc = bccTokens.map(\.email)
+    }
+    
+    /// First letter for the avatar circle in the suggestion dropdown.
     private func contactInitial(for suggestion: ContactSuggestion) -> String {
         if !suggestion.name.isEmpty {
             return String(suggestion.name.prefix(1)).uppercased()
@@ -690,8 +764,16 @@ struct EmailComposeView: View {
                     
                     // Try to fill in recipient if suggested
                     if !composed.suggestedTo.isEmpty && composed.suggestedTo.contains("@") {
-                        toText = composed.suggestedTo
-                        draft.to = parseEmails(composed.suggestedTo)
+                        let emails = composed.suggestedTo
+                            .components(separatedBy: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                        for email in emails {
+                            if !toTokens.contains(where: { $0.email.lowercased() == email.lowercased() }) {
+                                toTokens.append(RecipientToken(email: email))
+                            }
+                        }
+                        draft.to = toTokens.map(\.email)
                     }
                     
                     isAIGenerating = false
@@ -830,15 +912,9 @@ struct EmailComposeView: View {
     
     // MARK: - Helpers
     
-    private func parseEmails(_ text: String) -> [String] {
-        text.components(separatedBy: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-    }
-    
     private var canSend: Bool {
-        !draft.to.isEmpty &&
-        draft.to.allSatisfy { $0.contains("@") } &&
+        !toTokens.isEmpty &&
+        toTokens.allSatisfy { $0.email.contains("@") } &&
         !draft.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     
