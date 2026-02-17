@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 extension Notification.Name {
     static let emailComposeToolbarAction = Notification.Name("emailComposeToolbarAction")
+    static let emailComposeSaveAndClose = Notification.Name("emailComposeSaveAndClose")
 }
 
 enum EmailComposeToolbarAction: String {
@@ -63,6 +64,13 @@ struct EmailComposeView: View {
     @State private var activeRecipientField: RecipientField?
     @State private var searchTask: Task<Void, Never>?
     @State private var hoveredSuggestionId: String?
+    @State private var selectedSuggestionIndex: Int = -1
+    
+    // Draft auto-save state
+    @State private var autoSaveTask: Task<Void, Never>?
+    @State private var hasUnsavedChanges: Bool = false
+    @State private var isSavingDraft: Bool = false
+    @State private var lastSavedDraftSnapshot: String = ""
     
     let mode: Mode
     let quotedMessage: GmailMessage?
@@ -151,11 +159,16 @@ struct EmailComposeView: View {
                     placeholder: "Recipients",
                     onSearchQueryChanged: { query in
                         onRecipientInputChanged(field: .to, text: query)
+                    },
+                    onKeyboardNavigation: { event in
+                        handleSuggestionKeyboard(event)
                     }
                 )
                 .onChange(of: toTokens) { _, _ in
                     draft.to = toTokens.map(\.email)
                 }
+                
+                Spacer(minLength: 8)
                 
                 HStack(spacing: 12) {
                     if !showCcField {
@@ -172,14 +185,15 @@ struct EmailComposeView: View {
                     }
                 }
             }
-            
-            // Inline suggestion dropdown for To field
-            if activeRecipientField == .to && !contactSuggestions.isEmpty {
-                suggestionDropdownView
-                    .padding(.leading, 75)
-                    .padding(.trailing, 20)
-                    .padding(.vertical, 2)
+            .overlay(alignment: .topLeading) {
+                if activeRecipientField == .to && !contactSuggestions.isEmpty {
+                    GeometryReader { geo in
+                        suggestionDropdownView
+                            .offset(x: 75, y: geo.size.height + 2)
+                    }
+                }
             }
+            .zIndex(activeRecipientField == .to ? 10 : 1)
             
             // — Cc (shown on toggle or pre-filled) —
             if showCcField {
@@ -196,6 +210,9 @@ struct EmailComposeView: View {
                         placeholder: "",
                         onSearchQueryChanged: { query in
                             onRecipientInputChanged(field: .cc, text: query)
+                        },
+                        onKeyboardNavigation: { event in
+                            handleSuggestionKeyboard(event)
                         }
                     )
                     .onChange(of: ccTokens) { _, _ in
@@ -204,14 +221,15 @@ struct EmailComposeView: View {
                     
                     Spacer()
                 }
-                
-                // Inline suggestion dropdown for Cc field
-                if activeRecipientField == .cc && !contactSuggestions.isEmpty {
-                    suggestionDropdownView
-                        .padding(.leading, 75)
-                        .padding(.trailing, 20)
-                        .padding(.vertical, 2)
+                .overlay(alignment: .topLeading) {
+                    if activeRecipientField == .cc && !contactSuggestions.isEmpty {
+                        GeometryReader { geo in
+                            suggestionDropdownView
+                                .offset(x: 75, y: geo.size.height + 2)
+                        }
+                    }
                 }
+                .zIndex(activeRecipientField == .cc ? 10 : 1)
             }
             
             // — Bcc (shown on toggle or pre-filled) —
@@ -229,6 +247,9 @@ struct EmailComposeView: View {
                         placeholder: "",
                         onSearchQueryChanged: { query in
                             onRecipientInputChanged(field: .bcc, text: query)
+                        },
+                        onKeyboardNavigation: { event in
+                            handleSuggestionKeyboard(event)
                         }
                     )
                     .onChange(of: bccTokens) { _, _ in
@@ -237,14 +258,15 @@ struct EmailComposeView: View {
                     
                     Spacer()
                 }
-                
-                // Inline suggestion dropdown for Bcc field
-                if activeRecipientField == .bcc && !contactSuggestions.isEmpty {
-                    suggestionDropdownView
-                        .padding(.leading, 75)
-                        .padding(.trailing, 20)
-                        .padding(.vertical, 2)
+                .overlay(alignment: .topLeading) {
+                    if activeRecipientField == .bcc && !contactSuggestions.isEmpty {
+                        GeometryReader { geo in
+                            suggestionDropdownView
+                                .offset(x: 75, y: geo.size.height + 2)
+                        }
+                    }
                 }
+                .zIndex(activeRecipientField == .bcc ? 10 : 1)
             }
             
             rowDivider()
@@ -332,6 +354,19 @@ struct EmailComposeView: View {
         .background(Color.clear)
         .task {
             await gmail.loadContactCacheIfNeeded()
+            lastSavedDraftSnapshot = draftSnapshot
+            syncActiveDraft()
+        }
+        .onDisappear {
+            autoSaveTask?.cancel()
+        }
+        .onChange(of: draft.subject) { _, _ in scheduleDraftAutoSave() }
+        .onChange(of: draft.body) { _, _ in scheduleDraftAutoSave() }
+        .onChange(of: toTokens) { _, _ in scheduleDraftAutoSave() }
+        .onChange(of: ccTokens) { _, _ in scheduleDraftAutoSave() }
+        .onChange(of: bccTokens) { _, _ in scheduleDraftAutoSave() }
+        .onReceive(NotificationCenter.default.publisher(for: .emailComposeSaveAndClose)) { _ in
+            saveDraftNow()
         }
         .onReceive(NotificationCenter.default.publisher(for: .emailComposeToolbarAction)) { notification in
             guard let rawAction = notification.userInfo?["action"] as? String,
@@ -345,7 +380,7 @@ struct EmailComposeView: View {
             case .attach:
                 pickFiles()
             case .discard:
-                onDismiss?()
+                discardDraft()
             case .send:
                 sendDraft()
             }
@@ -431,6 +466,7 @@ struct EmailComposeView: View {
             
             let wasSent = await gmail.sendEmail(finalDraft)
             if wasSent {
+                gmail.activeDraft = nil
                 if let onSent {
                     onSent()
                 } else {
@@ -438,6 +474,97 @@ struct EmailComposeView: View {
                 }
             }
         }
+    }
+    
+    // MARK: - Draft Auto-Save
+    
+    /// A snapshot string used to detect if the draft has actually changed since last save.
+    private var draftSnapshot: String {
+        "\(draft.to.joined())\(draft.cc.joined())\(draft.bcc.joined())\(draft.subject)\(draft.body)"
+    }
+    
+    /// Keep the GmailService.activeDraft in sync with the local compose state.
+    private func syncActiveDraft() {
+        var d = draft
+        d.to = toTokens.map(\.email)
+        d.cc = ccTokens.map(\.email)
+        d.bcc = bccTokens.map(\.email)
+        gmail.activeDraft = d
+        gmail.activeComposeMode = {
+            switch mode {
+            case .newEmail: return .newEmail
+            case .reply: return .reply
+            case .replyAll: return .replyAll
+            case .forward: return .forward
+            }
+        }()
+        gmail.activeQuotedMessage = quotedMessage
+    }
+    
+    /// Schedule a debounced auto-save after the user edits any field.
+    private func scheduleDraftAutoSave() {
+        // Sync tokens into draft
+        draft.to = toTokens.map(\.email)
+        draft.cc = ccTokens.map(\.email)
+        draft.bcc = bccTokens.map(\.email)
+        syncActiveDraft()
+        
+        autoSaveTask?.cancel()
+        autoSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+            guard !Task.isCancelled else { return }
+            await performDraftSave()
+        }
+    }
+    
+    /// Save the current draft to Gmail immediately (e.g. on navigate-away).
+    /// Does NOT sync back to activeDraft — the caller is responsible for clearing it.
+    func saveDraftNow() {
+        commitPendingRecipients()
+        autoSaveTask?.cancel()
+        Task {
+            await performDraftSave()
+        }
+    }
+    
+    /// Performs the actual draft save via the Gmail API.
+    private func performDraftSave() async {
+        let currentSnapshot = draftSnapshot
+        guard currentSnapshot != lastSavedDraftSnapshot else { return }
+        guard draft.hasMeaningfulContent else { return }
+        
+        isSavingDraft = true
+        
+        if let result = await gmail.createOrUpdateDraft(draft) {
+            await MainActor.run {
+                draft.gmailDraftId = result.draftId
+                draft.gmailMessageId = result.messageId
+                lastSavedDraftSnapshot = currentSnapshot
+                isSavingDraft = false
+            }
+        } else {
+            await MainActor.run {
+                isSavingDraft = false
+            }
+        }
+    }
+    
+    /// Discard the compose view and delete the server-side draft if it exists.
+    private func discardDraft() {
+        autoSaveTask?.cancel()
+        let draftId = draft.gmailDraftId
+        let accountId = draft.accountId
+        gmail.activeDraft = nil
+        gmail.activeComposeMode = nil
+        gmail.activeQuotedMessage = nil
+        
+        if let draftId {
+            Task {
+                await gmail.deleteDraft(draftId: draftId, fromAccountId: accountId)
+            }
+        }
+        
+        onDismiss?()
     }
     
     /// Strips HTML tags and decodes common entities to produce a plain text version.
@@ -510,10 +637,19 @@ struct EmailComposeView: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .background(hoveredSuggestionId == suggestion.id ? Theme.sidebarSelection : Color.clear)
+                .background(
+                    index == selectedSuggestionIndex || hoveredSuggestionId == suggestion.id
+                        ? Theme.sidebarSelection
+                        : Color.clear
+                )
                 .contentShape(Rectangle())
                 .onHover { isHovered in
-                    hoveredSuggestionId = isHovered ? suggestion.id : nil
+                    if isHovered {
+                        hoveredSuggestionId = suggestion.id
+                        selectedSuggestionIndex = index
+                    } else {
+                        hoveredSuggestionId = nil
+                    }
                 }
                 .onTapGesture {
                     selectSuggestion(suggestion)
@@ -546,10 +682,12 @@ struct EmailComposeView: View {
         guard !query.isEmpty else {
             contactSuggestions = []
             activeRecipientField = nil
+            selectedSuggestionIndex = -1
             return
         }
         
         activeRecipientField = field
+        selectedSuggestionIndex = -1
         let existingEmails = allExistingRecipientEmails()
         
         // 1. Instant local cache results (no debounce)
@@ -630,6 +768,35 @@ struct EmailComposeView: View {
         contactSuggestions = []
         activeRecipientField = nil
         hoveredSuggestionId = nil
+        selectedSuggestionIndex = -1
+    }
+    
+    /// Handles arrow-key and Enter navigation within the suggestion dropdown.
+    /// Returns `true` if the event was consumed.
+    private func handleSuggestionKeyboard(_ event: RecipientTokenField.KeyboardNavigationEvent) -> Bool {
+        let maxIndex = min(contactSuggestions.count, 5) - 1
+        guard maxIndex >= 0 else { return false }
+        
+        switch event {
+        case .arrowDown:
+            if selectedSuggestionIndex < maxIndex {
+                selectedSuggestionIndex += 1
+            } else {
+                selectedSuggestionIndex = 0
+            }
+            return true
+        case .arrowUp:
+            if selectedSuggestionIndex > 0 {
+                selectedSuggestionIndex -= 1
+            } else {
+                selectedSuggestionIndex = maxIndex
+            }
+            return true
+        case .enterSelection:
+            guard selectedSuggestionIndex >= 0, selectedSuggestionIndex <= maxIndex else { return false }
+            selectSuggestion(contactSuggestions[selectedSuggestionIndex])
+            return true
+        }
     }
     
     /// All email addresses currently in To/Cc/Bcc tokens (lowercased), used to filter suggestions.

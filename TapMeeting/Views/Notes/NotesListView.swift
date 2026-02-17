@@ -17,6 +17,7 @@ struct NotesListView: View {
     @State private var calendarViewMode: CalendarViewMode = .week
     @State private var calendarCurrentDate: Date = .now
     @State private var showCalendarSelector = false
+    @State private var showCreateCalendarEvent = false
     
     @State private var showNewPopover = false
     
@@ -26,11 +27,13 @@ struct NotesListView: View {
     
     enum SidebarTab: Hashable {
         case home
+        case nest
         case meetings
         case calendar
         case todos
         case email
         case appleNotes
+        case pipeline
         case settings
         case folder(UUID?)
         case note(UUID)
@@ -69,7 +72,7 @@ struct NotesListView: View {
             }
             .animation(.easeInOut(duration: 0.25), value: isSidebarCollapsed)
 
-            if sidebarTab == .home {
+            if sidebarTab == .home || sidebarTab == .nest {
                 VStack {
                     Spacer()
                     FloatingSemanticSearchBar()
@@ -106,8 +109,6 @@ struct NotesListView: View {
                     .buttonStyle(.plain)
                     .help("Go to Home")
                     .padding(.leading, isSidebarCollapsed ? 0 : 104)
-                    
-                    newButtonView
                     
                     // Email: account filter — shown on Email tab with multiple accounts
                     if sidebarTab == .email, appState.gmailService.isConnected,
@@ -166,8 +167,19 @@ struct NotesListView: View {
                         MeetingControlButtons()
                     }
                     
-                    // Email: refresh — shown on Email tab
+                    // Email: refresh + attachments — shown on Email tab
                     if sidebarTab == .email, appState.gmailService.isConnected {
+                        Button {
+                            NotificationCenter.default.post(name: .emailAttachmentsToggle, object: nil)
+                        } label: {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(Theme.textPrimary)
+                                .frame(width: 28, height: 28)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Attachments")
+                        
                         Button {
                             Task { await appState.gmailService.fetchMailbox(appState.gmailService.currentMailbox) }
                         } label: {
@@ -209,6 +221,23 @@ struct NotesListView: View {
                         .cornerRadius(6)
 
                         Button {
+                            showCreateCalendarEvent = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 11, weight: .semibold))
+                                Text("New Event")
+                                    .font(.system(size: 12, weight: .medium))
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Theme.olive)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
                             showCalendarSelector.toggle()
                         } label: {
                             HStack(spacing: 4) {
@@ -248,6 +277,10 @@ struct NotesListView: View {
             }
         }
         .toolbarBackground(.hidden, for: .windowToolbar)
+        .popover(isPresented: $showCreateCalendarEvent, arrowEdge: .bottom) {
+            CalendarCreateEventView()
+                .environment(appState)
+        }
         // Email compose is now handled inside EmailView
         .onReceive(NotificationCenter.default.publisher(for: .quickNote)) { _ in
             startNewMeeting()
@@ -586,6 +619,25 @@ struct NotesListView: View {
                 onNewNote: { startNewMeeting() },
                 onNewStandaloneNote: { startNewStandaloneNote() }
             )
+        case .nest:
+            NestHomeView(
+                isSidebarCollapsed: $isSidebarCollapsed,
+                onSelectNote: { id in tabBeforeNote = .nest; sidebarTab = .note(id) },
+                onNewNote: { startNewMeeting() },
+                onNavigateToTodos: { sidebarTab = .todos },
+                onNavigateToEmail: { sidebarTab = .email },
+                onSelectEmailThread: { threadId in
+                    let gmail = appState.gmailService
+                    // Find the thread across all mailboxes and select it
+                    if let thread = gmail.inboxThreads.first(where: { $0.id == threadId })
+                        ?? gmail.sentThreads.first(where: { $0.id == threadId }) {
+                        gmail.currentMailbox = .inbox
+                        gmail.selectedThread = thread
+                        gmail.selectedMessageId = thread.latestMessage?.id
+                    }
+                    sidebarTab = .email
+                }
+            )
         case .meetings:
             MeetingsContentView(
                 isSidebarCollapsed: $isSidebarCollapsed,
@@ -663,6 +715,8 @@ struct NotesListView: View {
                 isSidebarCollapsed: $isSidebarCollapsed,
                 onSelectNote: { id in tabBeforeNote = .tag(tagId); sidebarTab = .note(id) }
             )
+        case .pipeline:
+            RAGPipelineDashboardView(isSidebarCollapsed: $isSidebarCollapsed)
         case .settings:
             SettingsContentView(isSidebarCollapsed: $isSidebarCollapsed)
         }
@@ -773,6 +827,14 @@ private struct NoteSidebar: View {
             }
             
             SidebarItem(
+                icon: "bird.fill",
+                label: "Nest",
+                isSelected: isNestSelected
+            ) {
+                selectedTab = .nest
+            }
+            
+            SidebarItem(
                 icon: "calendar.badge.clock",
                 label: "Meetings",
                 isSelected: isMeetingsSelected
@@ -814,6 +876,15 @@ private struct NoteSidebar: View {
                 badge: appState.appleNotesService.notes.count
             ) {
                 selectedTab = .appleNotes
+            }
+
+            SidebarItem(
+                icon: "chart.bar.doc.horizontal",
+                label: "Pipeline",
+                isSelected: isPipelineSelected,
+                badge: appState.searchTelemetryService.pipelineErrors.count
+            ) {
+                selectedTab = .pipeline
             }
             
             // Folders section
@@ -971,6 +1042,11 @@ private struct NoteSidebar: View {
         return false
     }
     
+    private var isNestSelected: Bool {
+        if case .nest = selectedTab { return true }
+        return false
+    }
+    
     private var isMeetingsSelected: Bool {
         if case .meetings = selectedTab { return true }
         return false
@@ -998,6 +1074,11 @@ private struct NoteSidebar: View {
 
     // Calendar helpers removed — they live on NotesListView where the @State vars are.
     
+    private var isPipelineSelected: Bool {
+        if case .pipeline = selectedTab { return true }
+        return false
+    }
+
     private var isSettingsSelected: Bool {
         if case .settings = selectedTab { return true }
         return false

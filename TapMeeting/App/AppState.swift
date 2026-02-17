@@ -53,11 +53,10 @@ final class AppState {
                 Task {
                     await googleCalendarService.fetchAllCalendars()
                     await googleCalendarService.fetchEvents()
+                    await prefetchCalendarWeekEvents()
                 }
-                Task {
-                    await gmailService.fetchMessages()
-                    gmailService.startPolling()
-                }
+                startCalendarBackgroundRefresh()
+                startGmailBootstrapIfNeeded()
             }
         }
     }
@@ -107,6 +106,10 @@ final class AppState {
     let browserMonitorService = BrowserMonitorService()
     let appleNotesService = AppleNotesService()
     
+    // MARK: - Nest Services (persisted across tab switches)
+    private(set) var nestHomeService: NestHomeService?
+    let nestAIService = NestAIService()
+    
     /// Meeting HUD — managed directly by AppState.
     private var meetingHUD: MeetingHUDController?
     
@@ -127,6 +130,13 @@ final class AppState {
     
     /// Background timer that polls for new to-dos every 20 seconds.
     private var todoPollingTimer: Timer?
+    
+    /// Background timer that refreshes calendar events every 60 seconds,
+    /// regardless of which tab is active, so the calendar tab loads instantly.
+    private var calendarRefreshTimer: Timer?
+    
+    /// Ensures launch/auth Gmail bootstrap fetch only starts once.
+    private var hasBootstrappedGmailLaunchFetch = false
     
     /// Whether a to-do scan is currently in progress (drives UI indicator).
     var isTodoScanning = false
@@ -184,23 +194,35 @@ final class AppState {
         // Wire Gmail → Calendar so adding an account covers both services
         gmailService.googleCalendarService = googleCalendarService
         
-        // When Google events arrive, refresh the merged calendar list
+        // When Google events arrive, refresh the merged calendar list + index for search
         googleCalendarService.onEventsFetched = { [weak self] in
             self?.calendarService.fetchUpcomingEvents()
+            // Incremental calendar indexing
+            guard let self, let ingestion = self.searchIngestionService else { return }
+            let events = self.calendarService.upcomingEvents
+            Task {
+                for event in events {
+                    do {
+                        try await ingestion.indexCalendarEvent(event)
+                    } catch {
+                        self.searchTelemetryService.recordError(
+                            component: "calendar_indexing",
+                            message: error.localizedDescription,
+                            context: ["event_id": event.id, "title": event.title]
+                        )
+                    }
+                }
+            }
         }
         
-        // Fetch Google Calendar events on launch if any accounts are connected
+        // Fetch Google Calendar events on launch if any accounts are connected,
+        // including the current week range so the calendar tab loads instantly.
         if !googleCalendarService.accounts.isEmpty {
             Task {
                 await googleCalendarService.fetchAllCalendars()
                 await googleCalendarService.fetchEvents()
+                await prefetchCalendarWeekEvents()
             }
-        }
-        
-        // Fetch Gmail messages on launch if any accounts are connected, then start polling
-        if !gmailService.accounts.isEmpty {
-            Task { await gmailService.fetchMessages() }
-            gmailService.startPolling()
         }
         
         // Show macOS notification when new emails arrive + extract to-dos
@@ -208,20 +230,62 @@ final class AppState {
             self?.notificationService.sendNewEmailNotification(threads: threads)
             Task { await self?.extractTodosFromNewEmails(threads: threads) }
         }
+        
+        // Fetch Gmail messages on launch if any accounts are connected, then start polling.
+        // Callback is wired first so behaviour is deterministic.
+        startGmailBootstrapIfNeeded()
 
         noteRepository.onNoteChanged = { [weak self] note in
             guard let self, let ingestion = self.searchIngestionService else { return }
-            Task { try? await ingestion.indexNote(note) }
+            Task {
+                do {
+                    try await ingestion.indexNote(note)
+                } catch {
+                    self.searchTelemetryService.recordError(
+                        component: "note_indexing",
+                        message: error.localizedDescription,
+                        context: ["note_id": note.id.uuidString, "title": note.title]
+                    )
+                }
+            }
         }
         noteRepository.onTranscriptSaved = { [weak self] note, utterances in
             guard let self, let ingestion = self.searchIngestionService else { return }
-            Task { try? await ingestion.indexTranscript(for: note, utterances: utterances) }
+            Task {
+                do {
+                    try await ingestion.indexTranscript(for: note, utterances: utterances)
+                } catch {
+                    self.searchTelemetryService.recordError(
+                        component: "transcript_indexing",
+                        message: error.localizedDescription,
+                        context: ["note_id": note.id.uuidString, "title": note.title]
+                    )
+                }
+            }
         }
         gmailService.onThreadsFetched = { [weak self] _, threads in
             guard let self, let ingestion = self.searchIngestionService else { return }
+            let selectedAccountIds = Set(
+                UserDefaults.standard.stringArray(forKey: Constants.Defaults.backfillEmailAccountIds) ?? []
+            )
+            // Only index threads from selected accounts
+            guard !selectedAccountIds.isEmpty else { return }
+            let emailDays = UserDefaults.standard.integer(forKey: Constants.Defaults.backfillEmailDays)
+            let days = emailDays > 0 ? emailDays : Constants.Backfill.defaultEmailDays
+            let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: .now) ?? .distantPast
+
             Task {
                 for thread in threads {
-                    try? await ingestion.indexEmailThread(thread)
+                    guard selectedAccountIds.contains(thread.accountId), thread.date >= cutoff else { continue }
+                    do {
+                        try await ingestion.indexEmailThread(thread)
+                    } catch {
+                        self.searchTelemetryService.recordError(
+                            component: "email_indexing",
+                            message: error.localizedDescription,
+                            context: ["thread_id": thread.id, "subject": thread.subject]
+                        )
+                    }
                 }
             }
         }
@@ -237,6 +301,9 @@ final class AppState {
         
         // Start calendar reminder monitoring
         startReminderMonitoring()
+        
+        // Start calendar background refresh (every 60s) so the calendar tab is always warm
+        startCalendarBackgroundRefresh()
         
         // Start to-do background polling (every 20s)
         startTodoPolling()
@@ -783,9 +850,9 @@ final class AppState {
                 conversationHistory: semanticChatMessages
             )
 
-            // 3. Retrieval done — append empty assistant message and stop thinking indicator
+            // 3. Retrieval done — append empty assistant message (streaming) and stop thinking indicator
             semanticChatMessages.append(
-                SemanticChatMessage(role: .assistant, content: "", citations: citations)
+                SemanticChatMessage(role: .assistant, content: "", citations: citations, isStreaming: true)
             )
             let messageIndex = semanticChatMessages.count - 1
             isSemanticLoading = false
@@ -795,7 +862,8 @@ final class AppState {
                 semanticChatMessages[messageIndex].content += delta
             }
 
-            // 5. Final state update
+            // 5. Streaming complete — mark message as done
+            semanticChatMessages[messageIndex].isStreaming = false
             semanticAnswer = semanticChatMessages[messageIndex].content
             semanticCitations = citations
 
@@ -844,19 +912,57 @@ final class AppState {
         self.searchIngestionService = ingestion
         self.searchEvaluationService = SearchEvaluationService(searchService: semanticSearch, telemetry: searchTelemetryService)
     }
+    
+    private func startGmailBootstrapIfNeeded() {
+        guard !hasBootstrappedGmailLaunchFetch else { return }
+        guard !gmailService.accounts.isEmpty else { return }
+        hasBootstrappedGmailLaunchFetch = true
+        Task { await gmailService.fetchMessages() }
+        gmailService.startPolling()
+    }
 
     func runSemanticBackfillIfNeeded() async {
         guard let ingestion = searchIngestionService else { return }
-        await gmailService.fetchMailbox(.inbox)
-        await gmailService.fetchMailbox(.sent)
+        if gmailService.inboxThreads.isEmpty {
+            await gmailService.fetchMailbox(.inbox)
+        }
+        if gmailService.sentThreads.isEmpty {
+            await gmailService.fetchMailbox(.sent)
+        }
         calendarService.fetchUpcomingEvents()
         let (notes, threads, events) = await MainActor.run {
             let n = noteRepository.fetchAllNotes()
-            let t = gmailService.allThreads()
+            let allThreads = gmailService.allThreads()
             let e = calendarService.upcomingEvents
-            return (n, t, e)
+
+            // Filter email threads by selected accounts (if any are selected)
+            let selectedAccountIds = Set(
+                UserDefaults.standard.stringArray(forKey: Constants.Defaults.backfillEmailAccountIds) ?? []
+            )
+            let emailDays = UserDefaults.standard.integer(forKey: Constants.Defaults.backfillEmailDays)
+            let days = emailDays > 0 ? emailDays : Constants.Backfill.defaultEmailDays
+            let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: .now) ?? .distantPast
+
+            let filtered: [GmailThread]
+            if selectedAccountIds.isEmpty {
+                // No accounts selected → skip email backfill entirely
+                filtered = []
+            } else {
+                filtered = allThreads.filter { thread in
+                    selectedAccountIds.contains(thread.accountId) && thread.date >= cutoff
+                }
+            }
+
+            return (n, filtered, e)
         }
         await ingestion.runMandatoryBackfill(notes: notes, threads: threads, calendarEvents: events)
+    }
+
+    /// Clears backfill state and re-indexes all content from scratch.
+    func triggerFullReindex() async {
+        guard let ingestion = searchIngestionService else { return }
+        ingestion.triggerReindex()
+        await runSemanticBackfillIfNeeded()
     }
 
     func runSemanticEvaluationSuite() async -> [SearchEvaluationResult] {
@@ -1253,6 +1359,45 @@ final class AppState {
         controller.show(event: event)
     }
     
+    // MARK: - Calendar Background Refresh
+    
+    /// Pre-fetch the current week's calendar events so the calendar tab
+    /// loads instantly without waiting for API calls.
+    private func prefetchCalendarWeekEvents() async {
+        let cal = Foundation.Calendar.current
+        let now = Date.now
+        let weekday = cal.component(.weekday, from: now)
+        let weekStart = cal.date(byAdding: .day, value: -(weekday - cal.firstWeekday), to: cal.startOfDay(for: now))!
+        let weekEnd = cal.date(byAdding: .day, value: 7, to: weekStart)!
+        
+        _ = await googleCalendarService.fetchEventsForRange(start: weekStart, end: weekEnd)
+        print("[AppState] Pre-fetched calendar events for current week")
+    }
+    
+    /// Start a 60-second timer that refreshes calendar events in the background
+    /// regardless of which tab is active. Keeps the event cache warm so the
+    /// calendar tab always opens instantly with fresh data.
+    private func startCalendarBackgroundRefresh() {
+        calendarRefreshTimer?.invalidate()
+        let timer = Timer(timeInterval: 60.0, repeats: true) { [weak self] _ in
+            guard let self, self.googleCalendarService.isConnected else { return }
+            Task {
+                // Refresh the 24h events used by reminders/MenuBar
+                await self.googleCalendarService.fetchEvents()
+                // Force-refresh the current week so the cache is always fresh
+                let cal = Foundation.Calendar.current
+                let now = Date.now
+                let weekday = cal.component(.weekday, from: now)
+                let weekStart = cal.date(byAdding: .day, value: -(weekday - cal.firstWeekday), to: cal.startOfDay(for: now))!
+                let weekEnd = cal.date(byAdding: .day, value: 7, to: weekStart)!
+                _ = await self.googleCalendarService.fetchEventsForRange(start: weekStart, end: weekEnd, forceRefresh: true)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        calendarRefreshTimer = timer
+        print("[AppState] Calendar background refresh started (every 60s)")
+    }
+    
     // MARK: - To-Do Background Polling
     
     /// Start a 20-second timer that scans for unprocessed email threads
@@ -1362,6 +1507,23 @@ final class AppState {
         // Persist processed IDs
         let trimmed = Array(newProcessedIds.suffix(500))
         UserDefaults.standard.set(trimmed, forKey: Constants.Defaults.processedTodoEmailMessageIds)
+    }
+    
+    // MARK: - Nest Home
+    
+    /// Lazily create the Nest Home service on first access.
+    @MainActor
+    func ensureNestHomeService() -> NestHomeService {
+        if let existing = nestHomeService { return existing }
+        let service = NestHomeService(
+            calendarService: calendarService,
+            googleCalendarService: googleCalendarService,
+            gmailService: gmailService,
+            todoRepository: todoRepository,
+            noteRepository: noteRepository
+        )
+        nestHomeService = service
+        return service
     }
     
     // MARK: - Automated Sender Detection

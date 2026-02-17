@@ -149,7 +149,7 @@ private struct MenuBarLabel: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Image(systemName: "waveform")
+            Image(systemName: "bird.fill")
                 .symbolRenderingMode(.hierarchical)
 
             if isRecording {

@@ -8,7 +8,8 @@
       "Bash(gem list:*)",
       "Bash(ruby -e:*)",
       "Bash(gem install:*)",
-      "Bash(ruby:*)"
+      "Bash(ruby:*)",
+      "Bash(find:*)"
     ]
   }
 }

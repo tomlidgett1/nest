@@ -19,6 +19,11 @@ struct CalendarView: View {
     @State private var calendarEvents: [CalendarEvent] = []
     @State private var isLoading = false
 
+    // Drag-to-create state
+    @State private var showDragCreate = false
+    @State private var dragCreateStart: Date = .now
+    @State private var dragCreateEnd: Date = .now
+
     /// 10-second auto-refresh timer for new calendar invites.
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
 
@@ -62,7 +67,13 @@ struct CalendarView: View {
                     weekStart: weekStart,
                     events: visibleEvents,
                     selectedEvent: $selectedEvent,
-                    calendars: calendar.calendars
+                    calendars: calendar.calendars,
+                    onDragCreate: { start, end in
+                        dragCreateStart = start
+                        dragCreateEnd = end
+                        selectedEvent = nil
+                        showDragCreate = true
+                    }
                 )
             case .month:
                 CalendarMonthView(
@@ -88,6 +99,16 @@ struct CalendarView: View {
         .popover(item: $selectedEvent, arrowEdge: .trailing) { event in
             CalendarEventPopover(event: event, calendars: calendar.calendars)
                 .frame(width: 340)
+        }
+        .popover(isPresented: $showDragCreate, arrowEdge: .trailing) {
+            CalendarCreateEventView(
+                initialStart: dragCreateStart,
+                initialEnd: dragCreateEnd,
+                onCreated: {
+                    Task { await loadEvents(forceRefresh: true) }
+                }
+            )
+            .environment(appState)
         }
     }
 

@@ -8,6 +8,7 @@ extension Notification.Name {
     static let emailReplyModeChanged = Notification.Name("emailReplyModeChanged")
     static let emailComposeToggle = Notification.Name("emailComposeToggle")
     static let emailMailboxChanged = Notification.Name("emailMailboxChanged")
+    static let emailAttachmentsToggle = Notification.Name("emailAttachmentsToggle")
 }
 
 enum EmailDetailToolbarAction: String {
@@ -75,6 +76,13 @@ struct EmailDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
         .onChange(of: selectedThreadId) { _, _ in
+            // Save reply draft before switching threads, then clear all active state
+            if isInComposeMode {
+                NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+                gmail.activeDraft = nil
+                gmail.activeComposeMode = nil
+                gmail.activeQuotedMessage = nil
+            }
             showReply = false
             showReplyAll = false
             showForward = false
@@ -255,42 +263,54 @@ struct EmailDetailView: View {
                 ScrollView {
                     inlineComposeView(
                         draft: {
-                            var d = replyDraft(for: latest)
+                            var d = activeDraftForCurrentThread(mode: .reply) ?? replyDraft(for: latest)
                             if !aiDraftBody.isEmpty { d.body = aiDraftBody }
                             return d
                         }(),
                         mode: .reply,
                         quotedMessage: latest,
-                        onDismiss: { showReply = false; aiDraftBody = "" }
+                        onDismiss: {
+                            NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+                            showReply = false; aiDraftBody = ""
+                        }
                     )
                     .padding(.bottom, 20)
                 }
+                .scrollClipDisabled()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if showReplyAll, let latest {
                 ScrollView {
                     inlineComposeView(
                         draft: {
-                            var d = replyAllDraft(for: latest)
+                            var d = activeDraftForCurrentThread(mode: .replyAll) ?? replyAllDraft(for: latest)
                             if !aiDraftBody.isEmpty { d.body = aiDraftBody }
                             return d
                         }(),
                         mode: .replyAll,
                         quotedMessage: latest,
-                        onDismiss: { showReplyAll = false; aiDraftBody = "" }
+                        onDismiss: {
+                            NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+                            showReplyAll = false; aiDraftBody = ""
+                        }
                     )
                     .padding(.bottom, 20)
                 }
+                .scrollClipDisabled()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if showForward, let latest {
                 ScrollView {
                     inlineComposeView(
-                        draft: forwardDraft(for: latest),
+                        draft: activeDraftForCurrentThread(mode: .forward) ?? forwardDraft(for: latest),
                         mode: .forward,
                         quotedMessage: latest,
-                        onDismiss: { showForward = false }
+                        onDismiss: {
+                            NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+                            showForward = false
+                        }
                     )
                     .padding(.bottom, 20)
                 }
+                .scrollClipDisabled()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 // Conversation view — AI Draft card appears above emails when active
@@ -689,6 +709,26 @@ struct EmailDetailView: View {
             senderEmail: senderEmailForCurrentThread,
             onDismiss: onDismiss
         )
+    }
+    
+    /// Only return the activeDraft if it matches the current thread AND compose mode.
+    /// Prevents a stale new-email draft from leaking into a reply on a different thread.
+    private func activeDraftForCurrentThread(mode: EmailComposeView.Mode) -> EmailDraft? {
+        guard let active = gmail.activeDraft,
+              let threadId = active.threadId,
+              threadId == gmail.selectedThread?.id else { return nil }
+        
+        let expectedMode: GmailService.ActiveComposeMode = {
+            switch mode {
+            case .reply: return .reply
+            case .replyAll: return .replyAll
+            case .forward: return .forward
+            case .newEmail: return .newEmail
+            }
+        }()
+        
+        guard gmail.activeComposeMode == expectedMode else { return nil }
+        return active
     }
     
     // MARK: - Reply Draft Builders

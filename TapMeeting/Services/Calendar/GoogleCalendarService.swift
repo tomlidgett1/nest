@@ -629,6 +629,151 @@ final class GoogleCalendarService {
         }
     }
 
+    // MARK: - Create Event
+
+    /// Parameters for creating a new calendar event.
+    struct NewEventRequest {
+        var title: String = ""
+        var startDate: Date = .now
+        var endDate: Date = Calendar.current.date(byAdding: .hour, value: 1, to: .now)!
+        var isAllDay: Bool = false
+        var location: String = ""
+        var description: String = ""
+        var attendeeEmails: [String] = []
+        var addGoogleMeet: Bool = false
+        var calendarId: String = "primary"
+        var sendUpdates: String = "all"
+    }
+
+    /// Create a new event on Google Calendar.
+    /// Returns the created CalendarEvent on success, or nil on failure.
+    @discardableResult
+    func createEvent(_ request: NewEventRequest) async -> CalendarEvent? {
+        // Find the account that owns this calendar
+        let ownerAccount: GoogleCalendarAccount? = {
+            if let cal = calendars.first(where: { $0.id == request.calendarId }) {
+                return accounts.first(where: { $0.id == cal.accountId })
+            }
+            return accounts.first
+        }()
+
+        guard let account = ownerAccount,
+              let token = await validAccessToken(for: account) else {
+            print("[GoogleCalendar] No valid account/token for createEvent")
+            return nil
+        }
+
+        // Diagnostic: log which account is being used and verify token scopes
+        print("[GoogleCalendar] createEvent using account: id=\(account.id), email=\(account.email)")
+        if let tokenInfoURL = URL(string: "https://oauth2.googleapis.com/tokeninfo?access_token=\(token)") {
+            if let (tiData, _) = try? await URLSession.shared.data(from: tokenInfoURL),
+               let tiJSON = try? JSONSerialization.jsonObject(with: tiData) as? [String: Any] {
+                print("[GoogleCalendar] Token scopes: \(tiJSON["scope"] ?? "unknown")")
+            }
+        }
+
+        let encodedCalId = request.calendarId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? request.calendarId
+        var urlString = "\(Constants.GoogleCalendar.calendarAPIBase)/calendars/\(encodedCalId)/events"
+        urlString += "?sendUpdates=\(request.sendUpdates)"
+        if request.addGoogleMeet {
+            urlString += "&conferenceDataVersion=1"
+        }
+
+        guard let url = URL(string: urlString) else { return nil }
+
+        // Build the JSON body
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+
+        let tz = TimeZone.current.identifier
+        var body: [String: Any] = [
+            "summary": request.title
+        ]
+
+        if request.isAllDay {
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyy-MM-dd"
+            body["start"] = ["date": dateFormatter.string(from: request.startDate), "timeZone": tz]
+            body["end"] = ["date": dateFormatter.string(from: request.endDate), "timeZone": tz]
+        } else {
+            body["start"] = ["dateTime": iso.string(from: request.startDate), "timeZone": tz]
+            body["end"] = ["dateTime": iso.string(from: request.endDate), "timeZone": tz]
+        }
+
+        if !request.location.isEmpty {
+            body["location"] = request.location
+        }
+        if !request.description.isEmpty {
+            body["description"] = request.description
+        }
+        if !request.attendeeEmails.isEmpty {
+            body["attendees"] = request.attendeeEmails.map { ["email": $0] }
+        }
+        if request.addGoogleMeet {
+            body["conferenceData"] = [
+                "createRequest": [
+                    "requestId": UUID().uuidString,
+                    "conferenceSolutionKey": ["type": "hangoutsMeet"]
+                ]
+            ]
+        }
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.httpBody = jsonData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: urlRequest)
+
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 401 {
+                    if let newToken = await refreshTokenAfterUnauthorised(for: account) {
+                        urlRequest.setValue("Bearer \(newToken)", forHTTPHeaderField: "Authorization")
+                        let (retryData, retryResp) = try await URLSession.shared.data(for: urlRequest)
+                        if let retryHttp = retryResp as? HTTPURLResponse, retryHttp.statusCode >= 200, retryHttp.statusCode < 300 {
+                            let events = parseEventsEnriched(from: wrapSingleEvent(retryData), calendarId: request.calendarId, accountEmail: account.email)
+                            if let created = events.first {
+                                invalidateEventCache()
+                                return created
+                            }
+                        }
+                    }
+                    return nil
+                }
+
+                guard http.statusCode >= 200, http.statusCode < 300 else {
+                    let body = String(data: data, encoding: .utf8) ?? "no body"
+                    print("[GoogleCalendar] Create event failed with status \(http.statusCode): \(body)")
+                    return nil
+                }
+            }
+
+            let events = parseEventsEnriched(from: wrapSingleEvent(data), calendarId: request.calendarId, accountEmail: account.email)
+            if let created = events.first {
+                invalidateEventCache()
+                return created
+            }
+
+            // Even if parsing fails, the event was created successfully — just invalidate cache
+            invalidateEventCache()
+            return nil
+        } catch {
+            print("[GoogleCalendar] Create event failed: \(error)")
+            return nil
+        }
+    }
+
+    /// Wraps a single event JSON response into the list format that parseEventsEnriched expects.
+    private func wrapSingleEvent(_ data: Data) -> Data {
+        guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return data }
+        let wrapped: [String: Any] = ["items": [dict]]
+        return (try? JSONSerialization.data(withJSONObject: wrapped)) ?? data
+    }
+
     /// Get a valid access token for the account, refreshing if needed.
     private func validAccessToken(for account: GoogleCalendarAccount) async -> String? {
         if account.id == "supabase", let supa = supabaseService {

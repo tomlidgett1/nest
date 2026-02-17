@@ -72,6 +72,15 @@ final class TodoRepository {
     // MARK: - Read
     
     /// Fetch all non-deleted to-dos, sorted by creation date (newest first).
+    /// Fetch a single to-do by its UUID.
+    func fetchTodoById(_ id: UUID) -> TodoItem? {
+        let predicate = #Predicate<TodoItem> { todo in
+            todo.id == id && todo.isDeleted == false
+        }
+        let descriptor = FetchDescriptor<TodoItem>(predicate: predicate)
+        return (try? modelContext.fetch(descriptor))?.first
+    }
+    
     func fetchAllTodos() -> [TodoItem] {
         let predicate = #Predicate<TodoItem> { todo in
             todo.isDeleted == false

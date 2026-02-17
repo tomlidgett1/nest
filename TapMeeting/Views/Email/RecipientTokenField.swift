@@ -31,6 +31,16 @@ struct RecipientTokenField: View {
     /// Called whenever the current search query changes (the text being typed, after any separator processing).
     var onSearchQueryChanged: ((String) -> Void)?
     
+    /// Called when the user presses arrow keys or Enter while suggestions are visible.
+    /// Return `true` from the handler if the key was consumed (e.g. arrow navigation or Enter to select).
+    var onKeyboardNavigation: ((KeyboardNavigationEvent) -> Bool)?
+    
+    enum KeyboardNavigationEvent {
+        case arrowDown
+        case arrowUp
+        case enterSelection
+    }
+    
     @FocusState private var isInputFocused: Bool
     
     var body: some View {
@@ -54,11 +64,33 @@ struct RecipientTokenField: View {
                     onSearchQueryChanged?(currentQuery)
                 }
                 .onSubmit {
+                    // If a suggestion is highlighted, select it instead of committing raw text
+                    if let handler = onKeyboardNavigation, handler(.enterSelection) {
+                        return
+                    }
                     commitCurrentInput()
                     onSearchQueryChanged?("")
                 }
+                .onKeyPress(.downArrow) {
+                    if let handler = onKeyboardNavigation, handler(.arrowDown) {
+                        return .handled
+                    }
+                    return .ignored
+                }
+                .onKeyPress(.upArrow) {
+                    if let handler = onKeyboardNavigation, handler(.arrowUp) {
+                        return .handled
+                    }
+                    return .ignored
+                }
         }
         .padding(.vertical, tokens.isEmpty ? 0 : 2)
+        .onChange(of: isInputFocused) { _, focused in
+            if !focused {
+                commitCurrentInput()
+                onSearchQueryChanged?("")
+            }
+        }
     }
     
     // MARK: - Token Chip

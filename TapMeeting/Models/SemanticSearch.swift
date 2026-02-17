@@ -47,6 +47,8 @@ struct SemanticSearchResponse {
     let query: String
     let results: [SearchDocumentCandidate]
     let citations: [SemanticCitation]
+    var embeddingLatencyMs: Int = 0
+    var searchLatencyMs: Int = 0
 }
 
 enum SemanticIntent: String {
@@ -71,12 +73,14 @@ struct SemanticChatMessage: Identifiable, Hashable {
     let role: Role
     var content: String
     var citations: [SemanticCitation]
+    var isStreaming: Bool
     let createdAt: Date
 
-    init(role: Role, content: String, citations: [SemanticCitation] = [], createdAt: Date = .now) {
+    init(role: Role, content: String, citations: [SemanticCitation] = [], isStreaming: Bool = false, createdAt: Date = .now) {
         self.role = role
         self.content = content
         self.citations = citations
+        self.isStreaming = isStreaming
         self.createdAt = createdAt
     }
 }

@@ -58,6 +58,7 @@ struct GmailAttachment: Identifiable, Equatable {
     let mimeType: String        // MIME type (e.g. "application/pdf")
     let size: Int               // size in bytes
     let attachmentId: String    // Gmail attachment ID for download
+    var isInline: Bool = false  // true if Content-Disposition is "inline"
     
     /// Human-readable file size string.
     var formattedSize: String {
@@ -66,6 +67,50 @@ struct GmailAttachment: Identifiable, Equatable {
         if kb < 1024 { return String(format: "%.0f KB", kb) }
         let mb = kb / 1024.0
         return String(format: "%.1f MB", mb)
+    }
+    
+    /// Whether this attachment is auto-generated email junk (signatures, calendar invites,
+    /// tracking pixels, branding icons) rather than a real user-attached file.
+    var isLikelySignatureOrIcon: Bool {
+        let lower = filename.lowercased()
+        let mime = mimeType.lowercased()
+        
+        // Calendar invites / events (.ics files)
+        if lower.hasSuffix(".ics") { return true }
+        if mime == "text/calendar" || mime == "application/ics" { return true }
+        
+        // SMIME signatures and encryption artefacts
+        if lower == "smime.p7s" || lower == "smime.p7m" || lower == "smime.p7c" { return true }
+        if mime == "application/pkcs7-signature" || mime == "application/pkcs7-mime" { return true }
+        
+        // Outlook winmail.dat / TNEF blobs
+        if lower == "winmail.dat" || lower == "atr.dat" { return true }
+        if mime == "application/ms-tnef" { return true }
+        
+        // Inline images under 30 KB are almost always signature logos or icons
+        if isInline && mime.hasPrefix("image/") && size < 30_000 { return true }
+        
+        // Common signature/branding filenames
+        let signaturePatterns = [
+            "image", "logo", "signature", "banner", "footer",
+            "icon", "badge", "outlook", "linkedin", "facebook",
+            "twitter", "instagram", "youtube", "social", "email-sig",
+            "emailsig", "sig-", "sig_", "brand", "header"
+        ]
+        if mime.hasPrefix("image/") && size < 50_000 {
+            if signaturePatterns.contains(where: { lower.contains($0) }) { return true }
+        }
+        
+        // Tracking pixels and 1x1 images (typically < 1 KB)
+        if mime.hasPrefix("image/") && size < 1_000 { return true }
+        
+        // Generic unnamed inline images (e.g. "image001.png", "image003.jpg")
+        if mime.hasPrefix("image/") && isInline {
+            let nameOnly = (lower as NSString).deletingPathExtension
+            if nameOnly.range(of: #"^image\d{0,4}$"#, options: .regularExpression) != nil { return true }
+        }
+        
+        return false
     }
     
     /// SF Symbol name based on MIME type.
@@ -184,6 +229,16 @@ struct GmailThread: Identifiable, Equatable {
         messages.contains { $0.hasAttachments }
     }
     
+    /// Whether the thread contains a draft message.
+    var hasDraft: Bool {
+        messages.contains { $0.labelIds.contains("DRAFT") }
+    }
+    
+    /// The draft message in this thread, if any.
+    var draftMessage: GmailMessage? {
+        messages.first { $0.labelIds.contains("DRAFT") }
+    }
+    
     /// Unique sender display names across the thread.
     var participants: [String] {
         var seen = Set<String>()
@@ -235,6 +290,30 @@ struct EmailDraft {
     var references: String?     // for reply threading
     var threadId: String?       // for reply threading
     var attachments: [EmailAttachmentFile] = []  // files to attach
+    var gmailDraftId: String?   // Gmail draft ID (for update/delete/send)
+    var gmailMessageId: String? // Message ID within the draft
+    var accountId: String?      // Which account this draft belongs to
+    
+    /// Whether the draft has enough content worth saving.
+    var hasMeaningfulContent: Bool {
+        !to.isEmpty ||
+        !subject.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+        !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+// MARK: - Attachment Item (for Attachments Browser)
+
+/// Wraps a `GmailAttachment` with parent email context for the attachments browser.
+struct AttachmentItem: Identifiable {
+    let id: String
+    let attachment: GmailAttachment
+    let senderName: String
+    let senderEmail: String
+    let subject: String
+    let date: Date
+    let threadId: String
+    let accountId: String
 }
 
 // MARK: - Gmail Service
@@ -302,6 +381,28 @@ final class GmailService {
     /// Brief success message after send.
     var sendSuccess: Bool = false
     
+    // MARK: - Active Draft State
+    
+    /// The currently active compose draft (persists across view transitions).
+    var activeDraft: EmailDraft?
+    
+    /// The compose mode for the active draft.
+    var activeComposeMode: ActiveComposeMode?
+    
+    /// The quoted message for the active reply/forward draft.
+    var activeQuotedMessage: GmailMessage?
+    
+    /// Whether a draft save is currently in progress.
+    private(set) var isSavingDraft = false
+    
+    /// Compose modes for draft tracking.
+    enum ActiveComposeMode: Equatable {
+        case newEmail
+        case reply
+        case replyAll
+        case forward
+    }
+    
     // MARK: - Pagination
     
     /// Next-page tokens per mailbox per account: `[mailbox.rawValue: [account.id: token]]`.
@@ -339,6 +440,39 @@ final class GmailService {
     /// Estimated total result count from the last search (from Gmail's `resultSizeEstimate`).
     private(set) var searchResultEstimate: Int = 0
     
+    // MARK: - Attachments Browser
+    
+    /// All **real** attachments from every loaded mailbox, enriched with parent email metadata.
+    /// Filters out inline signature images, tracking pixels, and tiny branding icons.
+    /// Sorted by date descending (newest first), deduplicated by attachment ID.
+    var allAttachments: [AttachmentItem] {
+        var seen = Set<String>()
+        var items: [AttachmentItem] = []
+        
+        let allThreads = inboxThreads + sentThreads + draftThreads + archivedThreads + trashThreads
+        for thread in allThreads {
+            for message in thread.messages {
+                for attachment in message.attachments {
+                    guard !seen.contains(attachment.id) else { continue }
+                    guard !attachment.isLikelySignatureOrIcon else { continue }
+                    seen.insert(attachment.id)
+                    items.append(AttachmentItem(
+                        id: attachment.id,
+                        attachment: attachment,
+                        senderName: message.from,
+                        senderEmail: message.fromEmail,
+                        subject: message.subject.isEmpty ? "No Subject" : message.subject,
+                        date: message.date,
+                        threadId: thread.id,
+                        accountId: thread.accountId
+                    ))
+                }
+            }
+        }
+        
+        return items.sorted { $0.date > $1.date }
+    }
+    
     // MARK: - Contact Cache
     
     /// Preloaded contacts for instant autocomplete (saved contacts + people you've emailed).
@@ -355,6 +489,15 @@ final class GmailService {
     /// Stored history ID per account — used for efficient change detection.
     /// Only does a full fetch when Gmail reports changes since this ID.
     private var latestHistoryIds: [String: String] = [:]  // accountId -> historyId
+    
+    /// Persisted unread-thread baseline used for net-new notification deltas.
+    private var notificationBaselineUnreadIdsByAccount: [String: Set<String>] = [:]
+    /// Persisted marker indicating whether baseline data was previously seeded.
+    private var hasPersistedNotificationBaseline = false
+    /// Signature of current connected accounts for baseline compatibility checks.
+    private var notificationBaselineAccountSignature = ""
+    /// Session-only guard: first inbox snapshot after launch is always silent.
+    private var hasSeededInboxBaselineThisLaunch = false
     
     // MARK: - Supabase Integration
 
@@ -400,6 +543,8 @@ final class GmailService {
 
     init() {
         loadAccounts()
+        loadNotificationBaseline()
+        reconcileNotificationBaselineForCurrentAccounts()
     }
     
     // MARK: - Account Storage
@@ -424,12 +569,93 @@ final class GmailService {
         }
     }
     
+    private func accountSignature(for accounts: [GmailAccount]) -> String {
+        accounts.map(\.id).sorted().joined(separator: "|")
+    }
+    
+    private func loadNotificationBaseline() {
+        let defaults = UserDefaults.standard
+        
+        if let data = defaults.data(forKey: Constants.Defaults.gmailNotificationBaselineUnreadIds),
+           let decoded = try? JSONDecoder().decode([String: [String]].self, from: data) {
+            notificationBaselineUnreadIdsByAccount = decoded.reduce(into: [:]) { partial, pair in
+                partial[pair.key] = Set(pair.value)
+            }
+        } else {
+            notificationBaselineUnreadIdsByAccount = [:]
+        }
+        
+        hasPersistedNotificationBaseline = defaults.bool(forKey: Constants.Defaults.gmailNotificationBaselineSeeded)
+        notificationBaselineAccountSignature = defaults.string(
+            forKey: Constants.Defaults.gmailNotificationAccountSignature
+        ) ?? ""
+    }
+    
+    private func persistNotificationBaseline() {
+        let defaults = UserDefaults.standard
+        let encoded = notificationBaselineUnreadIdsByAccount.reduce(into: [String: [String]]()) { partial, pair in
+            partial[pair.key] = Array(pair.value.prefix(500))
+        }
+        if let data = try? JSONEncoder().encode(encoded) {
+            defaults.set(data, forKey: Constants.Defaults.gmailNotificationBaselineUnreadIds)
+        }
+        defaults.set(hasPersistedNotificationBaseline, forKey: Constants.Defaults.gmailNotificationBaselineSeeded)
+        defaults.set(notificationBaselineAccountSignature, forKey: Constants.Defaults.gmailNotificationAccountSignature)
+        defaults.set(Date().timeIntervalSince1970, forKey: Constants.Defaults.gmailNotificationBaselineUpdatedAt)
+    }
+    
+    private func reconcileNotificationBaselineForCurrentAccounts() {
+        let currentSignature = accountSignature(for: accounts)
+        let didChange = notificationBaselineAccountSignature != currentSignature
+        
+        if didChange {
+            notificationBaselineUnreadIdsByAccount = [:]
+            hasPersistedNotificationBaseline = false
+            hasSeededInboxBaselineThisLaunch = false
+        }
+        
+        notificationBaselineAccountSignature = currentSignature
+        persistNotificationBaseline()
+    }
+    
+    private func buildUnreadBaseline(from threads: [GmailThread]) -> [String: Set<String>] {
+        var map: [String: Set<String>] = [:]
+        for thread in threads where thread.isUnread {
+            let accountId = thread.accountId.isEmpty ? "unknown" : thread.accountId
+            map[accountId, default: []].insert(thread.id)
+        }
+        return map
+    }
+    
+    private func computeNetNewUnreadThreads(from threads: [GmailThread]) -> [GmailThread] {
+        guard hasSeededInboxBaselineThisLaunch else { return [] }
+        let baseline = notificationBaselineUnreadIdsByAccount
+        return threads.filter { thread in
+            guard thread.isUnread else { return false }
+            let accountId = thread.accountId.isEmpty ? "unknown" : thread.accountId
+            return !(baseline[accountId]?.contains(thread.id) ?? false)
+        }
+    }
+    
+    private func updateNotificationBaseline(with threads: [GmailThread]) {
+        notificationBaselineUnreadIdsByAccount = buildUnreadBaseline(from: threads)
+        hasPersistedNotificationBaseline = true
+        persistNotificationBaseline()
+    }
+    
+    private func seedNotificationBaselineForLaunchIfNeeded(with threads: [GmailThread]) {
+        guard !hasSeededInboxBaselineThisLaunch else { return }
+        hasSeededInboxBaselineThisLaunch = true
+        updateNotificationBaseline(with: threads)
+    }
+    
     /// Ensure the Supabase-authenticated Google account is represented in the accounts array.
     /// Called when `supabaseService` is set or when authentication state may have changed.
     func ensureSupabaseAccount() {
         guard let supa = supabaseService, supa.isAuthenticated else {
             // Remove the Supabase account but keep any additional accounts.
             accounts.removeAll { $0.id == "supabase" }
+            reconcileNotificationBaselineForCurrentAccounts()
             return
         }
         
@@ -440,6 +666,7 @@ final class GmailService {
         // Ensure Supabase account is first, followed by any additional accounts.
         let additional = accounts.filter { $0.id != "supabase" }
         accounts = [supabaseAccount] + additional
+        reconcileNotificationBaselineForCurrentAccounts()
     }
     
     // MARK: - OAuth Flow (Additional Accounts)
@@ -503,6 +730,7 @@ final class GmailService {
         }
         accounts.removeAll { $0.id == accountId }
         saveAccounts()
+        reconcileNotificationBaselineForCurrentAccounts()
         
         // Also remove from Calendar service
         googleCalendarService?.removeAdditionalAccount(id: accountId)
@@ -524,6 +752,7 @@ final class GmailService {
         selectedThread = nil
         selectedMessageId = nil
         saveAccounts()
+        reconcileNotificationBaselineForCurrentAccounts()
         stopPolling()
         print("[Gmail] All accounts signed out")
     }
@@ -682,6 +911,7 @@ final class GmailService {
             await MainActor.run {
                 accounts.append(account)
                 saveAccounts()
+                reconcileNotificationBaselineForCurrentAccounts()
                 
                 // Add to Calendar service
                 googleCalendarService?.addAdditionalAccount(calAccount)
@@ -769,14 +999,13 @@ final class GmailService {
         // Snapshot the latest historyId per account (for efficient polling)
         await updateHistoryIds()
         
-        // Detect new unread inbox threads for notifications (only when we had a previous snapshot)
+        // Detect net-new unread inbox threads for notifications using persisted baseline.
+        // The first inbox snapshot in each launch is always silent.
         var newThreadsToNotify: [GmailThread] = []
         if mailbox == .inbox, onNewEmailsDetected != nil {
-            let previousIds = await MainActor.run { Set(inboxThreads.map(\.id)) }
-            let newUnread = sorted.filter { $0.isUnread && !previousIds.contains($0.id) }
-            if !previousIds.isEmpty && !newUnread.isEmpty {
-                newThreadsToNotify = newUnread
-            }
+            seedNotificationBaselineForLaunchIfNeeded(with: sorted)
+            newThreadsToNotify = computeNetNewUnreadThreads(from: sorted)
+            updateNotificationBaseline(with: sorted)
         }
         
         let threadsToNotify = newThreadsToNotify
@@ -1022,6 +1251,58 @@ final class GmailService {
         var merged = inboxThreads + sentThreads + draftThreads + archivedThreads + trashThreads
         merged.sort { $0.date > $1.date }
         return merged
+    }
+    
+    /// Convert a draft GmailMessage back into an EmailDraft for resuming composition.
+    func emailDraftFromMessage(_ message: GmailMessage, thread: GmailThread) -> EmailDraft {
+        var draft = EmailDraft()
+        draft.to = message.to
+        draft.cc = message.cc
+        draft.subject = message.subject
+        draft.body = message.bodyPlain
+        if !message.bodyHTML.isEmpty {
+            draft.bodyHTML = message.bodyHTML
+        }
+        draft.threadId = message.threadId
+        draft.inReplyTo = message.inReplyTo.isEmpty ? nil : message.inReplyTo
+        draft.references = message.references.isEmpty ? nil : message.references
+        draft.accountId = thread.accountId
+        return draft
+    }
+    
+    /// Fetch the Gmail draft ID for a message that has the DRAFT label.
+    /// Uses GET /users/me/drafts to find the draft ID matching the message.
+    func fetchDraftId(for messageId: String, accountId: String? = nil) async -> String? {
+        let account: GmailAccount? = {
+            if let id = accountId { return accounts.first { $0.id == id } }
+            return accounts.first
+        }()
+        guard let account,
+              let token = await validToken(for: account) else { return nil }
+        
+        guard let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/drafts") else { return nil }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        
+        do {
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200...299).contains(status),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let drafts = json["drafts"] as? [[String: Any]] else { return nil }
+            
+            for draftObj in drafts {
+                if let message = draftObj["message"] as? [String: Any],
+                   let msgId = message["id"] as? String,
+                   msgId == messageId,
+                   let draftId = draftObj["id"] as? String {
+                    return draftId
+                }
+            }
+        } catch {
+            print("[Gmail] Failed to fetch draft ID: \(error)")
+        }
+        return nil
     }
     
     /// Fetch the current historyId from each account's profile and store it.
@@ -1455,6 +1736,19 @@ final class GmailService {
             let attachmentId = body?["attachmentId"] as? String ?? ""
             let size = body?["size"] as? Int ?? 0
             
+            // Check Content-Disposition header to detect inline attachments
+            var isInline = false
+            if let partHeaders = part["headers"] as? [[String: Any]] {
+                for header in partHeaders {
+                    if let name = header["name"] as? String,
+                       name.caseInsensitiveCompare("Content-Disposition") == .orderedSame,
+                       let value = header["value"] as? String {
+                        isInline = value.lowercased().hasPrefix("inline")
+                        break
+                    }
+                }
+            }
+            
             if !attachmentId.isEmpty {
                 let attachment = GmailAttachment(
                     id: attachmentId,
@@ -1462,7 +1756,8 @@ final class GmailService {
                     filename: filename,
                     mimeType: mimeType,
                     size: size,
-                    attachmentId: attachmentId
+                    attachmentId: attachmentId,
+                    isInline: isInline
                 )
                 attachments.append(attachment)
             }
@@ -1556,29 +1851,11 @@ final class GmailService {
         }
     }
     
-    // MARK: - Send Email
+    // MARK: - RFC 2822 Builder
     
-    /// Send an email using the Gmail API.
-    /// Per Gmail API: POST /users/me/messages/send with { "raw": "<base64url RFC 2822>", "threadId": ... }
-    /// Returns true on success, false on failure.
-    func sendEmail(_ draft: EmailDraft, fromAccountId: String? = nil) async -> Bool {
-        let account: GmailAccount? = {
-            if let id = fromAccountId { return accounts.first { $0.id == id } }
-            return accounts.first
-        }()
-        guard let account,
-              let token = await validToken(for: account) else {
-            await MainActor.run { sendError = "No connected account." }
-            return false
-        }
-        
-        await MainActor.run {
-            isSending = true
-            sendError = nil
-            sendSuccess = false
-        }
-        
-        let fromAddress = account.email
+    /// Builds an RFC 2822 formatted email string from a draft and sender address.
+    /// Shared by sendEmail, createOrUpdateDraft, etc.
+    private func buildRFC2822(for draft: EmailDraft, from fromAddress: String) -> String {
         var rfc2822 = ""
         rfc2822 += "From: \(fromAddress)\r\n"
         rfc2822 += "To: \(draft.to.joined(separator: ", "))\r\n"
@@ -1601,18 +1878,15 @@ final class GmailService {
         let hasAttachments = !draft.attachments.isEmpty
         
         if !hasHTML && !hasAttachments {
-            // Simple plain-text email
             rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
             rfc2822 += "\r\n"
             rfc2822 += draft.body
             
         } else if hasHTML && !hasAttachments {
-            // multipart/alternative: plain text + HTML (no attachments)
             let altBoundary = "TapAlt-\(UUID().uuidString)"
             rfc2822 += "Content-Type: multipart/alternative; boundary=\"\(altBoundary)\"\r\n"
             rfc2822 += "\r\n"
             
-            // Plain text part
             rfc2822 += "--\(altBoundary)\r\n"
             rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
             rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
@@ -1620,7 +1894,6 @@ final class GmailService {
             rfc2822 += draft.body
             rfc2822 += "\r\n"
             
-            // HTML part
             rfc2822 += "--\(altBoundary)\r\n"
             rfc2822 += "Content-Type: text/html; charset=\"UTF-8\"\r\n"
             rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
@@ -1631,14 +1904,11 @@ final class GmailService {
             rfc2822 += "--\(altBoundary)--\r\n"
             
         } else {
-            // multipart/mixed: body + attachments
-            // When HTML is present, the body section itself is multipart/alternative
             let mixedBoundary = "TapMixed-\(UUID().uuidString)"
             rfc2822 += "Content-Type: multipart/mixed; boundary=\"\(mixedBoundary)\"\r\n"
             rfc2822 += "\r\n"
             
             if hasHTML {
-                // Nested multipart/alternative for text + HTML
                 let altBoundary = "TapAlt-\(UUID().uuidString)"
                 rfc2822 += "--\(mixedBoundary)\r\n"
                 rfc2822 += "Content-Type: multipart/alternative; boundary=\"\(altBoundary)\"\r\n"
@@ -1660,7 +1930,6 @@ final class GmailService {
                 
                 rfc2822 += "--\(altBoundary)--\r\n"
             } else {
-                // Plain text only
                 rfc2822 += "--\(mixedBoundary)\r\n"
                 rfc2822 += "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
                 rfc2822 += "Content-Transfer-Encoding: 7bit\r\n"
@@ -1669,7 +1938,6 @@ final class GmailService {
                 rfc2822 += "\r\n"
             }
             
-            // Attachment parts
             for attachment in draft.attachments {
                 rfc2822 += "--\(mixedBoundary)\r\n"
                 rfc2822 += "Content-Type: \(attachment.mimeType); name=\"\(attachment.filename)\"\r\n"
@@ -1685,18 +1953,56 @@ final class GmailService {
             rfc2822 += "--\(mixedBoundary)--\r\n"
         }
         
-        guard let messageData = rfc2822.data(using: .utf8) else {
+        return rfc2822
+    }
+    
+    /// Encodes an RFC 2822 string to base64url format for the Gmail API.
+    private func base64urlEncode(_ rfc2822: String) -> String? {
+        guard let data = rfc2822.data(using: .utf8) else { return nil }
+        return data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+    
+    // MARK: - Send Email
+    
+    /// Send an email using the Gmail API.
+    /// If the draft has a `gmailDraftId`, sends via `POST /drafts/send`.
+    /// Otherwise falls back to `POST /messages/send`.
+    /// Returns true on success, false on failure.
+    func sendEmail(_ draft: EmailDraft, fromAccountId: String? = nil) async -> Bool {
+        let account: GmailAccount? = {
+            if let id = fromAccountId ?? draft.accountId { return accounts.first { $0.id == id } }
+            return accounts.first
+        }()
+        guard let account,
+              let token = await validToken(for: account) else {
+            await MainActor.run { sendError = "No connected account." }
+            return false
+        }
+        
+        await MainActor.run {
+            isSending = true
+            sendError = nil
+            sendSuccess = false
+        }
+        
+        // If there's an existing Gmail draft, send it via the drafts.send endpoint
+        if let draftId = draft.gmailDraftId {
+            return await sendExistingDraft(draftId: draftId, draft: draft, token: token, account: account)
+        }
+        
+        let fromAddress = account.email
+        let rfc2822 = buildRFC2822(for: draft, from: fromAddress)
+        
+        guard let base64url = base64urlEncode(rfc2822) else {
             await MainActor.run {
                 isSending = false
                 sendError = "Failed to encode message."
             }
             return false
         }
-        
-        let base64url = messageData.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
         
         var requestBody: [String: Any] = ["raw": base64url]
         if let threadId = draft.threadId {
@@ -1722,14 +2028,13 @@ final class GmailService {
                     sentThreadId = responseThreadId
                 }
                 
-                // Update UI immediately — don't block on the thread refresh
                 await MainActor.run {
                     isSending = false
                     sendSuccess = true
+                    activeDraft = nil
                 }
                 print("[Gmail] ✓ Email sent to \(draft.to.joined(separator: ", "))")
                 
-                // Refresh the thread in the background so the mailbox list updates
                 if let sentThreadId, !sentThreadId.isEmpty {
                     Task.detached { [weak self] in
                         await self?.refreshThreadAfterSend(threadId: sentThreadId, token: token, account: account)
@@ -1753,6 +2058,218 @@ final class GmailService {
             }
             print("[Gmail] Send error: \(error)")
             return false
+        }
+    }
+    
+    /// Send an existing Gmail draft via POST /users/me/drafts/send.
+    private func sendExistingDraft(draftId: String, draft: EmailDraft, token: String, account: GmailAccount) async -> Bool {
+        let url = URL(string: "\(Constants.Gmail.apiBase)/users/me/drafts/send")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["id": draftId])
+        
+        do {
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            
+            if (200...299).contains(status) {
+                var sentThreadId = draft.threadId
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let responseThreadId = json["threadId"] as? String,
+                   !responseThreadId.isEmpty {
+                    sentThreadId = responseThreadId
+                }
+                
+                await MainActor.run {
+                    isSending = false
+                    sendSuccess = true
+                    activeDraft = nil
+                    removeDraftFromLocalThreads(draftId: draftId)
+                }
+                print("[Gmail] ✓ Draft sent to \(draft.to.joined(separator: ", "))")
+                
+                if let sentThreadId, !sentThreadId.isEmpty {
+                    Task.detached { [weak self] in
+                        await self?.refreshThreadAfterSend(threadId: sentThreadId, token: token, account: account)
+                    }
+                }
+                
+                return true
+            } else {
+                let errorText = String(data: data, encoding: .utf8) ?? "Unknown error"
+                await MainActor.run {
+                    isSending = false
+                    sendError = "Send failed (HTTP \(status))"
+                }
+                print("[Gmail] Draft send failed HTTP \(status): \(errorText.prefix(500))")
+                return false
+            }
+        } catch {
+            await MainActor.run {
+                isSending = false
+                sendError = "Network error: \(error.localizedDescription)"
+            }
+            print("[Gmail] Draft send error: \(error)")
+            return false
+        }
+    }
+    
+    // MARK: - Draft CRUD
+    
+    /// Create or update a Gmail draft via the Drafts API.
+    /// Returns the updated draft IDs on success, nil on failure.
+    func createOrUpdateDraft(_ draft: EmailDraft, fromAccountId: String? = nil) async -> (draftId: String, messageId: String)? {
+        let account: GmailAccount? = {
+            if let id = fromAccountId ?? draft.accountId { return accounts.first { $0.id == id } }
+            return accounts.first
+        }()
+        guard let account,
+              let token = await validToken(for: account) else {
+            print("[Gmail] Draft save failed: no connected account.")
+            return nil
+        }
+        
+        let fromAddress = account.email
+        let rfc2822 = buildRFC2822(for: draft, from: fromAddress)
+        
+        guard let base64url = base64urlEncode(rfc2822) else {
+            print("[Gmail] Draft save failed: could not encode message.")
+            return nil
+        }
+        
+        var messageBody: [String: Any] = ["raw": base64url]
+        if let threadId = draft.threadId {
+            messageBody["threadId"] = threadId
+        }
+        let requestBody: [String: Any] = ["message": messageBody]
+        
+        let isUpdate = draft.gmailDraftId != nil
+        let urlString: String
+        let httpMethod: String
+        
+        if let draftId = draft.gmailDraftId {
+            urlString = "\(Constants.Gmail.apiBase)/users/me/drafts/\(draftId)"
+            httpMethod = "PUT"
+        } else {
+            urlString = "\(Constants.Gmail.apiBase)/users/me/drafts"
+            httpMethod = "POST"
+        }
+        
+        guard let url = URL(string: urlString) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = httpMethod
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: requestBody)
+        
+        do {
+            let (data, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            
+            if (200...299).contains(status) {
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let draftId = json["id"] as? String {
+                    let messageId = (json["message"] as? [String: Any])?["id"] as? String ?? ""
+                    let threadId = (json["message"] as? [String: Any])?["threadId"] as? String
+                    
+                    print("[Gmail] ✓ Draft \(isUpdate ? "updated" : "created"): \(draftId)")
+                    
+                    // Update active draft state on main thread
+                    await MainActor.run {
+                        activeDraft?.gmailDraftId = draftId
+                        activeDraft?.gmailMessageId = messageId
+                        if let threadId {
+                            activeDraft?.threadId = threadId
+                        }
+                    }
+                    
+                    // Refresh draft list in background
+                    if let threadId {
+                        Task.detached { [weak self] in
+                            await self?.refreshDraftInLocalThreads(threadId: threadId, token: token, account: account)
+                        }
+                    }
+                    
+                    return (draftId, messageId)
+                }
+            } else {
+                let errorText = String(data: data, encoding: .utf8) ?? "Unknown"
+                print("[Gmail] Draft \(isUpdate ? "update" : "create") failed HTTP \(status): \(errorText.prefix(500))")
+            }
+        } catch {
+            print("[Gmail] Draft save error: \(error)")
+        }
+        
+        return nil
+    }
+    
+    /// Delete a Gmail draft.
+    func deleteDraft(draftId: String, fromAccountId: String? = nil) async {
+        let account: GmailAccount? = {
+            if let id = fromAccountId { return accounts.first { $0.id == id } }
+            return accounts.first
+        }()
+        guard let account,
+              let token = await validToken(for: account) else {
+            print("[Gmail] Draft delete failed: no connected account.")
+            return
+        }
+        
+        let urlString = "\(Constants.Gmail.apiBase)/users/me/drafts/\(draftId)"
+        guard let url = URL(string: urlString) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        
+        do {
+            let (_, response) = try await resilientData(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            
+            if (200...299).contains(status) || status == 404 {
+                await MainActor.run {
+                    removeDraftFromLocalThreads(draftId: draftId)
+                    activeDraft = nil
+                }
+                print("[Gmail] ✓ Draft deleted: \(draftId)")
+            } else {
+                print("[Gmail] Draft delete failed HTTP \(status)")
+            }
+        } catch {
+            print("[Gmail] Draft delete error: \(error)")
+        }
+    }
+    
+    /// Remove a draft thread from local arrays after deletion or send.
+    private func removeDraftFromLocalThreads(draftId: String) {
+        draftThreads.removeAll { thread in
+            thread.messages.allSatisfy { $0.labelIds.contains("DRAFT") }
+        }
+    }
+    
+    /// Refresh/insert a draft thread into local state after create/update.
+    private func refreshDraftInLocalThreads(threadId: String, token: String, account: GmailAccount) async {
+        guard let refreshedThread = await fetchThread(id: threadId, token: token, account: account) else { return }
+        
+        await MainActor.run {
+            // Update or insert into draftThreads
+            if let idx = draftThreads.firstIndex(where: { $0.id == refreshedThread.id }) {
+                draftThreads[idx] = refreshedThread
+            } else {
+                draftThreads.insert(refreshedThread, at: 0)
+            }
+            draftThreads.sort { $0.date > $1.date }
+            
+            // Also update if present in inbox (reply drafts show in inbox too)
+            if let idx = inboxThreads.firstIndex(where: { $0.id == refreshedThread.id }) {
+                inboxThreads[idx] = refreshedThread
+            }
+            
+            // Update selected thread if it matches
+            if selectedThread?.id == refreshedThread.id {
+                selectedThread = refreshedThread
+            }
         }
     }
     

@@ -56,18 +56,36 @@ enum Constants {
         static let maxSummariseTokens = 1024
         static let maxClassifyTokens = 256
         static let maxTodoExtractionTokens = 1024
-        static let maxSemanticAnswerTokens = 1400
+        static let maxSemanticAnswerTokens = 2500
+        /// Fast model for query rewriting, reranking, and entity extraction.
+        static let queryRewriteModel = "gpt-4.1-mini"
+        static let maxQueryRewriteTokens = 256
         static let maxCatchUpTokens = 1024
     }
 
     // MARK: - Search
 
     enum Search {
-        static let maxChunkCharacters = 900
-        static let maxSummaryCharacters = 1500
-        static let maxSearchResults = 20
+        /// Target chunk size in characters (~500 tokens for embedding-3-large).
+        static let maxChunkCharacters = 2000
+        /// Overlap between adjacent chunks (15% of maxChunkCharacters).
+        static let chunkOverlapCharacters = 300
+        /// Maximum chunks to create from a single source document.
+        static let maxChunksPerSource = 64
+        /// Maximum characters for document-level summaries.
+        static let maxSummaryCharacters = 2000
+        /// Maximum search results returned from the database.
+        static let maxSearchResults = 30
+        /// Minimum citations required before displaying a response.
         static let minimumCitationCount = 2
-        static let emailBackfillWindowHours = 48
+        /// Maximum evidence blocks sent to the LLM for RAG generation.
+        static let maxEvidenceBlocks = 12
+        /// Maximum characters per evidence block sent to the LLM.
+        static let maxEvidenceBlockCharacters = 1200
+        /// RRF constant (k) for Reciprocal Rank Fusion scoring.
+        static let rrfK = 60
+        /// Chunking strategy version — increment to trigger re-indexing of all content.
+        static let chunkingVersion = "v2"
     }
     
     // MARK: - Calendar
@@ -105,11 +123,12 @@ enum Constants {
         /// Google OAuth query params required to obtain/rotate refresh tokens.
         static let googleOAuthQueryParams: [(String, String?)] = [
             ("access_type", "offline"),
-            ("prompt", "consent")
+            ("prompt", "consent"),
+            ("include_granted_scopes", "true")
         ]
         /// Combined Google OAuth scopes requested during Supabase sign-in.
-        /// Covers: Calendar (read-only), Gmail (modify + send), Contacts (autocomplete).
-        static let googleScopes = "email profile https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
+        /// Covers: Calendar (read + write), Gmail (modify + send), Contacts (autocomplete).
+        static let googleScopes = "email profile https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
     }
 
     // MARK: - Google Calendar
@@ -121,7 +140,7 @@ enum Constants {
         static let tokenURL = "https://oauth2.googleapis.com/token"
         static let redirectURI = "http://localhost:8234"
         static let loopbackPort: UInt16 = 8234
-        static let scopes = "https://www.googleapis.com/auth/calendar.readonly"
+        static let scopes = "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events"
         /// Interval in seconds between automatic calendar event refreshes.
         static let pollingInterval: TimeInterval = 300
     }
@@ -221,6 +240,16 @@ enum Constants {
         /// JSON-encoded array of excluded email category raw values (e.g. "meeting_invites").
         static let todoExcludedCategories = "todoExcludedCategories"
         
+        // Gmail Notifications
+        /// JSON-encoded map of accountId -> known unread inbox thread IDs.
+        static let gmailNotificationBaselineUnreadIds = "gmailNotificationBaselineUnreadIds"
+        /// True once inbox baseline has been seeded for the current account set.
+        static let gmailNotificationBaselineSeeded = "gmailNotificationBaselineSeeded"
+        /// Sorted account signature used to detect account-set changes and reseed baseline.
+        static let gmailNotificationAccountSignature = "gmailNotificationAccountSignature"
+        /// Last successful baseline update timestamp.
+        static let gmailNotificationBaselineUpdatedAt = "gmailNotificationBaselineUpdatedAt"
+        
         // Calendar View
         static let calendarVisibilityState = "calendarVisibilityState"
         static let calendarViewMode = "calendarViewMode"
@@ -229,5 +258,20 @@ enum Constants {
         static let hasCompletedSupabaseMigration = "hasCompletedSupabaseMigration"
         static let hasCompletedSemanticBackfill = "hasCompletedSemanticBackfill"
         static let semanticBackfillProgress = "semanticBackfillProgress"
+        /// Chunking version that was used for the last backfill. If this differs from
+        /// `Constants.Search.chunkingVersion`, a re-index is triggered automatically.
+        static let lastBackfillChunkingVersion = "lastBackfillChunkingVersion"
+
+        // Backfill Scope
+        /// JSON-encoded array of Gmail account IDs selected for semantic backfill.
+        /// If empty/nil, no email threads are backfilled.
+        static let backfillEmailAccountIds = "backfillEmailAccountIds"
+        /// Number of days of email history to include in backfill.
+        static let backfillEmailDays = "backfillEmailDays"
+    }
+
+    enum Backfill {
+        /// Default number of days of email history to include in backfill.
+        static let defaultEmailDays = 45
     }
 }

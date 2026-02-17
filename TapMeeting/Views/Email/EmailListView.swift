@@ -317,11 +317,19 @@ private struct EmailThreadRow: View {
                             .foregroundColor(thread.isUnread ? Theme.olive : Theme.textTertiary)
                     }
                     
-                    // Subject
-                    Text(thread.subject)
-                        .font(.system(size: 12, weight: thread.isUnread ? .semibold : .regular))
-                        .foregroundColor(Theme.textPrimary)
-                        .lineLimit(1)
+                    // Subject (with draft indicator)
+                    HStack(spacing: 4) {
+                        if thread.hasDraft {
+                            Text("[Draft]")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(Theme.recording)
+                        }
+                        Text(thread.subject)
+                            .font(.system(size: 12, weight: thread.isUnread ? .semibold : .regular))
+                            .foregroundColor(Theme.textPrimary)
+                            .lineLimit(1)
+                    }
+                    .lineLimit(1)
                     
                     // Snippet
                     if !isExpanded {

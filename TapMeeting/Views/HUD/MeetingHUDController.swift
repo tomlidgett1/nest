@@ -85,8 +85,8 @@ final class MeetingHUDController {
         let hudView = MeetingHUDView()
             .environment(appState)
         
-        let hudWidth: CGFloat = 120
-        let hudHeight: CGFloat = 40
+        let hudWidth: CGFloat = 164
+        let hudHeight: CGFloat = 42
         
         let hostingView = NSHostingView(rootView: hudView)
         hostingView.frame = NSRect(x: 0, y: 0, width: hudWidth, height: hudHeight)

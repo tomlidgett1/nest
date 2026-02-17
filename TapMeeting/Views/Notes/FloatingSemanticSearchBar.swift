@@ -49,10 +49,9 @@ struct FloatingSemanticSearchBar: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 11)
-                    .background(.ultraThinMaterial)
-                    .background(Color.white.opacity(0.85))
+                    .background(Color.white)
                     .cornerRadius(14)
-                    .shadow(color: .black.opacity(0.06), radius: 12, y: 4)
+                    .shadow(color: .black.opacity(0.08), radius: 12, y: 4)
                     .overlay(
                         RoundedRectangle(cornerRadius: 14)
                             .stroke(Theme.divider.opacity(0.5), lineWidth: 0.5)
@@ -303,11 +302,10 @@ private struct NestChatPanel: View {
                     }
 
                     if !message.content.isEmpty {
-                        Text(message.content)
-                            .font(.system(size: 12.5))
-                            .foregroundColor(Theme.textPrimary)
-                            .lineSpacing(3)
-                            .textSelection(.enabled)
+                        StreamingMarkdownView(
+                            text: message.content,
+                            isStreaming: message.isStreaming
+                        )
                     }
                 }
                 .padding(.horizontal, 14)

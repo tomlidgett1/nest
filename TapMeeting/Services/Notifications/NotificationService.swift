@@ -63,13 +63,29 @@ final class NotificationService: NSObject, UNUserNotificationCenterDelegate {
         
         let content = UNMutableNotificationContent()
         content.sound = .default
+        content.title = "New Email"
         
-        if threads.count == 1, let thread = threads.first, let msg = thread.latestMessage {
-            content.title = "New email from \(msg.from)"
-            content.body = thread.subject
+        // Use the newest thread payload so every email notification follows one format:
+        // title + sender email + subject (or message content when no subject is available).
+        let newestThread = threads.max { $0.date < $1.date } ?? threads[0]
+        if let msg = newestThread.latestMessage {
+            content.subtitle = msg.fromEmail
+            
+            let subject = msg.subject.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !subject.isEmpty, subject.lowercased() != "no subject" {
+                content.body = subject
+            } else {
+                let plain = msg.bodyPlain.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !plain.isEmpty {
+                    content.body = plain
+                } else {
+                    let snippet = msg.snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+                    content.body = snippet.isEmpty ? "No subject or preview available." : snippet
+                }
+            }
         } else {
-            content.title = "New emails"
-            content.body = "You have \(threads.count) new emails"
+            content.subtitle = ""
+            content.body = "No subject or preview available."
         }
         
         let request = UNNotificationRequest(

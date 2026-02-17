@@ -1,12 +1,16 @@
 import SwiftUI
 
 /// A 7-day weekly calendar grid with hourly time slots.
+/// Supports drag-to-create: drag on empty grid area to select a time range, then create an event.
 struct CalendarWeekView: View {
 
     let weekStart: Date
     let events: [CalendarEvent]
     @Binding var selectedEvent: CalendarEvent?
     let calendars: [GoogleCalendar]
+
+    /// Called when the user finishes a drag-to-create gesture with (startDate, endDate).
+    var onDragCreate: ((Date, Date) -> Void)?
 
     // MARK: - Layout Constants
 
@@ -16,6 +20,12 @@ struct CalendarWeekView: View {
     private let allDayRowMinHeight: CGFloat = 28
 
     private var totalGridHeight: CGFloat { hourHeight * 24 }
+
+    // MARK: - Drag-to-Create State
+
+    @State private var dragStart: CGPoint?
+    @State private var dragCurrent: CGPoint?
+    @State private var isDragging = false
 
     // MARK: - Body
 
@@ -42,8 +52,14 @@ struct CalendarWeekView: View {
                             // Day column backgrounds
                             dayColumnBackgrounds(dayColumnWidth: dayColumnWidth)
 
+                            // Drag-to-create overlay
+                            dragCreateLayer(dayColumnWidth: dayColumnWidth)
+
                             // Events
                             eventsOverlay(dayColumnWidth: dayColumnWidth)
+
+                            // Drag-to-create highlight (rendered above events)
+                            dragHighlight(dayColumnWidth: dayColumnWidth)
 
                             // Current time indicator
                             currentTimeIndicator(dayColumnWidth: dayColumnWidth, totalWidth: geo.size.width)
@@ -52,7 +68,6 @@ struct CalendarWeekView: View {
                     }
                     .onAppear {
                         // Auto-scroll to 7 AM
-                        // ScrollViewReader can't target arbitrary offset, so we use a workaround
                     }
                 }
             }
@@ -317,5 +332,101 @@ struct CalendarWeekView: View {
             }
         }
         return nil
+    }
+
+    // MARK: - Drag-to-Create
+
+    /// Invisible layer that captures drag gestures on empty grid areas.
+    private func dragCreateLayer(dayColumnWidth: CGFloat) -> some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .frame(width: dayColumnWidth * 7, height: totalGridHeight)
+            .offset(x: timeGutterWidth)
+            .gesture(
+                DragGesture(minimumDistance: 4)
+                    .onChanged { value in
+                        let loc = value.startLocation
+                        if dragStart == nil {
+                            dragStart = loc
+                        }
+                        dragCurrent = value.location
+                        isDragging = true
+                    }
+                    .onEnded { value in
+                        defer {
+                            dragStart = nil
+                            dragCurrent = nil
+                            isDragging = false
+                        }
+
+                        guard let start = dragStart else { return }
+                        let end = value.location
+
+                        let minY = min(start.y, end.y)
+                        let maxY = max(start.y, end.y)
+
+                        // Require at least 15 min worth of drag (hourHeight / 4)
+                        guard maxY - minY > hourHeight / 4 else { return }
+
+                        // Determine which day column
+                        let dayIndex = Int(start.x / dayColumnWidth)
+                        guard dayIndex >= 0, dayIndex < 7 else { return }
+
+                        let startDate = dateFromYOffset(minY, dayOffset: dayIndex)
+                        let endDate = dateFromYOffset(maxY, dayOffset: dayIndex)
+
+                        onDragCreate?(startDate, endDate)
+                    }
+            )
+    }
+
+    /// Visual highlight showing the drag selection area.
+    private func dragHighlight(dayColumnWidth: CGFloat) -> some View {
+        Group {
+            if isDragging, let start = dragStart, let current = dragCurrent {
+                let dayIndex = Int(start.x / dayColumnWidth)
+                let minY = min(start.y, current.y)
+                let maxY = max(start.y, current.y)
+                let height = max(maxY - minY, 10)
+
+                if dayIndex >= 0, dayIndex < 7 {
+                    let startDate = dateFromYOffset(minY, dayOffset: dayIndex)
+                    let endDate = dateFromYOffset(maxY, dayOffset: dayIndex)
+                    let timeFormatter = DateFormatter()
+                    let _ = timeFormatter.dateFormat = "h:mm a"
+
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Theme.olive.opacity(0.15))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Theme.olive.opacity(0.4), lineWidth: 1)
+                        )
+                        .overlay(alignment: .topLeading) {
+                            Text("\(timeFormatter.string(from: startDate)) – \(timeFormatter.string(from: endDate))")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Theme.olive)
+                                .padding(.horizontal, 6)
+                                .padding(.top, 4)
+                        }
+                        .frame(width: dayColumnWidth - 4, height: height)
+                        .offset(
+                            x: timeGutterWidth + CGFloat(dayIndex) * dayColumnWidth + 2,
+                            y: minY
+                        )
+                }
+            }
+        }
+    }
+
+    /// Convert a Y offset on the grid to a Date, snapped to 15-minute intervals.
+    private func dateFromYOffset(_ y: CGFloat, dayOffset: Int) -> Date {
+        let totalMinutes = (y / hourHeight) * 60
+        let snapped = (Int(totalMinutes) / 15) * 15
+        let hour = snapped / 60
+        let minute = snapped % 60
+
+        let day = dayDate(offset: dayOffset)
+        let cal = Foundation.Calendar.current
+        return cal.date(bySettingHour: min(hour, 23), minute: min(minute, 59), second: 0, of: day)!
     }
 }

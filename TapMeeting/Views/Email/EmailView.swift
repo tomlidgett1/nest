@@ -23,6 +23,7 @@ struct EmailView: View {
     @State private var searchText: String = ""
     @State private var isInReplyMode = false
     @State private var showMailboxPopover = false
+    @State private var showAttachmentsBrowser = false
     @FocusState private var isSearchFocused: Bool
     
     private let minListWidth: CGFloat = 340
@@ -55,6 +56,26 @@ struct EmailView: View {
                 Task { await gmail.fetchMailbox(.inbox) }
             }
         }
+        .onChange(of: gmail.selectedThread?.id) { _, newId in
+            guard newId != nil, let thread = gmail.selectedThread else { return }
+            
+            // If the selected thread has a draft and we're in the Drafts mailbox,
+            // auto-open compose with the draft content
+            if thread.hasDraft, gmail.currentMailbox == .drafts {
+                resumeDraftFromThread(thread)
+            }
+            
+            // If navigating away from compose, save current draft and clear all active state
+            if showEmailCompose {
+                NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+                gmail.activeDraft = nil
+                gmail.activeComposeMode = nil
+                gmail.activeQuotedMessage = nil
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showEmailCompose = false
+                }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .emailReplyModeChanged)) { notification in
             let active = notification.userInfo?["active"] as? Bool ?? false
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -62,14 +83,37 @@ struct EmailView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .emailComposeToggle)) { _ in
+            // If closing compose (not opening), save draft first
+            if showEmailCompose {
+                NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+            }
             withAnimation(.easeInOut(duration: 0.25)) {
                 showEmailCompose.toggle()
+                if showEmailCompose {
+                    showAttachmentsBrowser = false
+                }
                 if !showEmailCompose {
                     showSentAnimation = false
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .emailAttachmentsToggle)) { _ in
+            withAnimation(.easeInOut(duration: 0.25)) {
+                showAttachmentsBrowser.toggle()
+                if showAttachmentsBrowser {
+                    showEmailCompose = false
+                    showSentAnimation = false
+                }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .emailMailboxChanged)) { _ in
+            // Save draft before switching mailbox
+            if showEmailCompose {
+                NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showEmailCompose = false
+                }
+            }
             searchText = ""
         }
     }
@@ -148,18 +192,34 @@ struct EmailView: View {
                         if showSentAnimation {
                             sentSuccessView
                                 .transition(.opacity)
+                        } else if showAttachmentsBrowser {
+                            EmailAttachmentsView(onNavigateToThread: { thread in
+                                withAnimation(.easeInOut(duration: 0.25)) {
+                                    showAttachmentsBrowser = false
+                                }
+                                gmail.selectedThread = thread
+                                gmail.selectedMessageId = nil
+                            })
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .transition(.opacity)
                         } else if showEmailCompose {
                             ScrollView {
                                 EmailComposeView(
-                                    draft: EmailDraft(),
+                                    draft: gmail.activeDraft ?? EmailDraft(),
                                     mode: .newEmail,
                                     senderEmail: composeSenderEmail,
                                     onDismiss: {
+                                        gmail.activeDraft = nil
+                                        gmail.activeComposeMode = nil
+                                        gmail.activeQuotedMessage = nil
                                         withAnimation(.easeInOut(duration: 0.25)) {
                                             showEmailCompose = false
                                         }
                                     },
                                     onSent: {
+                                        gmail.activeDraft = nil
+                                        gmail.activeComposeMode = nil
+                                        gmail.activeQuotedMessage = nil
                                         sentCheckmarkScale = 0.3
                                         withAnimation(.easeInOut(duration: 0.3)) {
                                             showEmailCompose = false
@@ -179,6 +239,7 @@ struct EmailView: View {
                                 )
                                 .padding(.bottom, 20)
                             }
+                            .scrollClipDisabled()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                             .transition(.asymmetric(
                                 insertion: .move(edge: .bottom).combined(with: .opacity),
@@ -193,6 +254,7 @@ struct EmailView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .animation(.easeInOut(duration: 0.3), value: showEmailCompose)
                     .animation(.easeInOut(duration: 0.3), value: showSentAnimation)
+                    .animation(.easeInOut(duration: 0.3), value: showAttachmentsBrowser)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.white)
@@ -291,8 +353,7 @@ struct EmailView: View {
             }
         }
         .padding(.horizontal, 12)
-        .padding(.top, 6)
-        .padding(.bottom, 8)
+        .padding(.vertical, 11)
     }
     
     private var mailboxPopover: some View {
@@ -496,8 +557,9 @@ struct EmailView: View {
                 .foregroundColor(Theme.olive)
             }
             
-            // Close compose
+            // Close compose (save draft first)
             Button {
+                NotificationCenter.default.post(name: .emailComposeSaveAndClose, object: nil)
                 withAnimation(.easeInOut(duration: 0.25)) {
                     showEmailCompose = false
                     showSentAnimation = false
@@ -568,6 +630,40 @@ struct EmailView: View {
             object: nil,
             userInfo: ["action": action.rawValue]
         )
+    }
+    
+    // MARK: - Draft Resumption
+    
+    /// Resume composing a draft from a thread that contains a DRAFT-labelled message.
+    private func resumeDraftFromThread(_ thread: GmailThread) {
+        guard let draftMessage = thread.draftMessage else { return }
+        
+        var draft = gmail.emailDraftFromMessage(draftMessage, thread: thread)
+        
+        // Fetch the Gmail draft ID in the background so we can update it
+        Task {
+            if let draftId = await gmail.fetchDraftId(for: draftMessage.id, accountId: thread.accountId) {
+                await MainActor.run {
+                    draft.gmailDraftId = draftId
+                    draft.gmailMessageId = draftMessage.id
+                    gmail.activeDraft = draft
+                    gmail.activeComposeMode = .newEmail
+                    
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        showEmailCompose = true
+                    }
+                }
+            } else {
+                await MainActor.run {
+                    gmail.activeDraft = draft
+                    gmail.activeComposeMode = .newEmail
+                    
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        showEmailCompose = true
+                    }
+                }
+            }
+        }
     }
     
     // MARK: - Sent Success Animation

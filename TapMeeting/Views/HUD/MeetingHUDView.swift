@@ -12,28 +12,31 @@ struct MeetingHUDView: View {
     
     var body: some View {
         HStack(spacing: 8) {
-            // Green waveform icon
-            Image(systemName: "waveform")
-                .font(.system(size: 12, weight: .bold))
-                .foregroundColor(.green)
+            // Match the main window toolbar brand symbol.
+            Image(systemName: "bird.fill")
+                .font(.system(size: 12))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundColor(Theme.textPrimary)
             
-            // Elapsed time
+            // Elapsed time (fixed minimum width avoids clipping at longer values, e.g. 50:34)
             Text(formattedElapsed)
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.95))
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+                .foregroundColor(Theme.textPrimary)
+                .frame(minWidth: 56, alignment: .leading)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
             Capsule()
-                .fill(Color.black.opacity(isHovered ? 0.85 : 0.75))
-                .shadow(color: .black.opacity(0.25), radius: 12, y: 4)
+                .fill(Color(red: 0.94, green: 0.90, blue: 0.82).opacity(isHovered ? 0.98 : 0.94))
+                .shadow(color: .black.opacity(0.14), radius: 12, y: 4)
         )
         .overlay(
             Capsule()
-                .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+                .stroke(Theme.divider.opacity(0.9), lineWidth: 0.8)
         )
-        .scaleEffect(isHovered ? 1.05 : 1.0)
+        .scaleEffect(isHovered ? 1.03 : 1.0)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovered = hovering
