@@ -32,6 +32,8 @@
 	<string>oQxYE9sAaY501miohbPOD/Z5dw/t9GCiF9Ppc2JeK0Y=</string>
 	<key>SUEnableAutomaticChecks</key>
 	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
 	<key>SUScheduledCheckInterval</key>
 	<integer>3600</integer>
 </dict>
