@@ -1,9 +1,14 @@
 <?xml version="1.0" standalone="yes"?>
-<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0">
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
-        <title>Nest Updates</title>
-        <link>https://raw.githubusercontent.com/tomlidgett1/nest/main/appcast.xml</link>
-        <description>Most recent changes with links to updates.</description>
-        <language>en</language>
+        <title>Nest</title>
+        <item>
+            <title>1.1</title>
+            <pubDate>Tue, 17 Feb 2026 11:52:17 +1100</pubDate>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>1.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/tomlidgett1/nest/releases/download/Nest/Nest.zip" length="7231967" type="application/octet-stream" sparkle:edSignature="AY3D4b46RMqEIX2xb3Jv17L4KlSmRNUJznH9SvHr0gkjK6B/KDdeIgtzfmaf5pxOgwhO9dY7LIprTVUay/f5AQ=="/>
+        </item>
     </channel>
 </rss>
