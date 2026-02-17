@@ -25,6 +25,8 @@ struct TapMeetingApp: App {
     }
 
     var body: some Scene {
+        let _ = connectUpdaterToAppState()
+
         // MARK: - Menu Bar
 
         MenuBarExtra {
@@ -90,6 +92,13 @@ struct TapMeetingApp: App {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updaterService: updaterService)
             }
+        }
+    }
+
+    /// Gives the updater a reference to AppState so it can check meeting status.
+    private func connectUpdaterToAppState() {
+        if updaterService.appState == nil {
+            updaterService.appState = appState
         }
     }
 

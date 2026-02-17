@@ -3,12 +3,12 @@
     <channel>
         <title>Nest</title>
         <item>
-            <title>1.4</title>
-            <pubDate>Tue, 17 Feb 2026 12:17:16 +1100</pubDate>
-            <sparkle:version>5</sparkle:version>
-            <sparkle:shortVersionString>1.4</sparkle:shortVersionString>
+            <title>1.5</title>
+            <pubDate>Tue, 17 Feb 2026 12:29:23 +1100</pubDate>
+            <sparkle:version>6</sparkle:version>
+            <sparkle:shortVersionString>1.5</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/tomlidgett1/nest/releases/download/v1.4/Nest.zip" length="7227210" type="application/octet-stream" sparkle:edSignature="G9yA3Sd0bpgFJUwe+Vup0W9x6Azf2TYIDZlcOZbuW/x+VyuFHYCVve1uCoU7rF/VEs6GPS1xs2zHMcXNmwD6CQ=="/>
+            <enclosure url="https://github.com/tomlidgett1/nest/releases/download/v1.5/Nest.zip" length="7229521" type="application/octet-stream" sparkle:edSignature="74iLlumlpyirR8EQhVYBGX3dlrgTIiCKDsjC7OMqqEkaBYEOVNNcz7f53IZ0/PA6GxkvDWBFc+4A2j16gSueBA=="/>
         </item>
     </channel>
 </rss>
