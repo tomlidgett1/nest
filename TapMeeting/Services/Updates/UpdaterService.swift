@@ -3,6 +3,7 @@ import Sparkle
 
 /// Wraps Sparkle's `SPUStandardUpdaterController` so the rest of the app
 /// can trigger update checks and observe readiness via SwiftUI bindings.
+/// Configured for fully automatic silent updates on launch and every hour.
 final class UpdaterService: ObservableObject {
 
     let updaterController: SPUStandardUpdaterController
@@ -16,6 +17,13 @@ final class UpdaterService: ObservableObject {
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
+
+        let updater = updaterController.updater
+
+        // Force automatic checks and silent installs via code
+        updater.automaticallyChecksForUpdates = true
+        updater.automaticallyDownloadsUpdates = true
+        updater.updateCheckInterval = 3600 // every hour
 
         updaterController.updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
