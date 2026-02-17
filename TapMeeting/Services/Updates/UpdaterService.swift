@@ -1,5 +1,6 @@
 import SwiftUI
 import Sparkle
+import AppKit
 
 // MARK: - Updater Delegate
 
@@ -47,46 +48,108 @@ final class UpdaterDelegate: NSObject, SPUUpdaterDelegate {
 /// can trigger update checks and observe readiness via SwiftUI bindings.
 /// Configured for fully automatic silent updates on launch and every hour.
 /// Will auto-install and relaunch, but only when no meeting is being recorded.
-final class UpdaterService: ObservableObject {
+final class UpdaterService: NSObject, ObservableObject {
 
     let updaterController: SPUStandardUpdaterController
     let updaterDelegate = UpdaterDelegate()
 
     /// Publishes whenever `canCheckForUpdates` changes so buttons can re-evaluate.
     @Published var canCheckForUpdates = false
+    private var periodicCheckTimer: Timer?
+    private var launchCheckAttemptsRemaining = 12
+    private var lastBackgroundCheckDate = Date.distantPast
+    private let launchCheckDelaySeconds: TimeInterval = 5
+    private let launchCheckRetrySeconds: TimeInterval = 5
+    private let periodicCheckSeconds: TimeInterval = 3600
+    private let minimumCheckSpacingSeconds: TimeInterval = 10
 
     /// Set by TapMeetingApp to give the delegate access to meeting state.
     var appState: AppState? {
         didSet { updaterDelegate.appState = appState }
     }
 
-    init() {
+    override init() {
         updaterController = SPUStandardUpdaterController(
             startingUpdater: true,
             updaterDelegate: updaterDelegate,
             userDriverDelegate: nil
         )
 
+        super.init()
+
         let updater = updaterController.updater
 
         // Force automatic checks and silent installs via code
         updater.automaticallyChecksForUpdates = true
         updater.automaticallyDownloadsUpdates = true
-        updater.updateCheckInterval = 3600 // every hour
+        updater.updateCheckInterval = periodicCheckSeconds
 
         updater.publisher(for: \.canCheckForUpdates)
             .assign(to: &$canCheckForUpdates)
 
-        // Check for updates 5 seconds after launch
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard let self, self.updaterController.updater.canCheckForUpdates else { return }
-            self.updaterController.updater.checkForUpdatesInBackground()
-        }
+        startDeterministicBackgroundChecks()
+    }
+
+    deinit {
+        periodicCheckTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
     }
 
     /// Manually trigger an update check (e.g. from a "Check for Updates" menu item).
     func checkForUpdates() {
         updaterController.checkForUpdates(nil)
+    }
+
+    // MARK: - Deterministic Auto-Check Flow
+
+    /// Guarantees update checks on launch, every hour, and on app activation.
+    /// This avoids timing races where Sparkle is not yet ready at first launch check.
+    private func startDeterministicBackgroundChecks() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+
+        periodicCheckTimer = Timer.scheduledTimer(withTimeInterval: periodicCheckSeconds, repeats: true) { [weak self] _ in
+            self?.performBackgroundCheckIfPossible()
+        }
+        periodicCheckTimer?.tolerance = 60
+
+        scheduleLaunchCheckAttempt(after: launchCheckDelaySeconds)
+    }
+
+    @objc
+    private func appDidBecomeActive() {
+        performBackgroundCheckIfPossible()
+    }
+
+    private func scheduleLaunchCheckAttempt(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            if self.updaterController.updater.canCheckForUpdates {
+                self.performBackgroundCheckIfPossible(force: true)
+                return
+            }
+
+            if self.launchCheckAttemptsRemaining > 0 {
+                self.launchCheckAttemptsRemaining -= 1
+                self.scheduleLaunchCheckAttempt(after: self.launchCheckRetrySeconds)
+            }
+        }
+    }
+
+    private func performBackgroundCheckIfPossible(force: Bool = false) {
+        guard updaterController.updater.canCheckForUpdates else { return }
+
+        let now = Date()
+        if !force, now.timeIntervalSince(lastBackgroundCheckDate) < minimumCheckSpacingSeconds {
+            return
+        }
+
+        lastBackgroundCheckDate = now
+        updaterController.updater.checkForUpdatesInBackground()
     }
 }
 
