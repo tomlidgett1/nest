@@ -4,11 +4,11 @@
         <title>Nest</title>
         <item>
             <title>1.1</title>
-            <pubDate>Tue, 17 Feb 2026 11:52:17 +1100</pubDate>
-            <sparkle:version>1</sparkle:version>
+            <pubDate>Tue, 17 Feb 2026 11:59:35 +1100</pubDate>
+            <sparkle:version>2</sparkle:version>
             <sparkle:shortVersionString>1.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/tomlidgett1/nest/releases/download/Nest/Nest.zip" length="7231967" type="application/octet-stream" sparkle:edSignature="AY3D4b46RMqEIX2xb3Jv17L4KlSmRNUJznH9SvHr0gkjK6B/KDdeIgtzfmaf5pxOgwhO9dY7LIprTVUay/f5AQ=="/>
+            <enclosure url="https://github.com/tomlidgett1/nest/releases/download/Nest/Nest.zip" length="7226967" type="application/octet-stream" sparkle:edSignature="cMRBPbED7ffFnDo62rPaNqwtfbywRgexWU1XHVgkrjrYroHsSRoyKyQLZFwkqnLFNpufsGSy/bji4mWRPy4pBA=="/>
         </item>
     </channel>
 </rss>
