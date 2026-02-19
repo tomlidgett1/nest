@@ -158,6 +158,10 @@ struct QueryEvent: Identifiable {
     let didRefuse: Bool
     let fallbackUsed: Bool
     let retrievalRounds: Int
+    /// Sources identified by the orchestration planner (e.g. ["notes", "transcripts", "calendar"])
+    var queryPlanSources: [String] = []
+    /// Intent classified by the planner (e.g. "summarise", "find", "draft")
+    var queryPlanIntent: String?
 }
 
 struct PipelineError: Identifiable {

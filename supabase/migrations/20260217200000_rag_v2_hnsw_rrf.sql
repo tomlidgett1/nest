@@ -3,8 +3,21 @@
 -- ============================================================
 
 -- 1. Replace IVFFlat with HNSW for ~95% recall (up from ~1%)
+-- NOTE: Run step 1 separately with a long timeout if you have many embeddings.
+-- The CONCURRENTLY option builds the index without blocking writes and avoids
+-- the default statement timeout. Run this one statement on its own first:
+--
+--   SET statement_timeout = '0';
+--   DROP INDEX IF EXISTS idx_search_embeddings_vector_ivfflat;
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_search_embeddings_vector_hnsw
+--       ON search_embeddings
+--       USING hnsw (embedding halfvec_cosine_ops)
+--       WITH (m = 16, ef_construction = 200);
+--
+-- Then run everything below (from step 2 onward).
+
 DROP INDEX IF EXISTS idx_search_embeddings_vector_ivfflat;
-CREATE INDEX idx_search_embeddings_vector_hnsw
+CREATE INDEX IF NOT EXISTS idx_search_embeddings_vector_hnsw
     ON search_embeddings
     USING hnsw (embedding halfvec_cosine_ops)
     WITH (m = 16, ef_construction = 200);
@@ -30,7 +43,7 @@ CREATE OR REPLACE FUNCTION hybrid_search_documents(
     query_embedding halfvec(3072),
     match_count INT DEFAULT 30,
     source_filters TEXT[] DEFAULT NULL,
-    min_semantic_score FLOAT DEFAULT 0.40
+    min_semantic_score FLOAT DEFAULT 0.28
 )
 RETURNS TABLE (
     document_id UUID,
@@ -122,7 +135,7 @@ CREATE OR REPLACE FUNCTION match_search_documents(
     query_embedding halfvec(3072),
     match_count INT DEFAULT 30,
     source_filters TEXT[] DEFAULT NULL,
-    min_score FLOAT DEFAULT 0.40
+    min_score FLOAT DEFAULT 0.28
 )
 RETURNS TABLE (
     document_id UUID,

@@ -58,6 +58,8 @@ struct EmailComposeView: View {
     @State private var aiPrompt: String = ""
     @State private var isAIGenerating: Bool = false
     @State private var aiError: String?
+    @State private var aiDebugInfo: EmailAIService.DebugInfo?
+    @State private var showAIDebug: Bool = false
     
     // Contact autocomplete state
     @State private var contactSuggestions: [ContactSuggestion] = []
@@ -79,7 +81,9 @@ struct EmailComposeView: View {
     var onSent: (() -> Void)?
     
     private var gmail: GmailService { appState.gmailService }
-    private let aiService = EmailAIService()
+    private var aiService: EmailAIService {
+        EmailAIService(pipeline: appState.searchQueryPipeline)
+    }
     
     /// The style profile for the current account.
     private var activeStyleProfile: StyleProfile? {
@@ -905,6 +909,89 @@ struct EmailComposeView: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 10)
             }
+            
+            // Debug panel
+            if let debug = aiDebugInfo {
+                aiDebugPanel(debug)
+            }
+        }
+    }
+    
+    // MARK: - AI Debug Panel
+    
+    private func aiDebugPanel(_ debug: EmailAIService.DebugInfo) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showAIDebug.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "ant")
+                        .font(.system(size: 9))
+                    Text("Pipeline Debug")
+                        .font(.system(size: 10, weight: .medium))
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8))
+                        .rotationEffect(.degrees(showAIDebug ? 180 : 0))
+                }
+                .foregroundColor(debug.evidenceCount > 0 ? Theme.olive : Theme.recording)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+            .buttonStyle(.plain)
+            
+            if showAIDebug {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        debugRow("Pipeline", debug.pipelineAvailable ? "Available" : "Unavailable")
+                        debugRow("Search query", debug.searchQuery)
+                        debugRow("Evidence blocks", "\(debug.evidenceCount)")
+                        if let temporal = debug.temporalLabel {
+                            debugRow("Temporal", temporal)
+                        }
+                        if !debug.evidenceTitles.isEmpty {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Evidence:")
+                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(Theme.textTertiary)
+                                ForEach(Array(debug.evidenceTitles.enumerated()), id: \.offset) { i, title in
+                                    Text("  [\(i + 1)] \(title)")
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundColor(Theme.textSecondary)
+                                }
+                            }
+                        }
+                        debugRow("LLM response", debug.anthropicResponsePreview)
+                        if let error = debug.error {
+                            debugRow("Error", error)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                }
+                .frame(maxHeight: 220)
+            }
+        }
+        .background(Color.white)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(debug.evidenceCount > 0 ? Theme.olive.opacity(0.3) : Theme.recording.opacity(0.3), lineWidth: 1)
+        )
+        .cornerRadius(6)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 8)
+    }
+    
+    private func debugRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(label + ":")
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundColor(Theme.textTertiary)
+                .frame(width: 90, alignment: .trailing)
+            Text(value)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(Theme.textSecondary)
+                .textSelection(.enabled)
         }
     }
     
@@ -915,15 +1002,20 @@ struct EmailComposeView: View {
         
         isAIGenerating = true
         aiError = nil
+        aiDebugInfo = nil
+        
+        let service = aiService
         
         Task {
             do {
-                let composed = try await aiService.composeEmail(
+                let composed = try await service.composeEmail(
                     prompt: aiPrompt,
                     styleProfile: activeStyleProfile,
                     globalInstructions: globalInstructions
                 )
                 await MainActor.run {
+                    aiDebugInfo = service.lastDebugInfo
+                    
                     if !composed.subject.isEmpty {
                         draft.subject = composed.subject
                     }
@@ -947,6 +1039,7 @@ struct EmailComposeView: View {
                 }
             } catch {
                 await MainActor.run {
+                    aiDebugInfo = service.lastDebugInfo
                     aiError = error.localizedDescription
                     isAIGenerating = false
                 }

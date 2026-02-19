@@ -24,6 +24,7 @@ struct EmailView: View {
     @State private var isInReplyMode = false
     @State private var showMailboxPopover = false
     @State private var showAttachmentsBrowser = false
+    @State private var showIntelligenceHub = false
     @FocusState private var isSearchFocused: Bool
     
     private let minListWidth: CGFloat = 340
@@ -58,6 +59,13 @@ struct EmailView: View {
         }
         .onChange(of: gmail.selectedThread?.id) { _, newId in
             guard newId != nil, let thread = gmail.selectedThread else { return }
+            
+            // Dismiss intelligence hub when a thread is selected
+            if showIntelligenceHub {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showIntelligenceHub = false
+                }
+            }
             
             // If the selected thread has a draft and we're in the Drafts mailbox,
             // auto-open compose with the draft content
@@ -245,16 +253,29 @@ struct EmailView: View {
                                 insertion: .move(edge: .bottom).combined(with: .opacity),
                                 removal: .opacity
                             ))
-                        } else {
+                        } else if gmail.selectedThread != nil && !showIntelligenceHub {
                             EmailDetailView()
                                 .frame(maxWidth: .infinity)
                                 .transition(.opacity)
+                        } else {
+                            EmailIntelligenceHubView(onSelectThread: { threadId in
+                                if let thread = gmail.inboxThreads.first(where: { $0.id == threadId }) {
+                                    gmail.selectedThread = thread
+                                    gmail.selectedMessageId = nil
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showIntelligenceHub = false
+                                    }
+                                }
+                            })
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .transition(.opacity)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .animation(.easeInOut(duration: 0.3), value: showEmailCompose)
                     .animation(.easeInOut(duration: 0.3), value: showSentAnimation)
                     .animation(.easeInOut(duration: 0.3), value: showAttachmentsBrowser)
+                    .animation(.easeInOut(duration: 0.3), value: showIntelligenceHub)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.white)
@@ -351,6 +372,26 @@ struct EmailView: View {
                     .foregroundColor(Theme.textTertiary)
                     .fixedSize()
             }
+            
+            // Insights toggle
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    showIntelligenceHub.toggle()
+                    if showIntelligenceHub {
+                        showAttachmentsBrowser = false
+                        showEmailCompose = false
+                    }
+                }
+            } label: {
+                Image(systemName: "chart.bar")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(showIntelligenceHub ? Theme.olive : Theme.textTertiary)
+                    .frame(width: 28, height: 28)
+                    .background(showIntelligenceHub ? Theme.olive.opacity(0.1) : Theme.sidebarBackground)
+                    .cornerRadius(6)
+            }
+            .buttonStyle(.plain)
+            .help("Email Insights")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 11)

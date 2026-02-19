@@ -39,6 +39,9 @@ final class AppState {
     var debugSystemBuffersSent = 0
     var debugMicSuppressedBySystem = 0
     
+    /// Guard to prevent double-execution of `initializeAfterAuth`.
+    var isInitializing = false
+
     // MARK: - Supabase
 
     /// Supabase auth and config service. Set after authentication.
@@ -61,6 +64,25 @@ final class AppState {
         }
     }
 
+    /// Reset services so they are re-created on next login.
+    /// Called when the user signs out.
+    func resetServicesForSignOut() {
+        syncService = nil
+        semanticSearchService = nil
+        searchQueryPipeline = nil
+        semanticChatService = nil
+        searchIngestionService = nil
+        searchEvaluationService = nil
+        nestAIService.pipeline = nil
+        emailDigestService.pipeline = nil
+        nestHomeService = nil
+        v2ChatService.pipeline = nil
+        v2ChatService.emailStyleContext = nil
+        v2ChatService.unsubscribe()
+        hasBootstrappedGmailLaunchFetch = false
+        isInitializing = false
+    }
+
     /// Sync service for bidirectional SwiftData <-> Supabase. Set after authentication.
     var syncService: SyncService? {
         didSet {
@@ -71,7 +93,9 @@ final class AppState {
 
     /// Semantic search retrieval.
     var semanticSearchService: SemanticSearchService?
-    /// Grounded semantic chatbot.
+    /// Central RAG query pipeline — shared by every AI feature.
+    var searchQueryPipeline: SearchQueryPipeline?
+    /// Grounded semantic chatbot (thin wrapper over the pipeline).
     var semanticChatService: SemanticChatService?
     /// Search ingestion + backfill orchestration.
     var searchIngestionService: SearchIngestionService?
@@ -109,6 +133,12 @@ final class AppState {
     // MARK: - Nest Services (persisted across tab switches)
     private(set) var nestHomeService: NestHomeService?
     let nestAIService = NestAIService()
+    
+    /// Email intelligence digest service — persists across tab switches.
+    let emailDigestService = EmailDigestService()
+    
+    /// V2 agent chatbot service — persists across tab switches.
+    let v2ChatService = V2ChatService()
     
     /// Meeting HUD — managed directly by AppState.
     private var meetingHUD: MeetingHUDController?
@@ -179,7 +209,11 @@ final class AppState {
     
     // MARK: - Init
     
+    /// SwiftData model context — stored for querying StyleProfile and other models.
+    private let modelContext: ModelContext
+    
     init(modelContext: ModelContext) {
+        self.modelContext = modelContext
         self.noteRepository = NoteRepository(modelContext: modelContext)
         self.todoRepository = TodoRepository(modelContext: modelContext)
         
@@ -896,10 +930,30 @@ final class AppState {
             embeddingService: embeddingService,
             telemetry: searchTelemetryService
         )
-        let semanticChat = SemanticChatService(
+
+        // Central pipeline — shared by every AI feature
+        let pipeline = SearchQueryPipeline(
             searchService: semanticSearch,
             telemetry: searchTelemetryService
         )
+        pipeline.liveCalendarProvider = { [weak self] in
+            guard let self else { return [] }
+            var all = self.calendarService.upcomingEvents
+            all.append(contentsOf: self.googleCalendarService.events)
+            var seen = Set<String>()
+            return all.filter { seen.insert($0.id).inserted }
+        }
+        pipeline.liveCalendarRangeProvider = { [weak self] start, end in
+            guard let self else { return [] }
+            return await self.googleCalendarService.fetchEventsForRange(start: start, end: end)
+        }
+
+        // Chat service — thin wrapper over the pipeline for conversational UX
+        let semanticChat = SemanticChatService(
+            pipeline: pipeline,
+            telemetry: searchTelemetryService
+        )
+
         let ingestion = SearchIngestionService(
             client: supabase.client,
             embeddingService: embeddingService,
@@ -908,9 +962,103 @@ final class AppState {
         )
 
         self.semanticSearchService = semanticSearch
+        self.searchQueryPipeline = pipeline
         self.semanticChatService = semanticChat
         self.searchIngestionService = ingestion
         self.searchEvaluationService = SearchEvaluationService(searchService: semanticSearch, telemetry: searchTelemetryService)
+
+        // Inject pipeline into NestAIService so all Nest AI features gain semantic awareness
+        nestAIService.pipeline = pipeline
+
+        // Inject pipeline into EmailDigestService so email intelligence gains semantic awareness
+        emailDigestService.pipeline = pipeline
+
+        // Inject pipeline into V2ChatService so the agent has full knowledge of the user's data
+        v2ChatService.pipeline = pipeline
+        
+        // Inject email style context (StyleProfile + global instructions) so the
+        // v2 email agent drafts in the user's voice with correct formatting.
+        v2ChatService.emailStyleContext = buildEmailStyleContext()
+
+        // Start Realtime subscription for trigger notifications (emails, calendar)
+        // so they arrive even when the user isn't on the v2 Agent tab.
+        Task { await v2ChatService.subscribeToTriggers() }
+    }
+    
+    /// Serialise the user's email StyleProfile + global instructions into a prompt-ready
+    /// string that the v2 email agent uses to draft emails in the user's voice.
+    /// Mirrors the logic in `EmailAIService.buildStyleContext()`.
+    func buildEmailStyleContext() -> String? {
+        let email = gmailService.connectedEmail ?? ""
+        guard !email.isEmpty else { return nil }
+        
+        // Fetch StyleProfile from SwiftData
+        var profile: StyleProfile?
+        do {
+            let profiles = try modelContext.fetch(FetchDescriptor<StyleProfile>())
+            profile = profiles.first { $0.accountEmail.lowercased() == email.lowercased() }
+        } catch {
+            print("[AppState] Failed to fetch StyleProfile: \(error.localizedDescription)")
+        }
+        
+        // Read global email instructions from UserDefaults
+        let globalInstructions = UserDefaults.standard.string(
+            forKey: Constants.Defaults.globalEmailInstructions
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // Build serialised context
+        var parts: [String] = []
+        
+        if let profile, !profile.styleSummary.isEmpty {
+            parts.append("## Writing Style Profile")
+            parts.append(profile.styleSummary)
+            
+            let greetings = profile.greetings
+            if !greetings.isEmpty {
+                parts.append("Typical greetings: \(greetings.joined(separator: ", "))")
+            }
+            
+            let signOffs = profile.signOffs
+            if !signOffs.isEmpty {
+                parts.append("Typical sign-offs: \(signOffs.joined(separator: ", "))")
+            }
+            
+            if !profile.signatureName.isEmpty {
+                parts.append("Signs as: \(profile.signatureName)")
+            }
+            
+            let phrases = profile.commonPhrases
+            if !phrases.isEmpty {
+                parts.append("Common phrases: \(phrases.joined(separator: ", "))")
+            }
+            
+            let avoided = profile.avoidedPhrases
+            if !avoided.isEmpty {
+                parts.append("Phrases to avoid: \(avoided.joined(separator: ", "))")
+            }
+            
+            parts.append("Formality: \(String(format: "%.1f", profile.formalityScore))/1.0")
+            parts.append("Uses contractions: \(profile.usesContractions ? "yes" : "no")")
+            parts.append("Uses emoji: \(profile.usesEmoji ? "yes" : "no")")
+            parts.append("Prefers bullet points: \(profile.prefersBulletPoints ? "yes" : "no")")
+            parts.append("Locale: \(profile.locale)")
+            
+            let excerpts = profile.sampleExcerpts
+            if !excerpts.isEmpty {
+                parts.append("\nExample excerpts of how this user writes:")
+                for (i, excerpt) in excerpts.enumerated() {
+                    parts.append("\(i + 1). \(excerpt)")
+                }
+            }
+        }
+        
+        if let global = globalInstructions, !global.isEmpty {
+            parts.append("\n## Global Email Rules")
+            parts.append(global)
+        }
+        
+        let result = parts.joined(separator: "\n")
+        return result.isEmpty ? nil : result
     }
     
     private func startGmailBootstrapIfNeeded() {
@@ -923,15 +1071,24 @@ final class AppState {
 
     func runSemanticBackfillIfNeeded() async {
         guard let ingestion = searchIngestionService else { return }
-        if gmailService.inboxThreads.isEmpty {
-            await gmailService.fetchMailbox(.inbox)
+
+        // Fetch all mailboxes so allThreads() includes everything
+        await withTaskGroup(of: Void.self) { group in
+            for mailbox: Mailbox in [.inbox, .sent, .drafts, .archived, .bin] {
+                group.addTask { [gmailService] in
+                    await gmailService.fetchMailbox(mailbox)
+                }
+            }
         }
-        if gmailService.sentThreads.isEmpty {
-            await gmailService.fetchMailbox(.sent)
-        }
+
         calendarService.fetchUpcomingEvents()
-        let (notes, threads, events) = await MainActor.run {
-            let n = noteRepository.fetchAllNotes()
+        let (notesWithTranscripts, threads, events) = await MainActor.run {
+            // Pre-fetch notes AND their transcripts on the main actor (SwiftData relationships are lazy)
+            let allNotes = noteRepository.fetchAllNotes()
+            let bundled = allNotes.map { note in
+                SearchIngestionService.NoteWithTranscript(note: note, utterances: Array(note.transcript))
+            }
+
             let allThreads = gmailService.allThreads()
             let e = calendarService.upcomingEvents
 
@@ -945,7 +1102,6 @@ final class AppState {
 
             let filtered: [GmailThread]
             if selectedAccountIds.isEmpty {
-                // No accounts selected → skip email backfill entirely
                 filtered = []
             } else {
                 filtered = allThreads.filter { thread in
@@ -953,9 +1109,9 @@ final class AppState {
                 }
             }
 
-            return (n, filtered, e)
+            return (bundled, filtered, e)
         }
-        await ingestion.runMandatoryBackfill(notes: notes, threads: threads, calendarEvents: events)
+        await ingestion.runMandatoryBackfill(notes: notesWithTranscripts, threads: threads, calendarEvents: events)
     }
 
     /// Clears backfill state and re-indexes all content from scratch.

@@ -20,7 +20,9 @@ struct MeetingFollowUpSheet: View {
     @State private var error: String?
     @State private var generatedPreview: ComposedEmail?
     
-    private let aiService = EmailAIService()
+    private var aiService: EmailAIService {
+        EmailAIService(pipeline: appState.searchQueryPipeline)
+    }
     
     /// The style profile for the current account.
     private var activeStyleProfile: StyleProfile? {

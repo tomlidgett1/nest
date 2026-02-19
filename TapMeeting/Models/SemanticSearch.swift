@@ -85,6 +85,17 @@ struct SemanticChatMessage: Identifiable, Hashable {
     }
 }
 
+/// A single block of retrieved evidence passed to the LLM for grounded generation.
+/// Shared across all AI features that use the `SearchQueryPipeline`.
+struct EvidenceBlock {
+    let sourceType: String
+    let title: String
+    let text: String
+    let semanticScore: Double
+    let sourceId: String
+    let documentId: UUID
+}
+
 struct SearchBackfillStatus {
     enum Stage: String {
         case idle

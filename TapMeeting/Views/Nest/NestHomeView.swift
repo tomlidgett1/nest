@@ -23,6 +23,7 @@ struct NestHomeView: View {
     private let refreshTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
     
     var body: some View {
+        let _ = appState.noteRepository.dataRevision // observe sync changes
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {

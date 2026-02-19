@@ -6,8 +6,17 @@ import Foundation
 ///
 /// All calls route through `AIProxyClient` → Supabase Edge Function → Claude.
 /// Results are cached aggressively to minimise API costs.
+///
+/// When `pipeline` is set, every AI method enriches its prompt with semantic
+/// context retrieved from the user's indexed history (emails, transcripts,
+/// notes, calendar). This is injected by `AppState` after the search stack
+/// is configured. If nil, methods degrade gracefully to their original behaviour.
 @Observable
 final class NestAIService {
+
+    /// Central RAG pipeline — injected by AppState after auth.
+    /// Enables deep semantic context in every AI feature.
+    var pipeline: SearchQueryPipeline?
     
     // MARK: - Published State
     
@@ -110,6 +119,20 @@ final class NestAIService {
             }.joined(separator: "\n")
         }
         
+        // Semantic enrichment — query top meetings by title + attendees in parallel
+        var semanticQueries: [String] = []
+        let topMeetings = todayEvents.filter { !$0.isAllDay }.prefix(3)
+        for event in topMeetings {
+            let q = "\(event.title) \(event.attendeeNames.joined(separator: " "))"
+            semanticQueries.append(q)
+        }
+        let semanticContext = await fetchSemanticContextBatch(
+            queries: semanticQueries,
+            sourceFilters: [.noteChunk, .utteranceChunk, .emailChunk],
+            maxBlocks: 6,
+            maxTotalChars: 2000
+        )
+
         let dataPayload = """
         Today's Calendar:
         \(calendarBlock.isEmpty ? "No meetings today." : calendarBlock)
@@ -124,6 +147,7 @@ final class NestAIService {
         \(yesterdayBlock)
         
         Completed today so far: \(completedTodosToday.count) items
+        \(semanticContext)
         """
         
         let system = """
@@ -134,7 +158,10 @@ final class NestAIService {
         from key people. Do not list everything — highlight what matters most and why. End with \
         one forward-looking sentence about the day ahead. Use Australian English spelling. \
         Do NOT use markdown formatting, bullet points, or headers — write as flowing prose, like \
-        a note from a personal assistant.
+        a note from a personal assistant. \
+        If SEMANTIC CONTEXT is provided, weave in specific details from past meetings, emails, \
+        and transcripts — e.g. mention what was discussed last time with someone the user is \
+        meeting today, or flag an email thread that relates to an upcoming meeting topic.
         """
         
         do {
@@ -233,6 +260,24 @@ final class NestAIService {
             Body preview: \(body)
             """
         }.joined(separator: "\n---\n")
+
+        // Semantic enrichment — one batch query from top email subjects to surface project context
+        let topSubjects = batch.prefix(5).compactMap { $0.latestMessage?.subject }
+        let projectQuery = topSubjects.joined(separator: " ")
+        let semanticContext = await fetchSemanticContext(
+            query: projectQuery,
+            sourceFilters: [.noteChunk, .utteranceChunk],
+            maxBlocks: 5,
+            maxTotalChars: 1500
+        )
+
+        let projectContextBlock = semanticContext.isEmpty ? "" : """
+        
+        \(semanticContext)
+        
+        Use this context to boost scores for emails that relate to active projects, recent \
+        meetings, or open commitments visible in the semantic context.
+        """
         
         let system = """
         You are an email triage assistant. For each email below, determine if the user genuinely \
@@ -261,7 +306,7 @@ final class NestAIService {
                 "max_tokens": 1024,
                 "system": system,
                 "messages": [
-                    ["role": "user", "content": emailSummaries]
+                    ["role": "user", "content": emailSummaries + projectContextBlock]
                 ]
             ]
             
@@ -330,6 +375,15 @@ final class NestAIService {
         
         let todosBlock = openItems.isEmpty ? "No open commitments." :
             openItems.map { "\($0.isOverdue ? "OVERDUE: " : "- ")\($0.title)" }.joined(separator: "\n")
+
+        // Semantic enrichment — retrieve deep context about this meeting's topic and people
+        let semanticQuery = "\(title) \(attendeeNames.joined(separator: " "))"
+        let semanticContext = await fetchSemanticContext(
+            query: semanticQuery,
+            sourceFilters: [.noteChunk, .utteranceChunk, .emailChunk],
+            maxBlocks: 8,
+            maxTotalChars: 3000
+        )
         
         let dataPayload = """
         Meeting: \(title)
@@ -343,6 +397,7 @@ final class NestAIService {
         
         Open commitments related to these people:
         \(todosBlock)
+        \(semanticContext)
         """
         
         let system = """
@@ -352,7 +407,10 @@ final class NestAIService {
         last time, (2) any commitments that are still open (especially overdue ones — flag these), \
         (3) notable emails since the last meeting, (4) what to focus on in today's meeting. \
         Be specific — use names, dates, and details from the data. Use Australian English. \
-        Do NOT use markdown formatting or bullet points — write as flowing prose.
+        Do NOT use markdown formatting or bullet points — write as flowing prose. \
+        If SEMANTIC CONTEXT is provided, use it to add depth — reference specific past \
+        conversations, decisions, and commitments. Prefer concrete details from semantic \
+        context over generic statements.
         """
         
         do {
@@ -538,6 +596,56 @@ final class NestAIService {
             let attendees = event.attendeeNames.isEmpty ? "" : " with \(event.attendeeNames.joined(separator: ", "))"
             return "- \(time)–\(end): \(event.title)\(attendees)"
         }.joined(separator: "\n")
+
+        // Semantic enrichment — type-specific queries
+        let semanticContext: String
+        switch type {
+        case .dayAtAGlance, .endOfDay:
+            // Pull transcript highlights and email content from today's meetings
+            var queries: [String] = []
+            for event in todayEvents.filter({ !$0.isAllDay }).prefix(3) {
+                queries.append("\(event.title) \(event.attendeeNames.joined(separator: " "))")
+            }
+            semanticContext = await fetchSemanticContextBatch(
+                queries: queries,
+                sourceFilters: [.noteChunk, .utteranceChunk, .emailChunk],
+                maxBlocks: 6,
+                maxTotalChars: 2000
+            )
+        case .nextMeetingPrep:
+            // Same strategy as meeting brief — deep context on next meeting
+            if let next = todayEvents.filter({ !$0.isAllDay && $0.startDate > .now }).first {
+                let q = "\(next.title) \(next.attendeeNames.joined(separator: " "))"
+                semanticContext = await fetchSemanticContext(
+                    query: q,
+                    sourceFilters: [.noteChunk, .utteranceChunk, .emailChunk],
+                    maxBlocks: 8,
+                    maxTotalChars: 2500
+                )
+            } else {
+                semanticContext = ""
+            }
+        case .tomorrow:
+            // Query by tomorrow's meeting titles + attendees
+            var queries: [String] = []
+            for event in tomorrowEvents.filter({ !$0.isAllDay }).prefix(3) {
+                queries.append("\(event.title) \(event.attendeeNames.joined(separator: " "))")
+            }
+            semanticContext = await fetchSemanticContextBatch(
+                queries: queries,
+                sourceFilters: [.noteChunk, .utteranceChunk, .emailChunk],
+                maxBlocks: 6,
+                maxTotalChars: 2000
+            )
+        case .catchUp:
+            // Broad query for what's been happening
+            semanticContext = await fetchSemanticContext(
+                query: "important updates decisions action items this week",
+                sourceFilters: [.noteChunk, .utteranceChunk, .emailChunk],
+                maxBlocks: 10,
+                maxTotalChars: 3000
+            )
+        }
         
         let dataPayload = """
         Current time: \(Date.now.formatted(date: .complete, time: .shortened))
@@ -556,8 +664,17 @@ final class NestAIService {
         
         Relevant Meeting Notes (prioritised by attendee overlap with upcoming meetings):
         \(meetingNotesBlock.isEmpty ? "None." : meetingNotesBlock)
+        \(semanticContext)
         """
         
+        let semanticInstruction = semanticContext.isEmpty ? "" : """
+        
+        SEMANTIC CONTEXT RULES:
+        - If SEMANTIC CONTEXT is provided, use it to add depth and specificity.
+        - Reference specific past conversations, decisions, email threads, and commitments.
+        - Prefer concrete details from semantic context over generic statements.
+        """
+
         let markdownInstructions = """
         
         FORMAT RULES — you MUST follow these exactly:
@@ -569,7 +686,7 @@ final class NestAIService {
         - Use Australian English spelling
         - 2-4 sections, each with 2-5 bullets maximum
         - Be specific — use real names, times, and details from the data
-        - Second person ("you"), warm but efficient tone
+        - Second person ("you"), warm but efficient tone\(semanticInstruction)
         """
         
         let system: String
@@ -728,23 +845,35 @@ final class NestAIService {
         let calendarContext = todayEvents.filter({ !$0.isAllDay }).prefix(5).map { event in
             "\(event.startDate.formatted(date: .omitted, time: .shortened)): \(event.title) with \(event.attendeeNames.joined(separator: ", "))"
         }.joined(separator: "\n")
+
+        // Semantic enrichment — query todo titles to find related discussions/emails
+        let todoQuery = topTodos.prefix(5).map(\.title).joined(separator: " ")
+        let semanticContext = await fetchSemanticContext(
+            query: todoQuery,
+            sourceFilters: [.noteChunk, .emailChunk, .utteranceChunk],
+            maxBlocks: 5,
+            maxTotalChars: 1500
+        )
         
         let system = """
         For each to-do item below, write a single SHORT sentence (max 12 words) explaining why \
         it matters RIGHT NOW in the context of today's calendar. Focus on social pressure ("Tom \
         will ask about this at 2pm"), time pressure ("3 days overdue"), or opportunity ("good \
         time to close this before the meeting"). If there's no particular urgency, say why it's \
-        still worth doing today. Respond ONLY as a JSON array: [{"index": 1, "context": "..."}]. \
+        still worth doing today. If SEMANTIC CONTEXT is provided, use it to reference specific \
+        people, conversations, or deadlines from the user's history. \
+        Respond ONLY as a JSON array: [{"index": 1, "context": "..."}]. \
         No other text.
         """
         
         do {
+            let userContent = "To-dos:\n\(todoSummaries)\n\nToday's calendar:\n\(calendarContext)\(semanticContext)"
             let body: [String: Any] = [
                 "model": Constants.AI.anthropicSonnetModel,
                 "max_tokens": 512,
                 "system": system,
                 "messages": [
-                    ["role": "user", "content": "To-dos:\n\(todoSummaries)\n\nToday's calendar:\n\(calendarContext)"]
+                    ["role": "user", "content": userContent]
                 ]
             ]
             
@@ -773,6 +902,116 @@ final class NestAIService {
         } catch {
             print("[NestAI] Action context generation failed: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Semantic Context Helper
+
+    /// Queries the central RAG pipeline and formats retrieved evidence into a
+    /// prompt-ready string. Returns empty string if pipeline is nil or no results.
+    ///
+    /// Every AI method calls this to enrich its prompt with deep historical context
+    /// from the user's indexed emails, meeting transcripts, notes, and calendar.
+    private func fetchSemanticContext(
+        query: String,
+        sourceFilters: [SearchSourceType] = SearchSourceType.allCases,
+        maxBlocks: Int = 6,
+        maxTotalChars: Int = 2500
+    ) async -> String {
+        guard let pipeline else { return "" }
+
+        do {
+            let result = try await pipeline.execute(
+                query: query,
+                options: .init(
+                    sourceFilters: sourceFilters,
+                    maxEvidenceBlocks: maxBlocks,
+                    enableLLMRewrite: true,
+                    enableTemporalResolution: false,
+                    enableAgenticFallback: true
+                )
+            )
+
+            guard !result.evidence.isEmpty else { return "" }
+
+            var chars = 0
+            var lines: [String] = []
+            for (i, block) in result.evidence.enumerated() {
+                let entry = "[\(i + 1)] \(block.title) — \(block.sourceType)\n\(block.text)"
+                if chars + entry.count > maxTotalChars { break }
+                lines.append(entry)
+                chars += entry.count
+            }
+
+            guard !lines.isEmpty else { return "" }
+
+            return """
+
+            SEMANTIC CONTEXT (from your indexed history — meetings, emails, transcripts, notes):
+            \(lines.joined(separator: "\n\n"))
+            """
+        } catch {
+            print("[NestAI] Semantic context fetch failed: \(error.localizedDescription)")
+            return ""
+        }
+    }
+
+    /// Runs multiple semantic queries in parallel and merges the results into a single context string.
+    private func fetchSemanticContextBatch(
+        queries: [String],
+        sourceFilters: [SearchSourceType] = SearchSourceType.allCases,
+        maxBlocks: Int = 6,
+        maxTotalChars: Int = 2500
+    ) async -> String {
+        guard let pipeline, !queries.isEmpty else { return "" }
+
+        var allEvidence: [EvidenceBlock] = []
+
+        await withTaskGroup(of: [EvidenceBlock].self) { group in
+            for query in queries {
+                group.addTask {
+                    guard let result = try? await pipeline.execute(
+                        query: query,
+                        options: .init(
+                            sourceFilters: sourceFilters,
+                            maxEvidenceBlocks: maxBlocks / max(queries.count, 1),
+                            enableLLMRewrite: true,
+                            enableTemporalResolution: false,
+                            enableAgenticFallback: false
+                        )
+                    ) else { return [] }
+                    return result.evidence
+                }
+            }
+            for await evidence in group {
+                allEvidence.append(contentsOf: evidence)
+            }
+        }
+
+        // Deduplicate by documentId and take top by score
+        var seen = Set<UUID>()
+        let deduped = allEvidence
+            .sorted { $0.semanticScore > $1.semanticScore }
+            .filter { seen.insert($0.documentId).inserted }
+            .prefix(maxBlocks)
+
+        guard !deduped.isEmpty else { return "" }
+
+        var chars = 0
+        var lines: [String] = []
+        for (i, block) in deduped.enumerated() {
+            let entry = "[\(i + 1)] \(block.title) — \(block.sourceType)\n\(block.text)"
+            if chars + entry.count > maxTotalChars { break }
+            lines.append(entry)
+            chars += entry.count
+        }
+
+        guard !lines.isEmpty else { return "" }
+
+        return """
+
+        SEMANTIC CONTEXT (from your indexed history — meetings, emails, transcripts, notes):
+        \(lines.joined(separator: "\n\n"))
+        """
     }
 }
 

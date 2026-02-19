@@ -5,6 +5,7 @@ import Sparkle
 struct GeneralPreferencesView: View {
     
     @EnvironmentObject private var updaterService: UpdaterService
+    @Environment(\.openWindow) private var openWindow
     @AppStorage(Constants.Defaults.launchAtLogin) private var launchAtLogin = false
     @AppStorage(Constants.Defaults.captureMicAudio) private var captureMic = true
     @AppStorage(Constants.Defaults.captureSystemAudio) private var captureSystem = true
@@ -59,6 +60,39 @@ struct GeneralPreferencesView: View {
                         .foregroundColor(Theme.textTertiary)
                 }
                 .padding(.top, 4)
+            }
+
+            // Debug — Onboarding
+            SettingsCard(title: "Debug", subtitle: "Developer tools for testing.") {
+                HStack(spacing: 12) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Theme.olive.opacity(0.08))
+                            .frame(width: 32, height: 32)
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.system(size: 13))
+                            .foregroundColor(Theme.olive)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Preview Onboarding")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(Theme.textPrimary)
+                        Text("Opens the onboarding flow in a new window")
+                            .font(.system(size: 11))
+                            .foregroundColor(Theme.textTertiary)
+                    }
+
+                    Spacer()
+
+                    Button {
+                        openWindow(id: "onboarding-window")
+                        NSApp.activate(ignoringOtherApps: true)
+                    } label: {
+                        Text("Show Onboarding")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                }
             }
 
             // Updates

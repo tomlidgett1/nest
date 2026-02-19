@@ -273,96 +273,85 @@ private struct NestChatPanel: View {
 
     private func userBubble(_ message: SemanticChatMessage) -> some View {
         HStack {
-            Spacer(minLength: 80)
+            Spacer(minLength: 60)
 
             Text(message.content)
-                .font(.system(size: 12.5))
+                .font(.system(size: 13))
                 .foregroundColor(Theme.textPrimary)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(Theme.olive.opacity(0.10))
-                .cornerRadius(14)
+                .background(Theme.olive.opacity(0.08))
+                .cornerRadius(16)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 3)
+        .padding(.vertical, 4)
     }
 
     private func assistantBubble(_ message: SemanticChatMessage) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Message box
-            HStack {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "sparkles")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(Theme.olive)
-                        Text("Nest")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(Theme.textSecondary)
-                    }
-
-                    if !message.content.isEmpty {
-                        StreamingMarkdownView(
-                            text: message.content,
-                            isStreaming: message.isStreaming
-                        )
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Theme.background)
-                .cornerRadius(14)
-
-                Spacer(minLength: 80)
+        HStack(alignment: .top, spacing: 10) {
+            // Avatar
+            ZStack {
+                Circle()
+                    .fill(Theme.olive.opacity(0.10))
+                    .frame(width: 24, height: 24)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(Theme.olive)
             }
+            .padding(.top, 2)
 
-            // Sources — outside the box
-            if !message.citations.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 5) {
-                        ForEach(message.citations.prefix(5)) { citation in
-                            HStack(spacing: 4) {
-                                Image(systemName: citationIcon(citation.sourceType))
-                                    .font(.system(size: 8))
-                                Text(citation.title)
-                                    .lineLimit(1)
-                            }
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Theme.textTertiary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Theme.background)
-                            .cornerRadius(6)
-                        }
-                    }
-                    .padding(.leading, 2)
+            // Content
+            VStack(alignment: .leading, spacing: 4) {
+                if !message.content.isEmpty {
+                    StreamingMarkdownView(
+                        text: stripCitationNumbers(message.content),
+                        isStreaming: message.isStreaming
+                    )
+                }
+
+                // Sources indicator — subtle, shows popover on hover
+                if !message.citations.isEmpty && !message.isStreaming {
+                    SourcesIndicator(citations: message.citations)
+                        .padding(.top, 2)
                 }
             }
+
+            Spacer(minLength: 40)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 3)
+        .padding(.vertical, 6)
+    }
+
+    /// Strips leftover [1], [2], etc. citation markers the LLM may produce.
+    private func stripCitationNumbers(_ text: String) -> String {
+        text.replacingOccurrences(
+            of: "\\s*\\[\\d+\\]",
+            with: "",
+            options: .regularExpression
+        )
     }
 
     // MARK: - Thinking Bubble
 
     private var thinkingBubble: some View {
-        HStack {
-            HStack(spacing: 6) {
+        HStack(alignment: .top, spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(Theme.olive.opacity(0.10))
+                    .frame(width: 24, height: 24)
                 Image(systemName: "sparkles")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(Theme.olive)
-
-                ShimmerText("Thinking…")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(Theme.background)
-            .cornerRadius(14)
+            .padding(.top, 2)
 
-            Spacer(minLength: 80)
+            ShimmerText("Thinking…")
+                .padding(.top, 5)
+
+            Spacer(minLength: 40)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 3)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Input Bar
@@ -413,7 +402,76 @@ private struct NestChatPanel: View {
         Task { await appState.askSemanticAssistant(trimmed) }
     }
 
-    private func citationIcon(_ type: SearchSourceType) -> String {
+}
+
+// MARK: - Sources Indicator
+
+/// Subtle "N sources" label that reveals a clean popover on click.
+private struct SourcesIndicator: View {
+    let citations: [SemanticCitation]
+    @State private var showPopover = false
+
+    private var uniqueCitations: [SemanticCitation] {
+        var seen = Set<String>()
+        return citations.filter { c in
+            let key = "\(c.sourceType.rawValue)::\(c.sourceId)"
+            guard !seen.contains(key) else { return false }
+            seen.insert(key)
+            return true
+        }
+    }
+
+    var body: some View {
+        let sources = Array(uniqueCitations.prefix(6))
+
+        Button {
+            showPopover.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "link")
+                    .font(.system(size: 8, weight: .semibold))
+                Text("\(sources.count) source\(sources.count == 1 ? "" : "s")")
+                    .font(.system(size: 10, weight: .medium))
+            }
+            .foregroundColor(showPopover ? Theme.olive : Theme.textQuaternary)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Sources")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.bottom, 2)
+
+                ForEach(sources) { citation in
+                    HStack(spacing: 6) {
+                        Image(systemName: sourceIcon(citation.sourceType))
+                            .font(.system(size: 9))
+                            .foregroundColor(Theme.textTertiary)
+                            .frame(width: 14)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(citation.title)
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textPrimary)
+                                .lineLimit(1)
+
+                            Text(citation.sourceType.displayName)
+                                .font(.system(size: 9))
+                                .foregroundColor(Theme.textQuaternary)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(minWidth: 200, maxWidth: 300)
+        }
+    }
+
+    private func sourceIcon(_ type: SearchSourceType) -> String {
         switch type {
         case .noteSummary, .noteChunk: return "doc.text"
         case .utteranceChunk: return "waveform"

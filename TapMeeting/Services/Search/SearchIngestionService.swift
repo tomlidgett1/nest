@@ -25,8 +25,14 @@ final class SearchIngestionService {
 
     // MARK: - Backfill
 
+    /// A note bundled with its pre-fetched transcript utterances (must be loaded on the main actor).
+    struct NoteWithTranscript {
+        let note: Note
+        let utterances: [Utterance]
+    }
+
     func runMandatoryBackfill(
-        notes: [Note],
+        notes: [NoteWithTranscript],
         threads: [GmailThread],
         calendarEvents: [CalendarEvent]
     ) async {
@@ -39,39 +45,72 @@ final class SearchIngestionService {
             return
         }
 
-        // Index all emails, not just recent ones
         let total = max(1, notes.count + threads.count + calendarEvents.count)
         backfillStatus = SearchBackfillStatus(stage: .indexing, progressPercent: 0, processedCount: 0, totalCount: total, lastError: nil)
         await writeJobStatus(type: "backfill", status: "running")
 
-        do {
-            for note in notes {
-                try await indexNote(note)
-                advanceBackfill()
-            }
+        // Ensure the Supabase session is fresh before starting (avoids "not authenticated" on first items)
+        _ = try? await client.auth.session
 
-            for thread in threads {
-                try await indexEmailThread(thread)
-                advanceBackfill()
-            }
+        var failedCount = 0
 
-            for event in calendarEvents {
-                try await indexCalendarEvent(event)
-                advanceBackfill()
+        for item in notes {
+            do {
+                try await indexNote(item.note)
+                if !item.utterances.isEmpty {
+                    try await indexTranscript(for: item.note, utterances: item.utterances)
+                }
+            } catch {
+                failedCount += 1
+                telemetry.recordError(
+                    component: "backfill",
+                    message: error.localizedDescription,
+                    context: ["source": "note", "title": item.note.title]
+                )
             }
-
-            backfillStatus.stage = .completed
-            backfillStatus.progressPercent = 100
-            UserDefaults.standard.set(true, forKey: Constants.Defaults.hasCompletedSemanticBackfill)
-            UserDefaults.standard.set(Constants.Search.chunkingVersion, forKey: Constants.Defaults.lastBackfillChunkingVersion)
-            await writeJobStatus(type: "backfill", status: "completed")
-            await refreshIndexCounts()
-        } catch {
-            backfillStatus.stage = .failed
-            backfillStatus.lastError = error.localizedDescription
-            await writeJobStatus(type: "backfill", status: "failed", errorMessage: error.localizedDescription)
-            telemetry.recordError(component: "backfill", message: error.localizedDescription)
+            advanceBackfill()
         }
+
+        for thread in threads {
+            do {
+                try await indexEmailThread(thread)
+            } catch {
+                failedCount += 1
+                telemetry.recordError(
+                    component: "backfill",
+                    message: error.localizedDescription,
+                    context: ["source": "email", "thread_id": thread.id, "subject": thread.subject]
+                )
+            }
+            advanceBackfill()
+        }
+
+        for event in calendarEvents {
+            do {
+                try await indexCalendarEvent(event)
+            } catch {
+                failedCount += 1
+                telemetry.recordError(
+                    component: "backfill",
+                    message: error.localizedDescription,
+                    context: ["source": "calendar", "event_id": event.id, "title": event.title]
+                )
+            }
+            advanceBackfill()
+        }
+
+        // Mark as completed even if some items failed — prevents restart loops.
+        // Individual failures are logged to the error log for inspection.
+        backfillStatus.stage = .completed
+        backfillStatus.progressPercent = 100
+        if failedCount > 0 {
+            backfillStatus.lastError = "\(failedCount) of \(total) items failed — see error log"
+        }
+        UserDefaults.standard.set(true, forKey: Constants.Defaults.hasCompletedSemanticBackfill)
+        UserDefaults.standard.set(Constants.Search.chunkingVersion, forKey: Constants.Defaults.lastBackfillChunkingVersion)
+        await writeJobStatus(type: "backfill", status: failedCount > 0 ? "completed_with_errors" : "completed",
+                             errorMessage: failedCount > 0 ? "\(failedCount) items failed" : nil)
+        await refreshIndexCounts()
     }
 
     /// Clears the backfill flag so the next call to `runMandatoryBackfill` re-indexes everything.

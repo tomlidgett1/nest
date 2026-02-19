@@ -26,7 +26,13 @@ struct EmailAIDraftSheet: View {
     @State private var suggestedActions: [EmailAIService.SuggestedAction] = []
     @State private var isLoadingActions = false
     
-    private let aiService = EmailAIService()
+    // Debug
+    @State private var aiDebugInfo: EmailAIService.DebugInfo?
+    @State private var showAIDebug: Bool = false
+    
+    private var aiService: EmailAIService {
+        EmailAIService(pipeline: appState.searchQueryPipeline)
+    }
     
     /// The style profile for the current account.
     private var activeStyleProfile: StyleProfile? {
@@ -182,6 +188,11 @@ struct EmailAIDraftSheet: View {
                 errorView(error)
             }
             
+            // Debug panel
+            if let debug = aiDebugInfo {
+                draftDebugPanel(debug)
+            }
+            
             // Draft results
             if hasGenerated {
                 multiDraftSection
@@ -199,6 +210,82 @@ struct EmailAIDraftSheet: View {
         .padding(.vertical, 10)
         .onAppear {
             loadSuggestedActions()
+        }
+    }
+    
+    // MARK: - Debug Panel
+    
+    private func draftDebugPanel(_ debug: EmailAIService.DebugInfo) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showAIDebug.toggle() }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "ant")
+                        .font(.system(size: 9))
+                    Text("Pipeline Debug")
+                        .font(.system(size: 10, weight: .medium))
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8))
+                        .rotationEffect(.degrees(showAIDebug ? 180 : 0))
+                }
+                .foregroundColor(debug.evidenceCount > 0 ? Theme.olive : Theme.recording)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+            }
+            .buttonStyle(.plain)
+            
+            if showAIDebug {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        draftDebugRow("Pipeline", debug.pipelineAvailable ? "Available" : "Unavailable")
+                        draftDebugRow("Search query", debug.searchQuery)
+                        draftDebugRow("Evidence", "\(debug.evidenceCount) blocks")
+                        if let temporal = debug.temporalLabel {
+                            draftDebugRow("Temporal", temporal)
+                        }
+                        if !debug.evidenceTitles.isEmpty {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Evidence titles:")
+                                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                    .foregroundColor(Theme.textTertiary)
+                                ForEach(Array(debug.evidenceTitles.enumerated()), id: \.offset) { i, title in
+                                    Text("  [\(i + 1)] \(title)")
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundColor(Theme.textSecondary)
+                                }
+                            }
+                        }
+                        draftDebugRow("LLM response", debug.anthropicResponsePreview)
+                        if let error = debug.error {
+                            draftDebugRow("Error", error)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
+                }
+                .frame(maxHeight: 220)
+            }
+        }
+        .background(Color.white)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(debug.evidenceCount > 0 ? Theme.olive.opacity(0.3) : Theme.recording.opacity(0.3), lineWidth: 1)
+        )
+        .cornerRadius(6)
+    }
+    
+    private func draftDebugRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            Text(label + ":")
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundColor(Theme.textTertiary)
+                .frame(width: 80, alignment: .trailing)
+            Text(value)
+                .font(.system(size: 9, design: .monospaced))
+                .foregroundColor(Theme.textSecondary)
+                .textSelection(.enabled)
         }
     }
     
@@ -324,11 +411,14 @@ struct EmailAIDraftSheet: View {
     private func generate() {
         isGenerating = true
         error = nil
+        aiDebugInfo = nil
         saveInstruction()
+        
+        let service = aiService
         
         Task {
             do {
-                let result = try await aiService.generateMultiDraft(
+                let result = try await service.generateMultiDraft(
                     thread: thread,
                     styleProfile: activeStyleProfile,
                     globalInstructions: globalInstructions,
@@ -336,12 +426,14 @@ struct EmailAIDraftSheet: View {
                     oneOffInstructions: instructions.isEmpty ? nil : instructions
                 )
                 await MainActor.run {
+                    aiDebugInfo = service.lastDebugInfo
                     drafts = result
                     hasGenerated = true
                     isGenerating = false
                 }
             } catch {
                 await MainActor.run {
+                    aiDebugInfo = service.lastDebugInfo
                     self.error = error.localizedDescription
                     isGenerating = false
                 }

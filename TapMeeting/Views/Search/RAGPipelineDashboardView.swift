@@ -410,6 +410,22 @@ struct RAGPipelineDashboardView: View {
                     }
                 }
 
+                if !event.queryPlanSources.isEmpty {
+                    HStack(alignment: .top) {
+                        Text("Planner:")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Theme.textTertiary)
+                        Text(event.queryPlanSources.joined(separator: ", "))
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.purple)
+                        if let intent = event.queryPlanIntent {
+                            Text("→ \(intent)")
+                                .font(.system(size: 10))
+                                .foregroundColor(Theme.textTertiary)
+                        }
+                    }
+                }
+
                 if event.subQueries.count > 1 {
                     HStack(alignment: .top) {
                         Text("Sub-queries:")
@@ -626,6 +642,12 @@ struct RAGPipelineDashboardView: View {
         ]
         if let enriched = event.enrichedQuery {
             lines.append("Enriched: \(enriched)")
+        }
+        if !event.queryPlanSources.isEmpty {
+            lines.append("Planner sources: \(event.queryPlanSources.joined(separator: ", "))")
+            if let intent = event.queryPlanIntent {
+                lines.append("Planner intent: \(intent)")
+            }
         }
         if event.subQueries.count > 1 {
             lines.append("Sub-queries: \(event.subQueries.joined(separator: " | "))")

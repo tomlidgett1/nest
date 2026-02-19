@@ -3,6 +3,12 @@ import SwiftUI
 struct AccountPreferencesView: View {
 
     @Environment(SupabaseService.self) private var supabaseService
+    @Environment(AppState.self) private var appState
+
+    @State private var showDeleteConfirmation = false
+    @State private var deleteConfirmationEmail = ""
+    @State private var isDeleting = false
+    @State private var deleteError: String?
 
     var body: some View {
         VStack(spacing: 16) {
@@ -66,12 +72,32 @@ struct AccountPreferencesView: View {
 
                 // Sign out
                 Button {
-                    Task { await supabaseService.signOut() }
+                    Task {
+                        appState.resetServicesForSignOut()
+                        await supabaseService.signOut()
+                    }
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "rectangle.portrait.and.arrow.right")
                             .font(.system(size: 11))
                         Text("Sign Out")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .foregroundColor(.red.opacity(0.8))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.red.opacity(0.06))
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    showDeleteConfirmation = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 11))
+                        Text("Delete Account")
                             .font(.system(size: 12, weight: .medium))
                     }
                     .foregroundColor(.red.opacity(0.8))
@@ -93,6 +119,79 @@ struct AccountPreferencesView: View {
                     APIStatusRow(icon: "brain", name: "OpenAI", description: "Note enhancement & tagging", isConfigured: supabaseService.isAuthenticated)
                     APIStatusRow(icon: "sparkles", name: "Anthropic", description: "AI email drafts", isConfigured: supabaseService.isAuthenticated)
                 }
+            }
+        }
+        .alert("Delete Account", isPresented: $showDeleteConfirmation) {
+            TextField("Type your email to confirm", text: $deleteConfirmationEmail)
+            Button("Cancel", role: .cancel) {
+                deleteConfirmationEmail = ""
+                deleteError = nil
+            }
+            Button("Delete", role: .destructive) {
+                Task { await deleteAccount() }
+            }
+            .disabled(deleteConfirmationEmail.lowercased() != (supabaseService.currentUserEmail ?? "").lowercased())
+        } message: {
+            if let deleteError {
+                Text(deleteError)
+            } else {
+                Text("This will permanently delete your account and all data. Type your email address to confirm.")
+            }
+        }
+    }
+
+    private func deleteAccount() async {
+        guard let email = supabaseService.currentUserEmail,
+              deleteConfirmationEmail.lowercased() == email.lowercased() else {
+            deleteError = "Email does not match your account."
+            showDeleteConfirmation = true
+            return
+        }
+
+        isDeleting = true
+        deleteError = nil
+
+        guard let jwt = await supabaseService.supabaseAccessTokenForFunctionCall() else {
+            deleteError = "Could not authenticate. Please try again."
+            isDeleting = false
+            showDeleteConfirmation = true
+            return
+        }
+
+        let urlString = "\(Constants.Supabase.functionsBaseURL)/delete-account"
+        guard let url = URL(string: urlString) else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["confirmation": email])
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+            if status == 200 {
+                await MainActor.run {
+                    deleteConfirmationEmail = ""
+                    isDeleting = false
+                }
+                appState.resetServicesForSignOut()
+                await supabaseService.signOut()
+            } else {
+                let body = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+                let detail = body["detail"] as? String ?? body["error"] as? String ?? "Deletion failed."
+                await MainActor.run {
+                    deleteError = detail
+                    isDeleting = false
+                    showDeleteConfirmation = true
+                }
+            }
+        } catch {
+            await MainActor.run {
+                deleteError = error.localizedDescription
+                isDeleting = false
+                showDeleteConfirmation = true
             }
         }
     }

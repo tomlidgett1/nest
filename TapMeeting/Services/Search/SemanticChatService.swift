@@ -1,11 +1,21 @@
 import Foundation
 
+/// Chat-specific wrapper around `SearchQueryPipeline`.
+///
+/// Handles:
+///   - Building the Nest LLM prompt with conversation history
+///   - Streaming the LLM response via SSE
+///   - Telemetry recording for chat queries
+///
+/// All retrieval intelligence (query enrichment, sub-queries, LLM rewriting,
+/// temporal resolution, dedup, MMR, evidence building, agentic fallback)
+/// lives in `SearchQueryPipeline` and is shared with every AI feature.
 final class SemanticChatService {
-    private let searchService: SemanticSearchService
+    private let pipeline: SearchQueryPipeline
     private let telemetry: SearchTelemetryService
 
-    init(searchService: SemanticSearchService, telemetry: SearchTelemetryService) {
-        self.searchService = searchService
+    init(pipeline: SearchQueryPipeline, telemetry: SearchTelemetryService) {
+        self.pipeline = pipeline
         self.telemetry = telemetry
     }
 
@@ -15,48 +25,15 @@ final class SemanticChatService {
         to query: String,
         conversationHistory: [SemanticChatMessage] = []
     ) async throws -> (citations: [SemanticCitation], stream: AsyncStream<String>) {
-        let intent = detectIntent(query)
 
-        // Step 1: Enrich query using conversation history (coreference resolution)
-        let enrichedQuery = enrichQuery(query, history: conversationHistory)
+        // Run the shared pipeline to get evidence
+        let pipelineResult = try await pipeline.execute(
+            query: query,
+            options: .init(conversationHistory: conversationHistory)
+        )
 
-        // Step 2: Generate sub-queries for multi-query retrieval
-        let subQueries = generateSubQueries(enrichedQuery, intent: intent)
-
-        // Step 3: Execute all searches in parallel and merge results
-        let searchStart = Date()
-        var allResults: [SearchDocumentCandidate] = []
-        var allCitations: [SemanticCitation] = []
-
-        for searchQuery in subQueries {
-            let retrieval = try await searchService.search(query: searchQuery)
-            allResults.append(contentsOf: retrieval.results)
-            allCitations.append(contentsOf: retrieval.citations)
-        }
-        let searchMs = Int(Date().timeIntervalSince(searchStart) * 1000)
-
-        // Step 4: Deduplicate results across all sub-queries
-        let dedupedResults = deduplicateResults(allResults)
-        let dedupedCitations = deduplicateCitations(allCitations)
-
-        // Step 5: Apply MMR for diversity (avoid duplicate evidence from same source)
-        let diverseResults = applyMMR(dedupedResults, maxResults: Constants.Search.maxEvidenceBlocks * 2)
-
-        // Step 6: Build evidence blocks
-        var evidence = buildEvidenceBlocks(from: diverseResults)
-
-        // Step 7: Agentic RAG — if evidence is too thin, try one more retrieval round
-        var retrievalRounds = 1
-        if evidence.count < 3 && !enrichedQuery.isEmpty {
-            let fallbackQuery = "key highlights and details related to: \(enrichedQuery)"
-            let fallbackRetrieval = try await searchService.search(query: fallbackQuery)
-            let fallbackEvidence = buildEvidenceBlocks(from: fallbackRetrieval.results)
-            if fallbackEvidence.count > evidence.count {
-                evidence = fallbackEvidence
-                allCitations.append(contentsOf: fallbackRetrieval.citations)
-            }
-            retrievalRounds = 2
-        }
+        let evidence = pipelineResult.evidence
+        let meta = pipelineResult.metadata
 
         guard !evidence.isEmpty else {
             let refusal = AsyncStream<String> { cont in
@@ -65,20 +42,19 @@ final class SemanticChatService {
             }
 
             recordQueryEvent(
-                rawQuery: query, enrichedQuery: enrichedQuery, subQueries: subQueries,
-                embeddingMs: 0, searchMs: searchMs, results: dedupedResults,
+                rawQuery: query, meta: meta, results: pipelineResult.allResults,
                 evidence: [], llmModel: "", llmMs: 0, responsePreview: "(refused)",
-                didRefuse: true, fallbackUsed: false, retrievalRounds: retrievalRounds
+                didRefuse: true
             )
 
-            return (dedupedCitations, refusal)
+            return (pipelineResult.citations, refusal)
         }
 
-        // Step 8: Build the LLM request with temporal context
+        // Build the LLM request
         let body = buildStreamingRequestBody(
             query: query,
-            enrichedQuery: enrichedQuery,
-            intent: intent,
+            enrichedQuery: meta.enrichedQuery,
+            intent: meta.intent,
             evidence: evidence,
             conversationHistory: conversationHistory
         )
@@ -94,14 +70,12 @@ final class SemanticChatService {
         let stream = makeSSEStream(from: bytes)
 
         recordQueryEvent(
-            rawQuery: query, enrichedQuery: enrichedQuery, subQueries: subQueries,
-            embeddingMs: 0, searchMs: searchMs, results: dedupedResults,
+            rawQuery: query, meta: meta, results: pipelineResult.allResults,
             evidence: evidence, llmModel: Constants.AI.semanticChatModel, llmMs: llmMs,
-            responsePreview: "(streaming)", didRefuse: false, fallbackUsed: retrievalRounds > 1,
-            retrievalRounds: retrievalRounds
+            responsePreview: "(streaming)", didRefuse: false
         )
 
-        return (dedupedCitations, stream)
+        return (pipelineResult.citations, stream)
     }
 
     // MARK: - Non-streaming Fallback
@@ -115,137 +89,6 @@ final class SemanticChatService {
         for await delta in stream { fullText += delta }
         let answer = fullText.isEmpty ? "I could not generate a grounded response." : fullText
         return SemanticChatResponse(answer: answer, citations: citations, didRefuse: false)
-    }
-
-    // MARK: - Query Enrichment
-
-    /// Uses conversation history to resolve pronouns and coreferences.
-    /// Example: User asks "What about their revenue?" after discussing Acme Corp
-    /// → enriched to "What about Acme Corp's revenue?"
-    private func enrichQuery(_ query: String, history: [SemanticChatMessage]) -> String {
-        let recentHistory = history.suffix(6)
-        guard !recentHistory.isEmpty else { return query }
-
-        // Extract key topics from recent conversation
-        var topics: [String] = []
-        for message in recentHistory {
-            if message.role == .assistant && !message.content.isEmpty {
-                // Extract likely topic words from assistant's last answer
-                let words = message.content.components(separatedBy: .whitespacesAndNewlines)
-                    .filter { $0.count > 4 }
-                    .prefix(10)
-                topics.append(contentsOf: words.map { String($0) })
-            }
-        }
-
-        // Check if the query contains pronouns/references that need resolution
-        let pronounPatterns = ["they", "their", "them", "he", "she", "his", "her", "it", "its", "that", "this", "those", "these"]
-        let queryLower = query.lowercased()
-        let hasPronouns = pronounPatterns.contains { queryLower.contains($0) }
-
-        if hasPronouns && !topics.isEmpty {
-            // Prepend context from conversation
-            let lastAssistantContent = recentHistory
-                .last(where: { $0.role == .assistant })?
-                .content ?? ""
-            let contextHint = String(lastAssistantContent.prefix(200))
-            return "Context: \(contextHint)\nQuery: \(query)"
-        }
-
-        return query
-    }
-
-    // MARK: - Multi-Query Generation
-
-    /// Generates multiple search queries for better recall.
-    /// For simple queries, returns just the original. For complex ones, adds reformulations.
-    private func generateSubQueries(_ query: String, intent: SemanticIntent) -> [String] {
-        var queries = [query]
-
-        // For complex queries, add a reformulated version
-        let words = query.split(separator: " ")
-        if words.count > 5 {
-            // Add a keyword-focused version (strip filler words)
-            let stopWords: Set<String> = ["what", "when", "where", "who", "how", "did", "does", "the", "a", "an", "is", "was", "were", "are", "about", "from", "with", "for", "can", "you", "me", "my", "tell", "show", "give", "find", "get"]
-            let keywords = words.filter { !stopWords.contains($0.lowercased()) }
-            if keywords.count >= 2 {
-                queries.append(keywords.joined(separator: " "))
-            }
-        }
-
-        return queries
-    }
-
-    // MARK: - Deduplication
-
-    private func deduplicateResults(_ results: [SearchDocumentCandidate]) -> [SearchDocumentCandidate] {
-        var seen = Set<UUID>()
-        return results.filter { candidate in
-            guard !seen.contains(candidate.id) else { return false }
-            seen.insert(candidate.id)
-            return true
-        }.sorted { $0.fusedScore > $1.fusedScore }
-    }
-
-    private func deduplicateCitations(_ citations: [SemanticCitation]) -> [SemanticCitation] {
-        var seen = Set<String>()
-        return citations.filter { citation in
-            let key = "\(citation.sourceType.rawValue)::\(citation.sourceId)"
-            guard !seen.contains(key) else { return false }
-            seen.insert(key)
-            return true
-        }
-    }
-
-    // MARK: - MMR (Maximal Marginal Relevance)
-
-    /// Ensures diversity in results by penalising documents from the same source.
-    private func applyMMR(_ results: [SearchDocumentCandidate], maxResults: Int) -> [SearchDocumentCandidate] {
-        guard results.count > maxResults else { return results }
-
-        var selected: [SearchDocumentCandidate] = []
-        var sourceCount: [String: Int] = [:]
-        let diversityPenalty = 0.3
-
-        let sorted = results.sorted { $0.fusedScore > $1.fusedScore }
-
-        for candidate in sorted {
-            guard selected.count < maxResults else { break }
-
-            let sourceKey = "\(candidate.sourceType.rawValue)::\(candidate.sourceId)"
-            let count = sourceCount[sourceKey, default: 0]
-
-            // Allow up to 3 chunks from the same source, but with diminishing priority
-            if count < 3 {
-                let penalty = Double(count) * diversityPenalty
-                let adjustedScore = candidate.fusedScore * (1.0 - penalty)
-                // Still include it if the adjusted score is reasonable
-                if adjustedScore > 0 || selected.count < 4 {
-                    selected.append(candidate)
-                    sourceCount[sourceKey] = count + 1
-                }
-            }
-        }
-
-        return selected
-    }
-
-    // MARK: - Evidence Building
-
-    private func buildEvidenceBlocks(from results: [SearchDocumentCandidate]) -> [EvidenceBlock] {
-        results.prefix(Constants.Search.maxEvidenceBlocks).compactMap { result in
-            let body = (result.chunkText ?? result.summaryText ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !body.isEmpty else { return nil }
-            return EvidenceBlock(
-                sourceType: result.sourceType.displayName,
-                title: result.title ?? result.sourceType.displayName,
-                text: String(body.prefix(Constants.Search.maxEvidenceBlockCharacters)),
-                semanticScore: result.semanticScore,
-                sourceId: result.sourceId,
-                documentId: result.id
-            )
-        }
     }
 
     // MARK: - Request Building
@@ -285,15 +128,20 @@ final class SemanticChatService {
 
         GROUNDING RULES:
         1. Use ONLY the provided evidence blocks. Never fabricate information.
-        2. Cite evidence with inline references like [1], [2] at the end of the relevant bullet.
+        2. Do NOT include citation numbers like [1], [2], [3] in your response. Write clean prose without any bracketed references.
         3. Prefer concrete details: names, actions, decisions, dates, numbers.
         4. If evidence is insufficient, say so honestly in one sentence — don't guess.
         5. Weight higher-scored evidence blocks more heavily.
         6. Use Australian English.
         7. Use conversation history to resolve pronouns ("they", "it", "that") and avoid repeating yourself.
 
+        TEMPORAL AWARENESS:
+        - Some evidence blocks labelled "Calendar Event (Live)" are injected from the live calendar — these are authoritative for schedule questions.
+        - For questions about "today", "tomorrow", "this week", etc. prioritise these live blocks.
+        - When listing events, include the **time**, **title**, and **attendees** for each.
+
         APPROACH:
-        Identify the most relevant evidence blocks, then give a crisp, structured answer.
+        Identify the most relevant evidence blocks, then give a crisp, structured answer. Never include citation numbers.
         """
 
         let recentHistory = conversationHistory.suffix(10)
@@ -320,7 +168,7 @@ final class SemanticChatService {
         Cited context (from semantic search, ordered by relevance):
         \(context)
 
-        Answer concisely using bullet points and inline references like [1], [2]. Be brief.
+        Answer concisely using bullet points. Do not include citation numbers. Be brief.
         """
 
         return [
@@ -363,35 +211,17 @@ final class SemanticChatService {
         }
     }
 
-    // MARK: - Intent Detection
-
-    private func detectIntent(_ query: String) -> SemanticIntent {
-        let lower = query.lowercased()
-        if lower.contains("draft email") || lower.contains("reply") || lower.contains("compose") {
-            return .draftEmail
-        }
-        if lower.contains("follow up") || lower.contains("todo") || lower.contains("action item") || lower.contains("to-do") {
-            return .createFollowUp
-        }
-        return .answerQuestion
-    }
-
     // MARK: - Telemetry
 
     private func recordQueryEvent(
         rawQuery: String,
-        enrichedQuery: String,
-        subQueries: [String],
-        embeddingMs: Int,
-        searchMs: Int,
+        meta: SearchQueryPipeline.PipelineMetadata,
         results: [SearchDocumentCandidate],
         evidence: [EvidenceBlock],
         llmModel: String,
         llmMs: Int,
         responsePreview: String,
-        didRefuse: Bool,
-        fallbackUsed: Bool,
-        retrievalRounds: Int
+        didRefuse: Bool
     ) {
         let queryResults = results.prefix(20).map { r in
             QueryResultEntry(
@@ -417,13 +247,13 @@ final class SemanticChatService {
             )
         }
 
-        let event = QueryEvent(
+        var event = QueryEvent(
             timestamp: .now,
             rawQuery: rawQuery,
-            enrichedQuery: enrichedQuery != rawQuery ? enrichedQuery : nil,
-            subQueries: subQueries,
-            embeddingLatencyMs: embeddingMs,
-            searchLatencyMs: searchMs,
+            enrichedQuery: meta.enrichedQuery != rawQuery ? meta.enrichedQuery : nil,
+            subQueries: meta.subQueries,
+            embeddingLatencyMs: 0,
+            searchLatencyMs: meta.searchLatencyMs,
             resultCount: results.count,
             results: queryResults,
             evidenceBlockCount: evidence.count,
@@ -433,9 +263,13 @@ final class SemanticChatService {
             llmLatencyMs: llmMs,
             responsePreview: responsePreview,
             didRefuse: didRefuse,
-            fallbackUsed: fallbackUsed,
-            retrievalRounds: retrievalRounds
+            fallbackUsed: meta.retrievalRounds > 1,
+            retrievalRounds: meta.retrievalRounds
         )
+        if let plan = meta.queryPlan {
+            event.queryPlanSources = plan.sources
+            event.queryPlanIntent = plan.intent
+        }
         telemetry.recordQuery(event)
     }
 }
@@ -445,13 +279,4 @@ final class SemanticChatService {
 private struct SSEEvent: Decodable {
     let type: String
     let delta: String?
-}
-
-struct EvidenceBlock {
-    let sourceType: String
-    let title: String
-    let text: String
-    let semanticScore: Double
-    let sourceId: String
-    let documentId: UUID
 }

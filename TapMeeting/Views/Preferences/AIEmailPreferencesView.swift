@@ -30,7 +30,9 @@ struct AIEmailPreferencesView: View {
     @State private var variantCount: Int = 3
     @State private var autoSuggest: Bool = true
     
-    private let aiService = EmailAIService()
+    private var aiService: EmailAIService {
+        EmailAIService(pipeline: appState.searchQueryPipeline)
+    }
     
     /// The style profile for the current Gmail account.
     private var activeProfile: StyleProfile? {

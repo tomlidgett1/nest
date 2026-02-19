@@ -23,6 +23,9 @@ final class SyncService {
         self.modelContext = modelContext
     }
 
+    /// Incremented after each successful sync so views can react.
+    private(set) var syncRevision = 0
+
     // MARK: - Full Sync (Pull)
 
     /// Pull all user data from Supabase and upsert into local SwiftData.
@@ -30,10 +33,20 @@ final class SyncService {
     @MainActor
     func fullSync() async {
         guard !isSyncing else { return }
+
+        // Verify we have a valid authenticated session before querying.
+        // Without this, RLS-protected tables return empty arrays and the
+        // "delete local items not on remote" logic wipes all local data.
+        do {
+            let session = try await client.auth.session
+            print("[SyncService] Starting full sync for user: \(session.user.email ?? "unknown") (\(session.user.id))")
+        } catch {
+            print("[SyncService] ✗ Cannot sync — no valid session: \(error.localizedDescription)")
+            return
+        }
+
         isSyncing = true
         defer { isSyncing = false }
-
-        print("[SyncService] Starting full sync...")
 
         await syncFolders()
         await syncTags()
@@ -44,7 +57,8 @@ final class SyncService {
         await syncContactRules()
         await syncTodos()
 
-        print("[SyncService] Full sync complete")
+        syncRevision += 1
+        print("[SyncService] Full sync complete (revision \(syncRevision))")
     }
 
     // MARK: - Pull Individual Tables
@@ -72,13 +86,20 @@ final class SyncService {
                 }
             }
 
-            // Delete local folders not on server
+            // Delete local folders not on server — but only when remote
+            // returned data. An empty remote with a populated local store
+            // almost certainly means the auth session wasn't ready yet.
             let remoteIds = Set(remote.map(\.id))
-            for local in localFolders where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localFolders.isEmpty {
+                for local in localFolders where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localFolders.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 folders but local has \(localFolders.count) — skipping deletion")
             }
 
             try modelContext.save()
+            print("[SyncService] Folder sync: \(remote.count) remote, \(localFolders.count) local")
         } catch {
             print("[SyncService] Folder sync failed: \(error.localizedDescription)")
         }
@@ -108,11 +129,16 @@ final class SyncService {
             }
 
             let remoteIds = Set(remote.map(\.id))
-            for local in localTags where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localTags.isEmpty {
+                for local in localTags where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localTags.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 tags but local has \(localTags.count) — skipping deletion")
             }
 
             try modelContext.save()
+            print("[SyncService] Tag sync: \(remote.count) remote, \(localTags.count) local")
         } catch {
             print("[SyncService] Tag sync failed: \(error.localizedDescription)")
         }
@@ -132,20 +158,26 @@ final class SyncService {
             let localFolders = fetchAll(Folder.self)
             let folderById = Dictionary(uniqueKeysWithValues: localFolders.map { ($0.id, $0) })
 
+            let attendeesList = { (r: RemoteNote) in r.attendees ?? [] }
+            let linkedIds = { (r: RemoteNote) -> String? in
+                let ids = r.linked_note_ids ?? []
+                return ids.isEmpty ? nil : ids.map(\.uuidString).joined(separator: ",")
+            }
+
             for r in remote {
                 if let local = localById[r.id] {
                     local.title = r.title
-                    local.rawNotes = r.raw_notes
+                    local.rawNotes = r.raw_notes ?? ""
                     local.enhancedNotes = r.enhanced_notes
                     local.calendarEventId = r.calendar_event_id
-                    local.attendeesRaw = r.attendees.joined(separator: "|||")
-                    local.isShared = r.is_shared
+                    local.attendeesRaw = attendeesList(r).joined(separator: "|||")
+                    local.isShared = r.is_shared ?? false
                     local.shareURL = r.share_url
-                    local.statusRaw = r.status
-                    local.noteTypeRaw = r.note_type
-                    local.isPinned = r.is_pinned
-                    local.linkedNoteIds = r.linked_note_ids.isEmpty ? nil : r.linked_note_ids.map(\.uuidString).joined(separator: ",")
-                    local.isArchived = r.is_archived
+                    local.statusRaw = r.status ?? "inProgress"
+                    local.noteTypeRaw = r.note_type ?? "meeting"
+                    local.isPinned = r.is_pinned ?? false
+                    local.linkedNoteIds = linkedIds(r)
+                    local.isArchived = r.is_archived ?? false
                     local.archivedAt = r.archived_at
                     local.createdAt = r.created_at
                     local.folder = r.folder_id.flatMap { folderById[$0] }
@@ -154,17 +186,17 @@ final class SyncService {
                         id: r.id,
                         title: r.title,
                         createdAt: r.created_at,
-                        rawNotes: r.raw_notes,
+                        rawNotes: r.raw_notes ?? "",
                         enhancedNotes: r.enhanced_notes,
                         calendarEventId: r.calendar_event_id,
-                        attendees: r.attendees,
-                        isShared: r.is_shared,
+                        attendees: attendeesList(r),
+                        isShared: r.is_shared ?? false,
                         shareURL: r.share_url,
-                        status: MeetingStatus(rawValue: r.status) ?? .inProgress,
-                        noteType: NoteType(rawValue: r.note_type) ?? .meeting,
-                        isPinned: r.is_pinned,
-                        linkedNoteIds: r.linked_note_ids.isEmpty ? nil : r.linked_note_ids.map(\.uuidString).joined(separator: ","),
-                        isArchived: r.is_archived,
+                        status: MeetingStatus(rawValue: r.status ?? "inProgress") ?? .inProgress,
+                        noteType: NoteType(rawValue: r.note_type ?? "meeting") ?? .meeting,
+                        isPinned: r.is_pinned ?? false,
+                        linkedNoteIds: linkedIds(r),
+                        isArchived: r.is_archived ?? false,
                         archivedAt: r.archived_at
                     )
                     note.folder = r.folder_id.flatMap { folderById[$0] }
@@ -173,11 +205,18 @@ final class SyncService {
             }
 
             let remoteIds = Set(remote.map(\.id))
-            for local in localNotes where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localNotes.isEmpty {
+                for local in localNotes where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localNotes.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 notes but local has \(localNotes.count) — skipping deletion to preserve data")
             }
 
             try modelContext.save()
+            print("[SyncService] Note sync: \(remote.count) remote, \(localNotes.count) local")
+        } catch let decodingError as DecodingError {
+            print("[SyncService] Note sync decoding error: \(decodingError)")
         } catch {
             print("[SyncService] Note sync failed: \(error.localizedDescription)")
         }
@@ -214,11 +253,16 @@ final class SyncService {
             }
 
             let remoteIds = Set(remote.map(\.id))
-            for local in localUtterances where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localUtterances.isEmpty {
+                for local in localUtterances where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localUtterances.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 utterances but local has \(localUtterances.count) — skipping deletion")
             }
 
             try modelContext.save()
+            print("[SyncService] Utterance sync: \(remote.count) remote, \(localUtterances.count) local")
         } catch {
             print("[SyncService] Utterance sync failed: \(error.localizedDescription)")
         }
@@ -314,8 +358,12 @@ final class SyncService {
             }
 
             let remoteIds = Set(remote.map(\.id))
-            for local in localProfiles where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localProfiles.isEmpty {
+                for local in localProfiles where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localProfiles.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 style profiles but local has \(localProfiles.count) — skipping deletion")
             }
 
             try modelContext.save()
@@ -357,8 +405,12 @@ final class SyncService {
             }
 
             let remoteIds = Set(remote.map(\.id))
-            for local in localRules where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localRules.isEmpty {
+                for local in localRules where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localRules.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 contact rules but local has \(localRules.count) — skipping deletion")
             }
 
             try modelContext.save()
@@ -416,8 +468,12 @@ final class SyncService {
             }
 
             let remoteIds = Set(remote.map(\.id))
-            for local in localTodos where !remoteIds.contains(local.id) {
-                modelContext.delete(local)
+            if !remote.isEmpty || localTodos.isEmpty {
+                for local in localTodos where !remoteIds.contains(local.id) {
+                    modelContext.delete(local)
+                }
+            } else if !localTodos.isEmpty {
+                print("[SyncService] ⚠ Remote returned 0 todos but local has \(localTodos.count) — skipping deletion")
             }
 
             try modelContext.save()
@@ -459,10 +515,12 @@ final class SyncService {
                     .upsert(remote)
                     .execute()
 
+                print("[SyncService] ✓ Pushed note: \(note.title) (\(note.id))")
+
                 // Sync tags
                 await pushNoteTagLinks(noteId: note.id, tagIds: note.tags.map(\.id))
             } catch {
-                print("[SyncService] Push note failed: \(error.localizedDescription)")
+                print("[SyncService] ✗ Push note failed for '\(note.title)': \(error)")
             }
         }
     }
@@ -498,8 +556,10 @@ final class SyncService {
                         .upsert(remotes)
                         .execute()
                 }
+
+                print("[SyncService] ✓ Pushed \(utterances.count) utterances for note \(noteId)")
             } catch {
-                print("[SyncService] Push utterances failed: \(error.localizedDescription)")
+                print("[SyncService] ✗ Push utterances failed: \(error)")
             }
         }
     }
@@ -780,17 +840,17 @@ struct RemoteNote: Codable {
     let user_id: UUID
     let folder_id: UUID?
     let title: String
-    let raw_notes: String
+    let raw_notes: String?
     let enhanced_notes: String?
     let calendar_event_id: String?
-    let attendees: [String]
-    let is_shared: Bool
+    let attendees: [String]?
+    let is_shared: Bool?
     let share_url: String?
-    let status: String
-    let note_type: String
-    let is_pinned: Bool
-    let linked_note_ids: [UUID]
-    let is_archived: Bool
+    let status: String?
+    let note_type: String?
+    let is_pinned: Bool?
+    let linked_note_ids: [UUID]?
+    let is_archived: Bool?
     let archived_at: Date?
     let created_at: Date
     let updated_at: Date

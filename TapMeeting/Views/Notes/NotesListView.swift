@@ -28,6 +28,7 @@ struct NotesListView: View {
     enum SidebarTab: Hashable {
         case home
         case nest
+        case v2Chat
         case meetings
         case calendar
         case todos
@@ -87,6 +88,16 @@ struct NotesListView: View {
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 HStack(spacing: 10) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "bird.fill")
+                            .font(.system(size: 12))
+                            .symbolRenderingMode(.hierarchical)
+                        Text("Nest")
+                            .font(.system(size: 13, weight: .medium))
+                    }
+                    .foregroundColor(Theme.textSecondary)
+                    .frame(minWidth: isSidebarCollapsed ? 0 : 120, alignment: .center)
+                    
                     Button {
                         withAnimation(.easeInOut(duration: 0.25)) {
                             isSidebarCollapsed.toggle()
@@ -108,7 +119,6 @@ struct NotesListView: View {
                     }
                     .buttonStyle(.plain)
                     .help("Go to Home")
-                    .padding(.leading, isSidebarCollapsed ? 0 : 104)
                     
                     // Email: account filter — shown on Email tab with multiple accounts
                     if sidebarTab == .email, appState.gmailService.isConnected,
@@ -263,15 +273,6 @@ struct NotesListView: View {
                     NextEventToolbarBadge(
                         events: appState.calendarService.upcomingEvents.filter { !$0.isAllDay }
                     )
-                    
-                    HStack(spacing: 5) {
-                        Image(systemName: "bird.fill")
-                            .font(.system(size: 12))
-                            .symbolRenderingMode(.hierarchical)
-                        Text("Nest")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .foregroundColor(Theme.textTertiary)
                 }
                 .padding(.trailing, 12)
             }
@@ -638,6 +639,8 @@ struct NotesListView: View {
                     sidebarTab = .email
                 }
             )
+        case .v2Chat:
+            V2ChatView(chatService: appState.v2ChatService)
         case .meetings:
             MeetingsContentView(
                 isSidebarCollapsed: $isSidebarCollapsed,
@@ -796,6 +799,7 @@ private struct NoteSidebar: View {
     @State private var showNewFolderAlert = false
 
     var body: some View {
+        let _ = appState.noteRepository.dataRevision // observe sync changes
         VStack(alignment: .leading, spacing: 0) {
             // Search bar
             HStack(spacing: 8) {
@@ -832,6 +836,14 @@ private struct NoteSidebar: View {
                 isSelected: isNestSelected
             ) {
                 selectedTab = .nest
+            }
+            
+            SidebarItem(
+                icon: "bubble.left.and.text.bubble.right",
+                label: "v2 Agent",
+                isSelected: isV2ChatSelected
+            ) {
+                selectedTab = .v2Chat
             }
             
             SidebarItem(
@@ -1044,6 +1056,11 @@ private struct NoteSidebar: View {
     
     private var isNestSelected: Bool {
         if case .nest = selectedTab { return true }
+        return false
+    }
+    
+    private var isV2ChatSelected: Bool {
+        if case .v2Chat = selectedTab { return true }
         return false
     }
     
@@ -1450,6 +1467,7 @@ private struct HomeContentView: View {
     private let refreshTimer = Timer.publish(every: 10, on: .main, in: .common).autoconnect()
     
     var body: some View {
+        let _ = appState.noteRepository.dataRevision // observe sync changes
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
@@ -2141,6 +2159,7 @@ private struct FolderContentView: View {
     }
     
     var body: some View {
+        let _ = appState.noteRepository.dataRevision // observe sync changes
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
@@ -2272,6 +2291,7 @@ private struct MeetingsContentView: View {
     }
     
     var body: some View {
+        let _ = appState.noteRepository.dataRevision // observe sync changes
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {

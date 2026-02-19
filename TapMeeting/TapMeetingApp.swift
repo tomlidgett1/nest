@@ -54,10 +54,9 @@ struct TapMeetingApp: App {
             .onOpenURL { url in
                 Task { await supabaseService.handleOAuthCallback(url) }
             }
-            .task(id: supabaseService.isAuthenticated) {
-                if supabaseService.isAuthenticated {
-                    await initializeAfterAuth()
-                }
+            .onChange(of: supabaseService.isAuthenticated, initial: true) { _, isAuth in
+                guard isAuth else { return }
+                Task { await initializeAfterAuth() }
             }
         }
         .keyboardShortcut("1", modifiers: .command)
@@ -85,8 +84,17 @@ struct TapMeetingApp: App {
             OnboardingView()
                 .environment(appState)
                 .environment(supabaseService)
+                .modelContainer(modelContainer)
+                .onOpenURL { url in
+                    Task { await supabaseService.handleOAuthCallback(url) }
+                }
+                .onChange(of: supabaseService.isAuthenticated, initial: true) { _, isAuth in
+                    guard isAuth else { return }
+                    Task { await initializeAfterAuth() }
+                }
         }
         .windowResizability(.contentSize)
+        .defaultSize(width: 560, height: 460)
         .defaultPosition(.center)
         .commands {
             CommandGroup(after: .appInfo) {
@@ -102,9 +110,20 @@ struct TapMeetingApp: App {
         }
     }
 
-    /// Called once after successful authentication to wire up sync and migrate data.
+    /// Called after successful authentication to wire up sync and pull data.
+    /// Safe to call on re-login — creates fresh services each time.
+    /// Guarded against double-execution from multiple windows.
     @MainActor
     private func initializeAfterAuth() async {
+        guard !appState.isInitializing else {
+            print("[TapMeetingApp] initializeAfterAuth — already running, skipping duplicate")
+            return
+        }
+        appState.isInitializing = true
+        defer { appState.isInitializing = false }
+
+        print("[TapMeetingApp] initializeAfterAuth — user: \(supabaseService.currentUserEmail ?? "unknown")")
+
         // Create sync service and attach to app state
         let syncService = SyncService(
             client: supabaseService.client,
@@ -118,6 +137,15 @@ struct TapMeetingApp: App {
 
         // Pull latest from Supabase
         await syncService.fullSync()
+
+        let noteCount = appState.noteRepository.fetchAllNotes().count
+        print("[TapMeetingApp] initializeAfterAuth — sync complete, revision \(syncService.syncRevision), \(noteCount) notes in local store")
+
+        // Tell views the data changed so they re-render with the synced data
+        appState.noteRepository.invalidate()
+        appState.todoRepository.refreshBadgeCounts()
+
+        print("[TapMeetingApp] initializeAfterAuth — dataRevision now \(appState.noteRepository.dataRevision)")
 
         // Build semantic index before enabling assistant flows
         await appState.runSemanticBackfillIfNeeded()

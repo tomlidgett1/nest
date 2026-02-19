@@ -128,7 +128,7 @@ enum Constants {
         ]
         /// Combined Google OAuth scopes requested during Supabase sign-in.
         /// Covers: Calendar (read + write), Gmail (modify + send), Contacts (autocomplete).
-        static let googleScopes = "email profile https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
+        static let googleScopes = "email profile https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts https://www.googleapis.com/auth/contacts.other.readonly"
     }
 
     // MARK: - Google Calendar
@@ -154,7 +154,7 @@ enum Constants {
         static let tokenURL = "https://oauth2.googleapis.com/token"
         static let redirectURI = "http://localhost:8235"
         static let loopbackPort: UInt16 = 8235
-        static let scopes = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly"
+        static let scopes = "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/contacts https://www.googleapis.com/auth/contacts.other.readonly"
     }
     
     // MARK: - Slack

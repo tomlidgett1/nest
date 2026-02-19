@@ -48,18 +48,63 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "unauthorised" }, 401);
   }
 
-  const { data: tokenRow, error: tokenError } = await supabaseAdmin
-    .from("google_oauth_tokens")
-    .select("refresh_token")
-    .eq("user_id", user.id)
-    .single();
+  // Accept optional account_id or google_email to target a specific linked account
+  let body: Record<string, unknown> = {};
+  try { body = await req.json(); } catch { /* empty body is fine */ }
+  const accountId = body.account_id as string | undefined;
+  const googleEmail = body.google_email as string | undefined;
 
-  if (tokenError || !tokenRow?.refresh_token) {
-    console.error("[google-token-broker] Refresh token not found", tokenError?.message ?? "not_found");
+  // Try the multi-account table first
+  let refreshToken: string | null = null;
+  let multiAccountId: string | null = null;
+
+  if (accountId) {
+    const { data } = await supabaseAdmin
+      .from("user_google_accounts")
+      .select("id, refresh_token")
+      .eq("id", accountId)
+      .eq("user_id", user.id)
+      .single();
+    refreshToken = data?.refresh_token ?? null;
+    multiAccountId = data?.id ?? null;
+  } else if (googleEmail) {
+    const { data } = await supabaseAdmin
+      .from("user_google_accounts")
+      .select("id, refresh_token")
+      .eq("google_email", googleEmail)
+      .eq("user_id", user.id)
+      .single();
+    refreshToken = data?.refresh_token ?? null;
+    multiAccountId = data?.id ?? null;
+  } else {
+    // Default: primary account from multi-account table
+    const { data } = await supabaseAdmin
+      .from("user_google_accounts")
+      .select("id, refresh_token")
+      .eq("user_id", user.id)
+      .eq("is_primary", true)
+      .limit(1)
+      .single();
+    refreshToken = data?.refresh_token ?? null;
+    multiAccountId = data?.id ?? null;
+  }
+
+  // Fallback to legacy single-token table
+  if (!refreshToken) {
+    const { data: legacyRow } = await supabaseAdmin
+      .from("google_oauth_tokens")
+      .select("refresh_token")
+      .eq("user_id", user.id)
+      .single();
+    refreshToken = legacyRow?.refresh_token ?? null;
+  }
+
+  if (!refreshToken) {
+    console.error("[google-token-broker] Refresh token not found for", user.id);
     return jsonResponse({ error: "refresh_token_not_found" }, 404);
   }
 
-  const refreshResult = await refreshGoogleAccessToken(tokenRow.refresh_token);
+  const refreshResult = await refreshGoogleAccessToken(refreshToken);
   if (!refreshResult.ok) {
     return jsonResponse(
       {
@@ -71,15 +116,18 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  if (refreshResult.refreshToken && refreshResult.refreshToken !== tokenRow.refresh_token) {
-    const { error: updateError } = await supabaseAdmin
+  // Rotate refresh token if Google issued a new one
+  if (refreshResult.refreshToken && refreshResult.refreshToken !== refreshToken) {
+    if (multiAccountId) {
+      await supabaseAdmin
+        .from("user_google_accounts")
+        .update({ refresh_token: refreshResult.refreshToken, updated_at: new Date().toISOString() })
+        .eq("id", multiAccountId);
+    }
+    await supabaseAdmin
       .from("google_oauth_tokens")
       .update({ refresh_token: refreshResult.refreshToken })
       .eq("user_id", user.id);
-
-    if (updateError) {
-      console.error("[google-token-broker] Failed to rotate refresh token", updateError.message);
-    }
   }
 
   return jsonResponse(

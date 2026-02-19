@@ -63,7 +63,9 @@ struct EmailDetailView: View {
         return gmail.connectedEmail ?? ""
     }
     
-    private let aiService = EmailAIService()
+    private var aiService: EmailAIService {
+        EmailAIService(pipeline: appState.searchQueryPipeline)
+    }
     
     var body: some View {
         Group {

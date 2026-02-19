@@ -136,7 +136,7 @@ final class SemanticSearchService {
             "query_embedding": vectorString(embedding),
             "match_count": 20,
             "source_filters": sourceFilters.map(\.rawValue),
-            "min_semantic_score": 0.40
+            "min_semantic_score": 0.28
         ]
         return try await callRPC(function: "hybrid_search_documents", payload: payload)
     }
@@ -150,7 +150,7 @@ final class SemanticSearchService {
             "query_embedding": vectorString(embedding),
             "match_count": 20,
             "source_filters": sourceFilters.map(\.rawValue),
-            "min_score": 0.40
+            "min_score": 0.28
         ]
 
         struct SemanticOnlyRow: Decodable {

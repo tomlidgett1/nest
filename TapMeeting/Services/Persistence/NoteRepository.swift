@@ -14,6 +14,16 @@ final class NoteRepository {
     var onNoteChanged: ((Note) -> Void)?
     var onTranscriptSaved: ((Note, [Utterance]) -> Void)?
 
+    /// Incremented after Supabase sync or bulk data changes.
+    /// Read methods touch this so SwiftUI views that call them
+    /// automatically re-render when fresh data arrives.
+    private(set) var dataRevision = 0
+
+    /// Notify views that the underlying data has changed (e.g. after sync).
+    func invalidate() {
+        dataRevision += 1
+    }
+
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
     }
@@ -30,6 +40,7 @@ final class NoteRepository {
         )
         modelContext.insert(note)
         save()
+        if syncService == nil { print("[NoteRepository] ⚠ syncService is nil — note '\(title)' won't push to Supabase") }
         syncService?.pushNote(note)
         return note
     }
@@ -38,6 +49,7 @@ final class NoteRepository {
 
     /// Fetch all active (non-archived) notes, sorted by creation date (newest first).
     func fetchAllNotes() -> [Note] {
+        _ = dataRevision
         let predicate = #Predicate<Note> { note in
             note.isArchived == false
         }
@@ -50,6 +62,7 @@ final class NoteRepository {
 
     /// Fetch all archived notes, sorted by archive date (newest first).
     func fetchArchivedNotes() -> [Note] {
+        _ = dataRevision
         let predicate = #Predicate<Note> { note in
             note.isArchived == true
         }
@@ -88,6 +101,7 @@ final class NoteRepository {
 
     /// Search active (non-archived) notes by title, content, or tag names.
     func searchNotes(query: String) -> [Note] {
+        _ = dataRevision
         let predicate = #Predicate<Note> { note in
             note.isArchived == false && (
                 note.title.localizedStandardContains(query) ||
@@ -137,6 +151,7 @@ final class NoteRepository {
     func updateRawNotes(_ text: String, for note: Note) {
         note.rawNotes = text
         save()
+        if syncService == nil { print("[NoteRepository] ⚠ syncService is nil — raw notes update for '\(note.title)' won't push") }
         syncService?.pushNote(note)
         onNoteChanged?(note)
     }
@@ -145,6 +160,7 @@ final class NoteRepository {
     func setEnhancedNotes(_ text: String, for note: Note) {
         note.enhancedNotes = text
         save()
+        if syncService == nil { print("[NoteRepository] ⚠ syncService is nil — enhanced notes for '\(note.title)' won't push") }
         syncService?.pushNote(note)
         onNoteChanged?(note)
     }
@@ -183,6 +199,7 @@ final class NoteRepository {
             newUtterances.append(utterance)
         }
         save()
+        if syncService == nil { print("[NoteRepository] ⚠ syncService is nil — \(newUtterances.count) utterances for '\(note.title)' won't push") }
         syncService?.pushUtterances(newUtterances, noteId: note.id)
         onTranscriptSaved?(note, newUtterances)
     }
@@ -220,6 +237,7 @@ final class NoteRepository {
 
     /// Fetch only active (non-archived) standalone notes.
     func fetchStandaloneNotes() -> [Note] {
+        _ = dataRevision
         let standaloneRaw = NoteType.standalone.rawValue
         let predicate = #Predicate<Note> { note in
             note.isArchived == false && note.noteTypeRaw == standaloneRaw
@@ -233,6 +251,7 @@ final class NoteRepository {
 
     /// Fetch only active (non-archived) meeting notes.
     func fetchMeetingNotes() -> [Note] {
+        _ = dataRevision
         let meetingRaw = NoteType.meeting.rawValue
         let predicate = #Predicate<Note> { note in
             note.isArchived == false && note.noteTypeRaw == meetingRaw
@@ -257,6 +276,7 @@ final class NoteRepository {
 
     /// Fetch all tags, sorted by name.
     func fetchAllTags() -> [Tag] {
+        _ = dataRevision
         let descriptor = FetchDescriptor<Tag>(
             sortBy: [SortDescriptor(\.name, order: .forward)]
         )
@@ -376,6 +396,7 @@ final class NoteRepository {
 
     /// Fetch all folders, sorted by sort order then creation date.
     func fetchAllFolders() -> [Folder] {
+        _ = dataRevision
         let descriptor = FetchDescriptor<Folder>(
             sortBy: [
                 SortDescriptor(\.sortOrder, order: .forward),
@@ -417,6 +438,7 @@ final class NoteRepository {
 
     /// Fetch active (non-archived) notes in a folder, or all uncategorised active notes if folder is nil.
     func fetchNotes(in folder: Folder?) -> [Note] {
+        _ = dataRevision
         if let folder {
             return folder.notes.filter { !$0.isArchived }.sorted { $0.createdAt > $1.createdAt }
         }
