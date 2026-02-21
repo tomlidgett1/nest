@@ -50,6 +50,26 @@ function TypingIndicator() {
   )
 }
 
+function StepProgress({ current }: { current: number }) {
+  return (
+    <nav className="step-progress" aria-label="Setup progress">
+      {[1, 2, 3].map((s, i) => (
+        <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <motion.div
+            className={`step-dot ${s === current ? 'step-dot-active' : s < current ? 'step-dot-done' : ''}`}
+            animate={{ scale: s === current ? 1.25 : 1 }}
+            transition={springSnappy}
+            aria-label={`Step ${s}${s === current ? ' (current)' : s < current ? ' (completed)' : ''}`}
+          />
+          {i < 2 && (
+            <div className={`step-line ${s < current ? 'step-line-done' : ''}`} />
+          )}
+        </div>
+      ))}
+    </nav>
+  )
+}
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null)
@@ -155,7 +175,7 @@ export default function Dashboard() {
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
       >
-        <div className="content">
+        <main className="content" role="status" aria-label="Loading">
           <div className="loading-dots">
             {[0, 1, 2].map(i => (
               <motion.div
@@ -166,7 +186,7 @@ export default function Dashboard() {
               />
             ))}
           </div>
-        </div>
+        </main>
       </motion.div>
     )
   }
@@ -183,20 +203,31 @@ export default function Dashboard() {
       exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
     >
-      <div className="top-bar" ref={topBarRef}>
-        <motion.img
-          src="/nest-logo.png"
-          alt="Nest"
-          className="top-bar-logo"
-          initial={{ opacity: 0, scale: 0.8 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ ...springSnappy, delay: 0.05 }}
-        />
+      <header className="top-bar" ref={topBarRef}>
+        <div className="top-bar-left">
+          <motion.img
+            src="/nest-logo.png"
+            alt="Nest"
+            className="top-bar-logo"
+            initial={{ opacity: 0, scale: 0.8 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ ...springSnappy, delay: 0.05 }}
+          />
+          <motion.span
+            className="top-bar-wordmark"
+            initial={{ opacity: 0, x: -8 }}
+            animate={{ opacity: 1, x: 0 }}
+            transition={{ ...spring, delay: 0.1 }}
+          >
+            Nest
+          </motion.span>
+        </div>
 
         <motion.button
           className="avatar-button"
           onClick={() => setDropdownOpen(prev => !prev)}
-          aria-label="Menu"
+          aria-label="Account menu"
+          aria-expanded={dropdownOpen}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: 0.3, delay: 0.15 }}
@@ -214,36 +245,39 @@ export default function Dashboard() {
         <AnimatePresence>
           {dropdownOpen && (
             <>
-              <div className="dropdown-overlay" onClick={() => setDropdownOpen(false)} />
+              <div className="dropdown-overlay" onClick={() => setDropdownOpen(false)} aria-hidden="true" />
               <motion.div
                 className="avatar-dropdown"
+                role="menu"
                 initial={{ opacity: 0, y: -6, scale: 0.97 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: -6, scale: 0.97 }}
                 transition={{ type: 'spring', stiffness: 500, damping: 30 }}
               >
-                <button className="dropdown-link" onClick={() => { setDropdownOpen(false); handleAddAccount() }}>
+                <button role="menuitem" className="dropdown-link" onClick={() => { setDropdownOpen(false); handleAddAccount() }}>
                   Add account
                 </button>
-                <div className="dropdown-divider" />
-                <Link to="/privacy" className="dropdown-link" onClick={() => setDropdownOpen(false)}>
+                <div className="dropdown-divider" role="separator" />
+                <Link to="/privacy" role="menuitem" className="dropdown-link" onClick={() => setDropdownOpen(false)}>
                   Privacy Policy
                 </Link>
-                <Link to="/terms" className="dropdown-link" onClick={() => setDropdownOpen(false)}>
+                <Link to="/terms" role="menuitem" className="dropdown-link" onClick={() => setDropdownOpen(false)}>
                   Terms of Service
                 </Link>
-                <a href="mailto:tomlidgettprojects@gmail.com" className="dropdown-link">
+                <a href="mailto:nestchatapp123@gmail.com" role="menuitem" className="dropdown-link">
                   Support
                 </a>
-                <div className="dropdown-divider" />
-                <button className="dropdown-link dropdown-link-danger" onClick={async () => { setDropdownOpen(false); await supabase.auth.signOut(); navigate('/') }}>
+                <div className="dropdown-divider" role="separator" />
+                <button role="menuitem" className="dropdown-link dropdown-link-danger" onClick={async () => { setDropdownOpen(false); await supabase.auth.signOut(); navigate('/') }}>
                   Log out
                 </button>
               </motion.div>
             </>
           )}
         </AnimatePresence>
-      </div>
+      </header>
+
+      <StepProgress current={step} />
 
       <AnimatePresence mode="wait">
         {/* ── Step 1: Connected Accounts ── */}
@@ -256,14 +290,14 @@ export default function Dashboard() {
             transition={{ duration: 0.3 }}
             style={{ display: 'contents' }}
           >
-            <div className="hero">
+            <main className="hero" aria-label="Connected accounts">
               <motion.div
                 className="checkmark-circle"
                 initial={{ scale: 0 }}
                 animate={{ scale: 1 }}
                 transition={{ type: 'spring', stiffness: 400, damping: 20, delay: 0.1 }}
               >
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <motion.path
                     d="M20 6L9 17L4 12"
                     stroke="#4A6340"
@@ -331,6 +365,7 @@ export default function Dashboard() {
                         className="accounts-card-remove"
                         onClick={() => handleRemoveAccount(account.id)}
                         disabled={removing === account.id}
+                        aria-label={`Remove ${account.google_email}`}
                       >
                         {removing === account.id ? '...' : 'Remove'}
                       </button>
@@ -346,14 +381,14 @@ export default function Dashboard() {
                   transition={{ ...spring, delay: 0.7 }}
                   whileTap={{ scale: 0.97 }}
                 >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                     <line x1="12" y1="5" x2="12" y2="19" />
                     <line x1="5" y1="12" x2="19" y2="12" />
                   </svg>
                   Add another account
                 </motion.button>
               </motion.div>
-            </div>
+            </main>
 
             <motion.div
               className="bottom-cta"
@@ -365,6 +400,7 @@ export default function Dashboard() {
                 className="btn-dark"
                 onClick={() => setStep(2)}
                 whileTap={{ scale: 0.97 }}
+                whileHover={{ scale: 1.01 }}
                 transition={springSnappy}
               >
                 Continue
@@ -383,7 +419,7 @@ export default function Dashboard() {
             transition={{ duration: 0.3 }}
             style={{ display: 'contents' }}
           >
-            <div className="hero">
+            <main className="hero" aria-label="Add Nest to contacts">
               <motion.img
                 src="/nest-logo.png"
                 alt=""
@@ -431,7 +467,7 @@ export default function Dashboard() {
                   </div>
                 </div>
               </motion.div>
-            </div>
+            </main>
 
             <motion.div
               className="bottom-cta"
@@ -446,6 +482,7 @@ export default function Dashboard() {
                   onClick={() => setTimeout(() => setStep(3), 500)}
                   style={{ textDecoration: 'none' }}
                   whileTap={{ scale: 0.97 }}
+                  whileHover={{ scale: 1.01 }}
                   transition={springSnappy}
                 >
                   Add to Contacts
@@ -472,7 +509,7 @@ export default function Dashboard() {
             transition={{ duration: 0.3 }}
             style={{ display: 'contents' }}
           >
-            <div className="hero">
+            <main className="hero" aria-label="Open iMessage">
               <motion.img
                 src="/nest-logo.png"
                 alt=""
@@ -544,7 +581,7 @@ export default function Dashboard() {
                   </motion.div>
                 )}
               </motion.div>
-            </div>
+            </main>
 
             <motion.div
               className="bottom-cta"
@@ -554,9 +591,10 @@ export default function Dashboard() {
             >
               <motion.a
                 className="btn-dark"
-                href="sms:tomlidgettprojects@gmail.com&body=Hey%20Nest!"
+                href="sms:nestchatapp123@gmail.com&body=Hey%20Nest!"
                 style={{ textDecoration: 'none' }}
                 whileTap={{ scale: 0.97 }}
+                whileHover={{ scale: 1.01 }}
                 transition={springSnappy}
               >
                 Open iMessage

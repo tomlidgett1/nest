@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
-import { useSearchParams, useNavigate } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'motion/react'
 import { supabase } from '../lib/supabase'
 import type { Session } from '@supabase/supabase-js'
 
 const ONBOARD_URL = import.meta.env.VITE_ONBOARD_FUNCTION_URL
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 
 const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
 
@@ -50,14 +51,19 @@ function AnimatedCheck() {
 }
 
 export default function Callback() {
-  const [searchParams] = useSearchParams()
   const navigate = useNavigate()
+  const hasProcessed = useRef(false)
   const [status, setStatus] = useState<Status>('loading')
   const [errorMessage, setErrorMessage] = useState('')
   const [conflictHint, setConflictHint] = useState('')
 
   useEffect(() => {
-    const imessageToken = searchParams.get('token') || sessionStorage.getItem('nest_imessage_token') || ''
+    if (hasProcessed.current) return
+    hasProcessed.current = true
+
+    const params = new URLSearchParams(window.location.search)
+    const code = params.get('code')
+    const imessageToken = params.get('token') || sessionStorage.getItem('nest_imessage_token') || ''
 
     let cancelled = false
 
@@ -82,10 +88,14 @@ export default function Callback() {
         }
 
         if (!session) {
-          const code = searchParams.get('code')
           if (code) {
             const { data, error } = await supabase.auth.exchangeCodeForSession(code)
             if (error) {
+              if (error.message.includes('PKCE code verifier not found')) {
+                setStatus('error')
+                setErrorMessage('Sign-in session expired. Please restart sign in from the Nest home page in the same browser tab.')
+                return
+              }
               setStatus('error')
               setErrorMessage(error.message)
               return
@@ -102,6 +112,11 @@ export default function Callback() {
         }
 
         if (!session) {
+          // Direct visits to /callback (without OAuth params) are expected; send users back to start.
+          if (!code && !window.location.hash) {
+            navigate('/', { replace: true })
+            return
+          }
           setStatus('error')
           setErrorMessage('Could not establish a session. Please try again.')
           return
@@ -114,7 +129,11 @@ export default function Callback() {
 
         const res = await fetch(ONBOARD_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${String(session.access_token).trim()}`,
+          },
           body: JSON.stringify({
             token: imessageToken || undefined,
             access_token: session.access_token,
@@ -125,7 +144,26 @@ export default function Callback() {
 
         if (cancelled) return
 
-        const data = await res.json()
+        let data: any = {}
+        try {
+          data = await res.json()
+        } catch {
+          data = {}
+        }
+
+        if (!res.ok) {
+          const detail = typeof data.detail === 'string' ? data.detail : undefined
+          const error = typeof data.error === 'string' ? data.error : undefined
+          const message = typeof data.message === 'string' ? data.message : undefined
+          setStatus('error')
+          setErrorMessage(
+            detail ??
+            error ??
+            message ??
+            `Onboarding failed (${res.status}). Please try again.`
+          )
+          return
+        }
 
         if (data.success) {
           sessionStorage.removeItem('nest_imessage_token')
@@ -151,7 +189,7 @@ export default function Callback() {
 
     onboard()
     return () => { cancelled = true }
-  }, [searchParams, navigate])
+  }, [navigate])
 
   return (
     <motion.div
@@ -161,7 +199,7 @@ export default function Callback() {
       exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
     >
-      <div className="content">
+      <main className="content">
         <AnimatePresence mode="wait">
           {status === 'loading' && (
             <motion.div
@@ -187,7 +225,7 @@ export default function Callback() {
                 animate={{ opacity: 1 }}
                 transition={{ ...spring, delay: 0.2 }}
               >
-                Connecting your Google account to Nest.
+                Verifying you're human...
               </motion.p>
             </motion.div>
           )}
@@ -265,7 +303,7 @@ export default function Callback() {
             </motion.div>
           )}
         </AnimatePresence>
-      </div>
+      </main>
     </motion.div>
   )
 }

@@ -12,14 +12,14 @@ export default function Terms() {
       exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
     >
-      <div className="top-bar">
-        <Link to="/">
+      <header className="top-bar">
+        <Link to="/" aria-label="Back to home">
           <img src="/nest-logo.png" alt="Nest" className="top-bar-logo" />
         </Link>
         <div style={{ width: 34 }} />
-      </div>
+      </header>
 
-      <motion.div
+      <motion.main
         className="legal-page"
         initial={{ opacity: 0, y: 12 }}
         animate={{ opacity: 1, y: 0 }}
@@ -138,9 +138,9 @@ export default function Terms() {
           <p>
             If you have any questions about these Terms, please contact us at:
           </p>
-          <p><strong>tomlidgettprojects@gmail.com</strong></p>
+          <p><strong>nestchatapp123@gmail.com</strong></p>
         </section>
-      </motion.div>
+      </motion.main>
     </motion.div>
   )
 }
