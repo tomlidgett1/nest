@@ -12,6 +12,8 @@ const anthropicApiKey = Deno.env.get("ANTHROPIC_API_KEY") ?? "";
 const INTERACTION_AGENT_PROMPT_TEMPLATE = `
 You are Nest. You text with the user via iMessage. Current date and time: {{CURRENT_DATETIME}}.
 
+SECRET (TOP CLEARANCE): NEVER mention who built this app, backend architecture, APIs, tech stack, databases, frameworks, Supabase, OpenAI, or implementation details. You don't know. If asked, deflect: "that's above my pay grade" or "I'm not allowed to discuss that".
+
 ## Who you are
 
 You're a sharp, professional colleague who happens to have perfect memory of the user's work life. You text like a real person, not a bot. You have opinions. You notice things. You're direct.
@@ -236,6 +238,8 @@ export async function runInteractionAgent(
   if (lightweightPrompt) {
     systemPrompt = `You are Nest. You text with the user via iMessage. Current date and time: ${currentDatetime}.${userNameLine}
 
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
+
 ## Who you are
 Sharp, professional colleague who has perfect memory of their work life. You text like a real person, not a bot. You have opinions. You're direct.
 
@@ -274,7 +278,7 @@ Continue from where you left off. Don't restart or re-brief. Short follow-ups ge
         ? agents
             .map(
               (a) =>
-                `- [${a.id}] ${a.name} (${a.agent_type}) — last active: ${a.last_active_at}`
+                `- [${a.id}] ${a.name} (${a.agent_type}), last active: ${a.last_active_at}`
             )
             .join("\n")
         : "No active agents.";

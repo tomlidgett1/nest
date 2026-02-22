@@ -23,10 +23,13 @@
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   getGoogleAccessToken,
+  getAllAccountTokens,
+  getTokenForEmail,
   createGmailDraft,
   createGmailReplyDraft,
   listGmailMessages,
   getGmailMessage,
+  type AccountToken,
 } from "./gmail-helpers.ts";
 
 // ── Config ───────────────────────────────────────────────────
@@ -35,6 +38,7 @@ const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
 const PDL_API_KEY = Deno.env.get("PDL_API_KEY") ?? "";
 const TAVILY_API_KEY = Deno.env.get("TAVILY_API_KEY") ?? "";
 const WEATHER_API_KEY = Deno.env.get("WEATHER_API_KEY") ?? "";
+const GOOGLE_MAPS_API_KEY = Deno.env.get("GOOGLE_MAPS_API_KEY") ?? "";
 
 const CALENDAR_API = "https://www.googleapis.com/calendar/v3";
 const PEOPLE_API = "https://people.googleapis.com/v1";
@@ -150,8 +154,14 @@ export async function executeTool(
   args: Record<string, unknown>,
   userId: string,
   supabase: SupabaseClient,
+  userTimezone?: string,
 ): Promise<string> {
   try {
+    const tz = userTimezone ?? DEFAULT_TZ;
+    if (!args.time_zone) args.time_zone = tz;
+    if (name === "weather_lookup" && !args.location) {
+      args._userTimezone = tz;
+    }
     const result = await dispatch(name, args, userId, supabase);
     return typeof result === "string" ? result : JSON.stringify(result);
   } catch (e) {
@@ -208,9 +218,28 @@ async function dispatch(
     case "document_search":     return documentSearch(userId, supabase, args);
     case "create_note":         return createNote(userId, supabase, args);
     case "weather_lookup":      return weatherLookup(args);
+    case "travel_time":         return travelTime(args);
+    case "places_search":       return placesSearch(args);
+    case "manage_todos":        return manageTodos(userId, supabase, args);
     default:
       return { error: `Unknown tool: ${name}` };
   }
+}
+
+/**
+ * Resolve a Google access token from an optional account email arg.
+ * If account is specified, uses that account. Otherwise falls back to primary.
+ */
+async function resolveToken(
+  userId: string,
+  supabase: SupabaseClient,
+  accountEmail?: string,
+): Promise<{ accessToken: string; email: string }> {
+  if (accountEmail) {
+    return getTokenForEmail(supabase, userId, accountEmail);
+  }
+  const token = await getGoogleAccessToken(supabase, userId);
+  return { accessToken: token, email: "primary" };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -222,10 +251,11 @@ async function calendarLookup(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const accounts = await getAllAccountTokens(supabase, userId);
   const tz = (args.time_zone as string) ?? DEFAULT_TZ;
   const { timeMin, timeMax } = resolveTimeRange(args.range as string, tz);
   const maxResults = (args.max_results as number) ?? 15;
+  const query = (args.query as string)?.toLowerCase();
 
   const params = new URLSearchParams({
     timeMin,
@@ -236,16 +266,35 @@ async function calendarLookup(
     timeZone: tz,
   });
 
-  const query = (args.query as string)?.toLowerCase();
-
-  const resp = await retryFetch(
-    `${CALENDAR_API}/calendars/primary/events?${params}`,
-    { headers: { Authorization: `Bearer ${accessToken}` } },
+  const perAccount = await Promise.all(
+    accounts.map(async (acct) => {
+      try {
+        const resp = await retryFetch(
+          `${CALENDAR_API}/calendars/primary/events?${params}`,
+          { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+        );
+        if (!resp.ok) {
+          console.warn(`[tools] calendar_lookup failed for ${acct.email} (${resp.status})`);
+          return [];
+        }
+        const data = await resp.json();
+        return (data.items ?? []).map((e: any) => ({
+          ...formatCalendarEvent(e),
+          account: acct.email,
+        }));
+      } catch (e) {
+        console.warn(`[tools] calendar_lookup error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
   );
-  if (!resp.ok) throw new Error(`Calendar lookup failed (${resp.status})`);
 
-  const data = await resp.json();
-  let events = (data.items ?? []).map(formatCalendarEvent);
+  const seen = new Set<string>();
+  let events = perAccount.flat().filter((e: any) => {
+    if (seen.has(e.event_id)) return false;
+    seen.add(e.event_id);
+    return true;
+  });
 
   if (query) {
     events = events.filter((e: any) =>
@@ -256,15 +305,17 @@ async function calendarLookup(
   }
 
   const now = new Date();
-  return events.map((e: any) => {
-    const start = new Date(e.start);
-    const end = new Date(e.end);
-    let status: string;
-    if (end < now) status = "ALREADY_HAPPENED";
-    else if (start <= now && end >= now) status = "HAPPENING_NOW";
-    else status = "UPCOMING";
-    return { ...e, status };
-  });
+  return events
+    .map((e: any) => {
+      const start = new Date(e.start);
+      const end = new Date(e.end);
+      let status: string;
+      if (end < now) status = "ALREADY_HAPPENED";
+      else if (start <= now && end >= now) status = "HAPPENING_NOW";
+      else status = "UPCOMING";
+      return { ...e, status };
+    })
+    .sort((a: any, b: any) => new Date(a.start).getTime() - new Date(b.start).getTime());
 }
 
 /**
@@ -415,7 +466,7 @@ async function calendarCreate(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const { accessToken, email: acctEmail } = await resolveToken(userId, supabase, args.account as string | undefined);
   const tz = (args.time_zone as string) ?? DEFAULT_TZ;
   const isAllDay = !!(args.all_day);
 
@@ -452,6 +503,7 @@ async function calendarCreate(
   const created = await resp.json();
   const result: Record<string, unknown> = {
     event_id: created.id, status: "created", title: created.summary, html_link: created.htmlLink,
+    account: acctEmail,
     _confirmation: `Calendar event "${created.summary}" created successfully. Confirm this to the user.`,
   };
   if (created.conferenceData?.entryPoints) {
@@ -466,7 +518,7 @@ async function calendarUpdate(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
   const tz = (args.time_zone as string) ?? DEFAULT_TZ;
   const patch: Record<string, unknown> = {};
 
@@ -516,7 +568,7 @@ async function calendarDelete(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
   const calId = (args.calendar_id as string) ?? "primary";
   const qp = new URLSearchParams();
   if (args.send_updates) qp.set("sendUpdates", args.send_updates as string);
@@ -541,37 +593,274 @@ async function semanticSearch(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const query = args.query as string;
-  const limit = (args.limit as number) ?? 8;
+  const limit = (args.limit as number) ?? 10;
   const sourceFilters = (args.source_filters as string[]) ?? null;
+  const start = Date.now();
 
-  const embedding = await getEmbedding(query);
+  // Generate multiple sub-queries for better recall
+  const subQueries = generateSearchSubQueries(query);
+  const allQueries = [...new Set([query, ...subQueries])].slice(0, 5);
+
+  // Batch-embed all queries in one API call
+  const embeddings = await getBatchEmbeddings(allQueries);
+
+  // Run all queries in parallel (with source filters if provided)
+  const searchPromises = allQueries.map((q, i) =>
+    hybridSearchWithFallback(q, embeddings[i], supabase, userId, sourceFilters, limit)
+      .catch(() => [] as any[])
+  );
+
+  // Also run temporal calendar search if the query has date-related intent
+  const searchTz = (args.time_zone as string) ?? DEFAULT_TZ;
+  const temporalResults = await temporalCalendarSearchFromQuery(query, supabase, userId, searchTz);
+
+  const allSearchResults = await Promise.all(searchPromises);
+  let results = [...allSearchResults.flat(), ...temporalResults];
+
+  // Deduplicate by document_id
+  const seen = new Set<string>();
+  results = results.filter((r: any) => {
+    const id = r.document_id ?? r.id;
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+
+  // Sort by fused_score descending
+  results.sort((a: any, b: any) => (b.fused_score ?? b.semantic_score ?? 0) - (a.fused_score ?? a.semantic_score ?? 0));
+
+  // MMR diversity: penalise clusters from the same source
+  results = applyMMRDiversity(results, limit * 2);
+
+  // Auto-retry with topic nouns if results are thin
+  if (results.length < 3) {
+    const topicNouns = extractTopicNouns(query);
+    if (topicNouns.length > 0) {
+      const fallbackQuery = topicNouns.join(" ");
+      const [fallbackEmb] = await getBatchEmbeddings([fallbackQuery]);
+      const fallbackResults = await hybridSearchWithFallback(
+        fallbackQuery, fallbackEmb, supabase, userId, null, limit
+      ).catch(() => [] as any[]);
+
+      for (const r of fallbackResults) {
+        const id = r.document_id ?? r.id;
+        if (id && !seen.has(id)) {
+          seen.add(id);
+          results.push(r);
+        }
+      }
+    }
+  }
+
+  const formatted = results.slice(0, limit).map(formatSearchResult);
+  const elapsed = Date.now() - start;
+  console.log(`[tools] semantic_search: ${formatted.length} results from ${allQueries.length} queries (${elapsed}ms)`);
+
+  // Freshness signal when results are thin
+  if (formatted.length < 2) {
+    return {
+      results: formatted,
+      count: formatted.length,
+      _hint: "Indexed data returned few results. Try gmail_search for real-time email content, or calendar_lookup for live calendar data. The index may not include very recent items.",
+    };
+  }
+
+  return { results: formatted, count: formatted.length };
+}
+
+function generateSearchSubQueries(query: string): string[] {
+  const stopWords = new Set([
+    "what", "when", "where", "who", "how", "why", "did", "does", "do",
+    "the", "a", "an", "is", "was", "were", "are", "been", "be",
+    "about", "from", "with", "for", "of", "in", "on", "at", "to",
+    "can", "could", "would", "should", "will", "you", "me", "my", "i",
+    "we", "our", "tell", "show", "give", "find", "get", "list",
+    "summarise", "summarize", "explain", "please", "any", "some",
+    "that", "this", "those", "these", "it", "its",
+  ]);
+  const temporalWords = new Set([
+    "today", "tomorrow", "yesterday", "tonight", "morning", "afternoon",
+    "evening", "last", "next", "recent", "latest", "upcoming", "past",
+    "week", "month", "year", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "saturday", "sunday",
+  ]);
+
+  const words = query.split(/\s+/);
+  const keywords = words.filter((w) => {
+    const lower = w.toLowerCase().replace(/[^\w]/g, "");
+    return !stopWords.has(lower) && !temporalWords.has(lower) && lower.length > 1;
+  });
+
+  const queries: string[] = [];
+  if (keywords.length >= 2) queries.push(keywords.join(" "));
+
+  const topicWords = [...keywords].sort((a, b) => b.length - a.length).slice(0, 3);
+  if (topicWords.length > 0 && topicWords[0].toLowerCase() !== keywords.join(" ").toLowerCase()) {
+    queries.push(topicWords[0]);
+    if (topicWords.length >= 2) queries.push(topicWords.join(" "));
+  }
+
+  return queries;
+}
+
+async function hybridSearchWithFallback(
+  queryText: string,
+  embedding: number[],
+  supabase: SupabaseClient,
+  userId: string,
+  sourceFilters: string[] | null,
+  matchCount: number,
+): Promise<any[]> {
+  const embStr = vectorString(embedding);
 
   const { data, error } = await supabase.rpc("hybrid_search_documents", {
-    query_text: query,
-    query_embedding: vectorString(embedding),
-    match_count: limit,
+    query_text: queryText,
+    query_embedding: embStr,
+    match_count: matchCount,
     source_filters: sourceFilters,
-    min_semantic_score: 0.28,
+    min_semantic_score: 0.25,
     p_user_id: userId,
   });
 
   if (error) {
     console.warn("[tools] hybrid_search failed, falling back to vector:", error.message);
     const fallback = await supabase.rpc("match_search_documents", {
-      query_embedding: vectorString(embedding),
-      match_count: limit,
-      source_filters: sourceFilters ?? [
-        "note_summary", "note_chunk", "utterance_chunk",
-        "email_summary", "email_chunk", "calendar_summary",
-      ],
-      min_score: 0.28,
+      query_embedding: embStr,
+      match_count: matchCount,
+      source_filters: sourceFilters ?? null,
+      min_score: 0.25,
       p_user_id: userId,
     });
-    if (fallback.error) throw new Error(`Semantic search failed: ${fallback.error.message}`);
-    return (fallback.data ?? []).map(formatSearchResult);
+    if (fallback.error) throw new Error(`Search failed: ${fallback.error.message}`);
+    return (fallback.data ?? []).map((d: any) => ({ ...d, fused_score: d.semantic_score ?? 0 }));
   }
 
-  return (data ?? []).map(formatSearchResult);
+  return data ?? [];
+}
+
+async function temporalCalendarSearchFromQuery(
+  query: string,
+  supabase: SupabaseClient,
+  userId: string,
+  userTz = DEFAULT_TZ,
+): Promise<any[]> {
+  const lower = query.toLowerCase();
+
+  // Detect temporal intent — explicit date words or implicit date-seeking patterns
+  const hasTemporalKeyword = /\b(today|tomorrow|yesterday|this week|last week|next week|this month|last month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(lower);
+  const hasDateSeekingIntent = /\b(date|when|first|last|earliest|latest|most recent)\b/i.test(lower);
+
+  if (!hasTemporalKeyword && !hasDateSeekingIntent) return [];
+
+  try {
+    // For date-seeking queries without explicit range, search a wide window
+    let startDate: Date;
+    let endDate: Date;
+    const now = new Date();
+
+    if (hasTemporalKeyword) {
+      // Use explicit temporal resolution
+      if (lower.includes("today")) { startDate = startOfDayInTz(now, userTz); endDate = addDays(startDate, 1); }
+      else if (lower.includes("tomorrow")) { startDate = addDays(startOfDayInTz(now, userTz), 1); endDate = addDays(startDate, 1); }
+      else if (lower.includes("yesterday")) { startDate = addDays(startOfDayInTz(now, userTz), -1); endDate = startOfDayInTz(now, userTz); }
+      else if (lower.includes("this week")) { startDate = startOfWeekInTz(now, userTz); endDate = addDays(startDate, 7); }
+      else if (lower.includes("last week")) { startDate = addDays(startOfWeekInTz(now, userTz), -7); endDate = startOfWeekInTz(now, userTz); }
+      else if (lower.includes("next week")) { startDate = addDays(startOfWeekInTz(now, userTz), 7); endDate = addDays(startDate, 7); }
+      else { startDate = addDays(now, -90); endDate = addDays(now, 30); }
+    } else {
+      // Date-seeking intent without explicit range — search wide (past 6 months)
+      startDate = addDays(now, -180);
+      endDate = addDays(now, 30);
+    }
+
+    const { data, error } = await supabase
+      .from("search_documents")
+      .select("id, source_type, source_id, title, summary_text, chunk_text, metadata")
+      .eq("user_id", userId)
+      .eq("source_type", "calendar_summary")
+      .eq("is_deleted", false)
+      .filter("metadata->>start", "gte", startDate.toISOString())
+      .filter("metadata->>start", "lt", endDate.toISOString())
+      .order("metadata->>start" as any, { ascending: true })
+      .limit(20);
+
+    if (error || !data) return [];
+
+    return data.map((d: any) => ({
+      document_id: d.id,
+      source_type: d.source_type,
+      source_id: d.source_id ?? "",
+      title: d.title ?? "",
+      summary_text: d.summary_text,
+      chunk_text: d.chunk_text,
+      metadata: d.metadata,
+      semantic_score: 0.9,
+      fused_score: 0.9,
+    }));
+  } catch (e) {
+    console.warn("[tools] temporal calendar search failed:", (e as Error).message);
+    return [];
+  }
+}
+
+function startOfDayInTz(date: Date, tz: string): Date {
+  const localDateStr = date.toLocaleDateString("en-CA", { timeZone: tz });
+  const [y, m, d] = localDateStr.split("-").map(Number);
+  const localTimeStr = date.toLocaleString("sv-SE", { timeZone: tz });
+  const localParsed = new Date(localTimeStr + "Z");
+  const offsetMs = localParsed.getTime() - date.getTime();
+  return new Date(Date.UTC(y, m - 1, d) - offsetMs);
+}
+
+function startOfWeekInTz(date: Date, tz: string): Date {
+  const start = startOfDayInTz(date, tz);
+  const localTimeStr = date.toLocaleString("sv-SE", { timeZone: tz });
+  const localParsed = new Date(localTimeStr + "Z");
+  const offsetMs = localParsed.getTime() - date.getTime();
+  const localDow = new Date(start.getTime() + offsetMs).getDay();
+  const daysFromMon = (localDow + 6) % 7;
+  return addDays(start, -daysFromMon);
+}
+
+function addDays(date: Date, n: number): Date {
+  return new Date(date.getTime() + n * 86400000);
+}
+
+function applyMMRDiversity(results: any[], maxResults: number): any[] {
+  if (results.length <= maxResults) return results;
+  const selected: any[] = [];
+  const sourceCount: Record<string, number> = {};
+  const PENALTY = 0.3;
+
+  for (const candidate of results) {
+    if (selected.length >= maxResults) break;
+    const sourceKey = `${candidate.source_type}::${candidate.source_id}`;
+    const count = sourceCount[sourceKey] ?? 0;
+    if (count < 3) {
+      const penalty = count * PENALTY;
+      const score = (candidate.fused_score ?? candidate.semantic_score ?? 0) * (1.0 - penalty);
+      if (score > 0 || selected.length < 4) {
+        selected.push(candidate);
+        sourceCount[sourceKey] = count + 1;
+      }
+    }
+  }
+  return selected;
+}
+
+function extractTopicNouns(query: string): string[] {
+  const allStop = new Set([
+    "what", "when", "where", "who", "how", "why", "did", "does", "do",
+    "the", "a", "an", "is", "was", "were", "are", "been", "be",
+    "about", "from", "with", "for", "of", "in", "on", "at", "to",
+    "can", "could", "would", "should", "will", "you", "me", "my", "i",
+    "we", "our", "tell", "show", "give", "find", "get", "list",
+    "today", "tomorrow", "yesterday", "week", "month", "year",
+    "key", "highlights", "details", "related", "date", "first", "last",
+  ]);
+  return query.split(/\s+/)
+    .map((w) => w.toLowerCase().replace(/[^\w]/g, ""))
+    .filter((w) => !allStop.has(w) && w.length > 1);
 }
 
 function formatSearchResult(d: any): Record<string, unknown> {
@@ -582,6 +871,7 @@ function formatSearchResult(d: any): Record<string, unknown> {
     source_type: d.source_type,
     score: d.fused_score ?? d.semantic_score ?? 0,
     created_at: d.created_at ?? null,
+    metadata: d.metadata ?? null,
   };
 }
 
@@ -694,25 +984,49 @@ async function contactsSearch(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const accounts = await getAllAccountTokens(supabase, userId);
   const query = (args.query as string) ?? "";
   const limit = (args.limit as number) ?? 10;
   const readMask = "names,emailAddresses,phoneNumbers,organizations";
 
-  // FIX #3: Non-blocking warmup. Fire background task, only wait if still pending.
-  ensureContactsWarmup(accessToken, userId);
-  if (contactsWarmupState.get(userId) === "pending") {
-    await new Promise((r) => setTimeout(r, 1200));
+  for (const acct of accounts) {
+    ensureContactsWarmup(acct.accessToken, `${userId}:${acct.accountId}`);
   }
-
-  const resp = await retryFetch(
-    `${PEOPLE_API}/people:searchContacts?query=${encodeURIComponent(query)}&readMask=${readMask}&pageSize=${limit}`,
-    { headers: { Authorization: `Bearer ${accessToken}` } },
+  const anyPending = accounts.some(
+    (acct) => contactsWarmupState.get(`${userId}:${acct.accountId}`) === "pending",
   );
-  if (!resp.ok) throw new Error(`Contacts search failed (${resp.status})`);
+  if (anyPending) await new Promise((r) => setTimeout(r, 1200));
 
-  const data = await resp.json();
-  return (data.results ?? []).map((r: any) => formatContact(r.person));
+  const perAccount = await Promise.all(
+    accounts.map(async (acct) => {
+      try {
+        const resp = await retryFetch(
+          `${PEOPLE_API}/people:searchContacts?query=${encodeURIComponent(query)}&readMask=${readMask}&pageSize=${limit}`,
+          { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+        );
+        if (!resp.ok) {
+          console.warn(`[tools] contacts_search failed for ${acct.email} (${resp.status})`);
+          return [];
+        }
+        const data = await resp.json();
+        return (data.results ?? []).map((r: any) => ({
+          ...formatContact(r.person),
+          account: acct.email,
+        }));
+      } catch (e) {
+        console.warn(`[tools] contacts_search error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
+
+  const seen = new Set<string>();
+  return perAccount.flat().filter((c: any) => {
+    const key = c.email?.toLowerCase() ?? c.name?.toLowerCase() ?? JSON.stringify(c);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 async function contactsManage(
@@ -720,7 +1034,7 @@ async function contactsManage(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
   const action = args.action as string;
 
   switch (action) {
@@ -810,28 +1124,47 @@ async function gmailSearch(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const accounts = await getAllAccountTokens(supabase, userId);
   const maxResults = Math.min((args.max_results as number) ?? 10, 20);
-  const messages = await listGmailMessages(accessToken, args.query as string, maxResults);
+  const perAccountMax = Math.max(Math.ceil(maxResults / accounts.length), 5);
 
-  if (!messages.length) {
+  const perAccount = await Promise.all(
+    accounts.map(async (acct) => {
+      try {
+        const messages = await listGmailMessages(acct.accessToken, args.query as string, perAccountMax);
+        if (!messages.length) return [];
+        const details = await Promise.all(
+          messages.map((m: any) => getGmailMessage(acct.accessToken, m.id)),
+        );
+        return details.map((d: any) => ({
+          message_id: d.messageId, thread_id: d.threadId,
+          from: d.from, to: d.to, cc: d.cc,
+          subject: d.subject, date: d.date, snippet: d.snippet,
+          body_preview: d.bodyPreview,
+          has_attachments: (d.attachmentCount ?? 0) > 0,
+          account: acct.email,
+        }));
+      } catch (e) {
+        console.warn(`[tools] gmail_search error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
+
+  const allResults = perAccount
+    .flat()
+    .sort((a: any, b: any) => {
+      const da = new Date(a.date || 0).getTime();
+      const db = new Date(b.date || 0).getTime();
+      return db - da;
+    })
+    .slice(0, maxResults);
+
+  if (!allResults.length) {
     return { results: [], count: 0, message: "No emails found matching that query." };
   }
 
-  const details = await Promise.all(
-    messages.map((m: any) => getGmailMessage(accessToken, m.id)),
-  );
-
-  return {
-    results: details.map((d: any) => ({
-      message_id: d.messageId, thread_id: d.threadId,
-      from: d.from, to: d.to, cc: d.cc,
-      subject: d.subject, date: d.date, snippet: d.snippet,
-      body_preview: d.bodyPreview,
-      has_attachments: (d.attachmentCount ?? 0) > 0,
-    })),
-    count: details.length,
-  };
+  return { results: allResults, count: allResults.length };
 }
 
 /**
@@ -843,7 +1176,7 @@ async function getEmail(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
   const messageId = args.message_id as string;
   if (!messageId) return { error: "message_id is required" };
 
@@ -916,7 +1249,16 @@ async function sendDraft(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const toRaw = Array.isArray(args.to) ? args.to : [args.to as string];
+  const invalidRecipients = toRaw.filter((r: string) => !r?.includes("@"));
+  if (invalidRecipients.length > 0) {
+    return {
+      error: `Invalid recipient(s): ${invalidRecipients.join(", ")}. Each recipient must be a valid email address containing @. Use contacts_search or person_lookup to find their email first.`,
+      _hint: "Call contacts_search with the person's name, then retry send_draft with the email address from the result.",
+    };
+  }
+
+  const { accessToken, email: acctEmail } = await resolveToken(userId, supabase, args.account as string | undefined);
 
   let result: any;
   if (args.reply_to_thread_id) {
@@ -943,6 +1285,7 @@ async function sendDraft(
     to: args.to, subject: args.subject,
     is_reply: !!args.reply_to_thread_id,
     reply_all: !!args.reply_all,
+    account: acctEmail,
     _confirmation: "Email draft created successfully. Show the draft to the user and ask for confirmation before sending.",
   };
 }
@@ -956,7 +1299,7 @@ async function sendEmail(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
   const draftId = args.draft_id as string;
 
   if (!draftId) {
@@ -1039,6 +1382,126 @@ async function webSearchViaOpenAI(query: string): Promise<unknown> {
 }
 
 // ══════════════════════════════════════════════════════════════
+// TODOS / TASK LIST
+// ══════════════════════════════════════════════════════════════
+
+async function manageTodos(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const action = args.action as string;
+
+  switch (action) {
+    case "add": {
+      const title = args.title as string;
+      if (!title) return { error: "Title is required to add a todo." };
+
+      const row: Record<string, unknown> = {
+        user_id: userId,
+        title,
+      };
+      if (args.notes) row.notes = args.notes;
+      if (args.due_at) row.due_at = args.due_at;
+      if (args.priority) row.priority = args.priority;
+
+      const { data, error } = await supabase
+        .from("v2_user_todos")
+        .insert(row)
+        .select("id, title, priority, due_at")
+        .single();
+      if (error) throw new Error(`Add todo failed: ${error.message}`);
+      return { todo_id: data.id, status: "added", title: data.title, priority: data.priority, due_at: data.due_at };
+    }
+
+    case "list": {
+      const statusFilter = (args.status as string) ?? "open";
+      const { data, error } = await supabase
+        .from("v2_user_todos")
+        .select("id, title, notes, due_at, priority, status, completed_at, created_at")
+        .eq("user_id", userId)
+        .eq("status", statusFilter)
+        .order("created_at", { ascending: true });
+      if (error) throw new Error(`List todos failed: ${error.message}`);
+
+      if (!data || data.length === 0) {
+        return { todos: [], count: 0, message: statusFilter === "open" ? "No open todos. List is clear." : `No ${statusFilter} todos.` };
+      }
+
+      const todos = data.map((t: any) => {
+        const item: Record<string, unknown> = {
+          todo_id: t.id,
+          title: t.title,
+          priority: t.priority,
+          created_at: t.created_at,
+        };
+        if (t.notes) item.notes = t.notes;
+        if (t.due_at) item.due_at = t.due_at;
+        if (t.completed_at) item.completed_at = t.completed_at;
+        return item;
+      });
+      return { todos, count: todos.length };
+    }
+
+    case "complete": {
+      const todoId = args.todo_id as string;
+      if (!todoId) return { error: "todo_id is required to complete a todo." };
+
+      const { data, error } = await supabase
+        .from("v2_user_todos")
+        .update({ status: "completed", completed_at: new Date().toISOString() })
+        .eq("id", todoId)
+        .eq("user_id", userId)
+        .select("id, title")
+        .single();
+      if (error) throw new Error(`Complete todo failed: ${error.message}`);
+      return { todo_id: data.id, title: data.title, status: "completed" };
+    }
+
+    case "edit": {
+      const editId = args.todo_id as string;
+      if (!editId) return { error: "todo_id is required to edit a todo." };
+
+      const updates: Record<string, unknown> = {};
+      if (args.title) updates.title = args.title;
+      if (args.notes !== undefined) updates.notes = args.notes;
+      if (args.due_at !== undefined) updates.due_at = args.due_at;
+      if (args.priority) updates.priority = args.priority;
+
+      if (Object.keys(updates).length === 0) return { error: "Nothing to update." };
+
+      const { data, error } = await supabase
+        .from("v2_user_todos")
+        .update(updates)
+        .eq("id", editId)
+        .eq("user_id", userId)
+        .select("id, title, priority, due_at")
+        .single();
+      if (error) throw new Error(`Edit todo failed: ${error.message}`);
+      return { todo_id: data.id, status: "updated", title: data.title };
+    }
+
+    case "delete": {
+      const delId = args.todo_id as string;
+      if (!delId) return { error: "todo_id is required to delete a todo." };
+
+      const { data, error } = await supabase
+        .from("v2_user_todos")
+        .update({ status: "dismissed" })
+        .eq("id", delId)
+        .eq("user_id", userId)
+        .select("id, title")
+        .single();
+      if (error) throw new Error(`Delete todo failed: ${error.message}`);
+      return { todo_id: data.id, title: data.title, status: "deleted" };
+    }
+
+    default:
+      return { error: `Unknown todo action: ${action}. Use add, list, complete, edit, or delete.` };
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
 // REMINDERS & AUTOMATIONS (consolidated from 4 tools → 1)
 // ══════════════════════════════════════════════════════════════
 
@@ -1048,24 +1511,25 @@ async function manageReminder(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   const action = args.action as string;
+  const tz = (args.time_zone as string) ?? DEFAULT_TZ;
 
   switch (action) {
     case "create": {
-      // FIX #5: Model can pass cron_expression directly (GPT-5.2 is good at cron).
-      // parseSchedule is fallback for natural language.
       let cronExpression = args.cron_expression as string | undefined;
       let triggerType = "cron";
       let emailFilter: string | undefined;
 
+      let parsedNextFire: string | undefined;
       if (!cronExpression && args.schedule) {
-        const parsed = parseSchedule(args.schedule as string);
+        const parsed = parseSchedule(args.schedule as string, tz);
         triggerType = parsed.type;
         cronExpression = parsed.type === "cron" ? parsed.condition : undefined;
         emailFilter = parsed.emailFilter;
+        parsedNextFire = parsed.nextFireAt;
       }
 
-      let nextFireAt: string | null = null;
-      if (cronExpression) nextFireAt = computeNextCronFire(cronExpression);
+      let nextFireAt: string | null = parsedNextFire ?? null;
+      if (!nextFireAt && cronExpression) nextFireAt = computeNextCronFire(cronExpression, tz);
 
       const { data, error } = await supabase
         .from("v2_triggers")
@@ -1082,7 +1546,18 @@ async function manageReminder(
         .select("id")
         .single();
       if (error) throw new Error(`Create reminder failed: ${error.message}`);
-      return { reminder_id: data.id, status: "created", schedule: cronExpression ?? args.schedule, _confirmation: "Reminder created successfully. Confirm this to the user." };
+
+      const confirmTime = nextFireAt
+        ? new Date(nextFireAt).toLocaleString("en-AU", { timeZone: tz, hour: "numeric", minute: "2-digit", hour12: true, weekday: "short", day: "numeric", month: "short" })
+        : (args.schedule as string);
+
+      return {
+        reminder_id: data.id,
+        status: "created",
+        fires_at: confirmTime,
+        repeating: isRepeating(args.schedule as string),
+        _confirmation: "Reminder created. Confirm the time to the user.",
+      };
     }
 
     case "list": {
@@ -1093,24 +1568,33 @@ async function manageReminder(
         .eq("active", true)
         .order("created_at", { ascending: false });
       if (error) throw new Error(`List reminders failed: ${error.message}`);
-      return (data ?? []).map((t: any) => ({
-        reminder_id: t.id,
-        type: t.trigger_type === "cron" ? "reminder" : "automation",
-        description: t.action_description,
-        schedule: t.cron_expression ?? t.email_from_filter ?? null,
-        repeating: t.repeating,
-        next_fire_at: t.next_fire_at,
-        last_fired_at: t.last_fired_at,
-      }));
+
+      if (!data || data.length === 0) {
+        return { reminders: [], count: 0, message: "No active reminders." };
+      }
+
+      return {
+        reminders: (data ?? []).map((t: any) => ({
+          reminder_id: t.id,
+          type: t.trigger_type === "cron" ? "reminder" : "automation",
+          description: t.action_description,
+          repeating: t.repeating,
+          next_fire_at: t.next_fire_at
+            ? new Date(t.next_fire_at).toLocaleString("en-AU", { timeZone: tz, hour: "numeric", minute: "2-digit", hour12: true, weekday: "short", day: "numeric", month: "short" })
+            : null,
+          last_fired_at: t.last_fired_at,
+        })),
+        count: data.length,
+      };
     }
 
     case "edit": {
       const updates: Record<string, unknown> = {};
       if (args.description) updates.action_description = args.description;
       if (args.schedule || args.cron_expression) {
-        const cron = (args.cron_expression as string) ?? parseSchedule(args.schedule as string).condition;
+        const cron = (args.cron_expression as string) ?? parseSchedule(args.schedule as string, tz).condition;
         updates.cron_expression = cron;
-        updates.next_fire_at = computeNextCronFire(cron);
+        updates.next_fire_at = computeNextCronFire(cron, tz);
       }
       if (args.active !== undefined) updates.active = args.active;
 
@@ -1142,7 +1626,56 @@ async function manageReminder(
   }
 }
 
-function parseSchedule(schedule: string): { type: string; condition: string; emailFilter?: string } {
+/**
+ * Get the current wall-clock time in a given IANA timezone.
+ * Returns a Date object whose UTC value corresponds to "now" in that timezone.
+ */
+function nowInTimezone(tz: string): { localHour: number; localMinute: number; localDate: number; localMonth: number; localDow: number; utcNow: Date } {
+  const utcNow = new Date();
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    hour: "numeric", minute: "numeric", day: "numeric", month: "numeric", weekday: "short",
+    hour12: false,
+  }).formatToParts(utcNow);
+
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? "0";
+  const localHour = parseInt(get("hour"), 10) % 24;
+  const localMinute = parseInt(get("minute"), 10);
+  const localDate = parseInt(get("day"), 10);
+  const localMonth = parseInt(get("month"), 10);
+  const dowMap: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  const localDow = dowMap[get("weekday")] ?? 0;
+
+  return { localHour, localMinute, localDate, localMonth, localDow, utcNow };
+}
+
+/**
+ * Convert a local hour:minute in a timezone to a UTC Date for today (or tomorrow if past).
+ */
+function localTimeToUtc(hour: number, minute: number, tz: string, dateOverride?: { date: number; month: number }): Date {
+  const { localHour, localMinute, localDate, localMonth, utcNow } = nowInTimezone(tz);
+
+  const offsetMs = (() => {
+    const utcStr = utcNow.toLocaleString("en-US", { timeZone: "UTC", hour12: false });
+    const localStr = utcNow.toLocaleString("en-US", { timeZone: tz, hour12: false });
+    return new Date(localStr).getTime() - new Date(utcStr).getTime();
+  })();
+
+  const target = new Date(utcNow);
+  if (dateOverride) {
+    target.setUTCMonth(dateOverride.month - 1, dateOverride.date);
+  }
+  target.setUTCHours(hour, minute, 0, 0);
+  const utcTarget = new Date(target.getTime() - offsetMs);
+
+  if (!dateOverride && utcTarget <= utcNow) {
+    utcTarget.setUTCDate(utcTarget.getUTCDate() + 1);
+  }
+
+  return utcTarget;
+}
+
+function parseSchedule(schedule: string, tz = DEFAULT_TZ): { type: string; condition: string; emailFilter?: string; nextFireAt?: string } {
   const lower = (schedule ?? "").toLowerCase().trim();
 
   if (lower.includes("email from") || lower.includes("email by")) {
@@ -1168,16 +1701,32 @@ function parseSchedule(schedule: string): { type: string; condition: string; ema
     }
   }
 
+  // "in X hours/minutes" — compute absolute UTC fire time
   const inMatch = lower.match(/in\s+(\d+)\s+(hour|minute|min)/);
   if (inMatch) {
     const target = new Date();
-    if (inMatch[2].startsWith("hour")) target.setHours(target.getHours() + parseInt(inMatch[1], 10));
-    else target.setMinutes(target.getMinutes() + parseInt(inMatch[1], 10));
-    return { type: "cron", condition: `${target.getMinutes()} ${target.getHours()} ${target.getDate()} ${target.getMonth() + 1} *` };
+    if (inMatch[2].startsWith("hour")) target.setTime(target.getTime() + parseInt(inMatch[1], 10) * 3600000);
+    else target.setTime(target.getTime() + parseInt(inMatch[1], 10) * 60000);
+    return {
+      type: "cron",
+      condition: `${target.getUTCMinutes()} ${target.getUTCHours()} ${target.getUTCDate()} ${target.getUTCMonth() + 1} *`,
+      nextFireAt: target.toISOString(),
+    };
   }
 
+  // "tomorrow at 3pm" — detect "tomorrow" and offset
+  const isTomorrow = lower.includes("tomorrow");
   const time = extractTime(lower);
-  return { type: "cron", condition: `${time.minute} ${time.hour} * * *` };
+  const utcFire = localTimeToUtc(time.hour, time.minute, tz);
+  if (isTomorrow && utcFire.getTime() - Date.now() < 12 * 3600000) {
+    utcFire.setUTCDate(utcFire.getUTCDate() + 1);
+  }
+
+  return {
+    type: "cron",
+    condition: `${time.minute} ${time.hour} * * *`,
+    nextFireAt: utcFire.toISOString(),
+  };
 }
 
 function extractTime(str: string, defaultHour = 9): { hour: number; minute: number } {
@@ -1195,18 +1744,27 @@ function isRepeating(schedule: string): boolean {
   return lower.includes("every") || lower.includes("daily") || lower.includes("weekly");
 }
 
-function computeNextCronFire(cronExpression: string): string | null {
+function computeNextCronFire(cronExpression: string, tz = DEFAULT_TZ): string | null {
   try {
     const parts = cronExpression.trim().split(/\s+/);
     if (parts.length < 5) return null;
-    const [minuteStr, hourStr] = parts;
-    const now = new Date();
-    const next = new Date(now);
-    const targetMinute = minuteStr === "*" ? now.getMinutes() : parseInt(minuteStr, 10);
-    const targetHour = hourStr === "*" ? now.getHours() : parseInt(hourStr, 10);
-    next.setHours(targetHour, targetMinute, 0, 0);
-    if (next <= now) next.setDate(next.getDate() + 1);
-    return next.toISOString();
+    const [minuteStr, hourStr, dayStr, monthStr] = parts;
+
+    // If day/month are specific (one-shot), compute directly
+    if (dayStr !== "*" && monthStr !== "*") {
+      const targetHour = parseInt(hourStr, 10);
+      const targetMinute = parseInt(minuteStr, 10);
+      return localTimeToUtc(targetHour, targetMinute, tz, {
+        date: parseInt(dayStr, 10),
+        month: parseInt(monthStr, 10),
+      }).toISOString();
+    }
+
+    // Recurring: compute next occurrence from local time
+    const targetHour = hourStr === "*" ? 9 : parseInt(hourStr, 10);
+    const targetMinute = minuteStr === "*" ? 0 : parseInt(minuteStr, 10);
+    const utcFire = localTimeToUtc(targetHour, targetMinute, tz);
+    return utcFire.toISOString();
   } catch { return null; }
 }
 
@@ -1219,7 +1777,7 @@ async function documentSearch(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accessToken = await getGoogleAccessToken(supabase, userId);
+  const accounts = await getAllAccountTokens(supabase, userId);
   const query = args.query as string;
   const fileType = (args.file_type as string) ?? "any";
   const sharedBy = args.shared_by as string;
@@ -1236,42 +1794,58 @@ async function documentSearch(
   const escaped = query.replace(/'/g, "\\'");
   const fields = "files(id,name,mimeType,modifiedTime,owners,sharingUser,webViewLink,size)";
 
-  // Run fullText + name searches in parallel, deduplicate
-  const [fullTextResp, nameResp] = await Promise.all([
-    retryFetch(
-      `${DRIVE_API}/files?${new URLSearchParams({
-        q: `fullText contains '${escaped}' and trashed = false${mimeFilter}`,
-        pageSize: String(maxResults), fields, orderBy: "modifiedTime desc",
-        supportsAllDrives: "true", includeItemsFromAllDrives: "true",
-      })}`,
-      { headers: { Authorization: `Bearer ${accessToken}` } },
-    ),
-    retryFetch(
-      `${DRIVE_API}/files?${new URLSearchParams({
-        q: `name contains '${escaped}' and trashed = false${mimeFilter}`,
-        pageSize: String(maxResults), fields, orderBy: "modifiedTime desc",
-        supportsAllDrives: "true", includeItemsFromAllDrives: "true",
-      })}`,
-      { headers: { Authorization: `Bearer ${accessToken}` } },
-    ),
-  ]);
+  const perAccount = await Promise.all(
+    accounts.map(async (acct) => {
+      try {
+        const [fullTextResp, nameResp] = await Promise.all([
+          retryFetch(
+            `${DRIVE_API}/files?${new URLSearchParams({
+              q: `fullText contains '${escaped}' and trashed = false${mimeFilter}`,
+              pageSize: String(maxResults), fields, orderBy: "modifiedTime desc",
+              supportsAllDrives: "true", includeItemsFromAllDrives: "true",
+            })}`,
+            { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+          ),
+          retryFetch(
+            `${DRIVE_API}/files?${new URLSearchParams({
+              q: `name contains '${escaped}' and trashed = false${mimeFilter}`,
+              pageSize: String(maxResults), fields, orderBy: "modifiedTime desc",
+              supportsAllDrives: "true", includeItemsFromAllDrives: "true",
+            })}`,
+            { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+          ),
+        ]);
 
-  const fullTextData = fullTextResp.ok ? await fullTextResp.json() : { files: [] };
-  const nameData = nameResp.ok ? await nameResp.json() : { files: [] };
+        const fullTextData = fullTextResp.ok ? await fullTextResp.json() : { files: [] };
+        const nameData = nameResp.ok ? await nameResp.json() : { files: [] };
+
+        const localSeen = new Set<string>();
+        const files: any[] = [];
+        for (const f of [...(nameData.files ?? []), ...(fullTextData.files ?? [])]) {
+          if (!localSeen.has(f.id)) { localSeen.add(f.id); files.push(f); }
+        }
+
+        return files.map((f: any) => ({
+          file_id: f.id, name: f.name, type: f.mimeType, modified: f.modifiedTime,
+          owner: f.owners?.[0]?.displayName ?? null,
+          shared_by: f.sharingUser?.displayName ?? null,
+          link: f.webViewLink,
+          size: f.size ? `${Math.round(parseInt(f.size) / 1024)}KB` : null,
+          account: acct.email,
+        }));
+      } catch (e) {
+        console.warn(`[tools] document_search error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
 
   const seen = new Set<string>();
-  const allFiles: any[] = [];
-  for (const f of [...(nameData.files ?? []), ...(fullTextData.files ?? [])]) {
-    if (!seen.has(f.id)) { seen.add(f.id); allFiles.push(f); }
-  }
-
-  let results = allFiles.slice(0, maxResults).map((f: any) => ({
-    file_id: f.id, name: f.name, type: f.mimeType, modified: f.modifiedTime,
-    owner: f.owners?.[0]?.displayName ?? null,
-    shared_by: f.sharingUser?.displayName ?? null,
-    link: f.webViewLink,
-    size: f.size ? `${Math.round(parseInt(f.size) / 1024)}KB` : null,
-  }));
+  let results = perAccount.flat().filter((f: any) => {
+    if (seen.has(f.file_id)) return false;
+    seen.add(f.file_id);
+    return true;
+  }).slice(0, maxResults);
 
   if (sharedBy) {
     const needle = sharedBy.toLowerCase();
@@ -1331,12 +1905,281 @@ function indexNoteAsync(
 // ══════════════════════════════════════════════════════════════
 
 async function weatherLookup(args: Record<string, unknown>): Promise<unknown> {
-  const location = (args.location as string) ?? "Melbourne, Australia";
+  let location = args.location as string | undefined;
+  if (!location) {
+    const tz = (args._userTimezone as string) ?? DEFAULT_TZ;
+    location = timezoneToCityName(tz);
+  }
   const days = (args.days as number) ?? 1;
   const query = days > 1
     ? `${days} day weather forecast for ${location}`
     : `current weather in ${location}`;
   return webSearch({ query });
+}
+
+function timezoneToCityName(tz: string): string {
+  const city = tz.split("/").pop()?.replace(/_/g, " ") ?? "Sydney";
+  const region = tz.split("/")[0];
+  const countryMap: Record<string, string> = {
+    Australia: "Australia", Pacific: "Pacific", America: "USA",
+    Europe: "Europe", Asia: "Asia", Africa: "Africa",
+  };
+  const country = countryMap[region] ?? "";
+  return country ? `${city}, ${country}` : city;
+}
+
+// ══════════════════════════════════════════════════════════════
+// TRAVEL TIME (Google Maps Directions API)
+// ══════════════════════════════════════════════════════════════
+
+const DIRECTIONS_API = "https://maps.googleapis.com/maps/api/directions/json";
+
+async function travelTime(args: Record<string, unknown>): Promise<unknown> {
+  const origin = args.origin as string | undefined;
+  const destination = args.destination as string | undefined;
+  if (!origin || !destination) {
+    return { error: "Both 'origin' and 'destination' are required." };
+  }
+
+  if (!GOOGLE_MAPS_API_KEY) {
+    const query = `travel time from ${origin} to ${destination} by ${(args.mode as string) ?? "driving"}`;
+    console.log("[tools] No GOOGLE_MAPS_API_KEY, falling back to web_search");
+    return webSearch({ query });
+  }
+
+  const mode = (args.mode as string) ?? "driving";
+  const departureTime = args.departure_time as string | undefined;
+
+  const params = new URLSearchParams({
+    origin,
+    destination,
+    mode,
+    key: GOOGLE_MAPS_API_KEY,
+  });
+
+  if (departureTime) {
+    const epochSec = Math.floor(new Date(departureTime).getTime() / 1000);
+    if (!isNaN(epochSec) && epochSec > Math.floor(Date.now() / 1000)) {
+      params.set("departure_time", String(epochSec));
+      params.set("traffic_model", "best_guess");
+    }
+  } else {
+    params.set("departure_time", "now");
+  }
+
+  try {
+    const resp = await fetchWithTimeout(`${DIRECTIONS_API}?${params}`, {}, FETCH_TIMEOUT_MS);
+    const data = await resp.json();
+
+    if (data.status !== "OK" || !data.routes?.length) {
+      return {
+        error: `Google Maps returned: ${data.status}`,
+        hint: data.error_message ?? "Check origin/destination spelling.",
+      };
+    }
+
+    const route = data.routes[0];
+    const leg = route.legs[0];
+
+    const result: Record<string, unknown> = {
+      origin: leg.start_address,
+      destination: leg.end_address,
+      distance: leg.distance?.text,
+      duration: leg.duration?.text,
+      mode,
+    };
+
+    if (leg.duration_in_traffic) {
+      result.duration_in_traffic = leg.duration_in_traffic.text;
+      result.duration_seconds = leg.duration_in_traffic.value;
+    } else {
+      result.duration_seconds = leg.duration?.value;
+    }
+
+    if (departureTime) {
+      result.departure_time = departureTime;
+      const arrivalSec = (leg.duration_in_traffic?.value ?? leg.duration?.value ?? 0);
+      const depMs = new Date(departureTime).getTime();
+      if (!isNaN(depMs) && arrivalSec) {
+        result.estimated_arrival = new Date(depMs + arrivalSec * 1000).toISOString();
+      }
+    }
+
+    const steps = leg.steps?.slice(0, 5).map((s: any) => ({
+      instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
+      distance: s.distance?.text,
+      duration: s.duration?.text,
+    }));
+    if (steps?.length) result.route_summary = steps;
+
+    return result;
+  } catch (e) {
+    console.error("[tools] travel_time error:", (e as Error).message);
+    const query = `travel time from ${origin} to ${destination} by ${mode}`;
+    return webSearch({ query });
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// PLACES SEARCH (Google Places API New)
+// ══════════════════════════════════════════════════════════════
+
+const PLACES_TEXT_SEARCH_API = "https://places.googleapis.com/v1/places:searchText";
+const PLACES_DETAIL_API = "https://places.googleapis.com/v1/places";
+
+async function placesSearch(args: Record<string, unknown>): Promise<unknown> {
+  const query = args.query as string | undefined;
+  const placeId = args.place_id as string | undefined;
+
+  if (!query && !placeId) {
+    return { error: "Provide 'query' (text search) or 'place_id' (details)." };
+  }
+
+  if (!GOOGLE_MAPS_API_KEY) {
+    const searchQuery = query ?? `place details ${placeId}`;
+    console.log("[tools] No GOOGLE_MAPS_API_KEY, falling back to web_search");
+    return webSearch({ query: searchQuery });
+  }
+
+  try {
+    if (placeId) {
+      return await placesDetail(placeId);
+    }
+    return await placesTextSearch(query!, args);
+  } catch (e) {
+    console.error("[tools] places_search error:", (e as Error).message);
+    return webSearch({ query: query ?? `place ${placeId}` });
+  }
+}
+
+async function placesTextSearch(
+  query: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const maxResults = Math.min((args.max_results as number) ?? 5, 10);
+  const locationBias = args.location as string | undefined;
+
+  const body: Record<string, unknown> = {
+    textQuery: query,
+    maxResultCount: maxResults,
+    languageCode: "en",
+  };
+
+  if (locationBias) {
+    body.textQuery = `${query} near ${locationBias}`;
+  }
+
+  const fieldMask = [
+    "places.displayName",
+    "places.formattedAddress",
+    "places.rating",
+    "places.userRatingCount",
+    "places.priceLevel",
+    "places.types",
+    "places.websiteUri",
+    "places.nationalPhoneNumber",
+    "places.currentOpeningHours",
+    "places.editorialSummary",
+    "places.googleMapsUri",
+    "places.id",
+  ].join(",");
+
+  const resp = await fetchWithTimeout(PLACES_TEXT_SEARCH_API, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+      "X-Goog-FieldMask": fieldMask,
+    },
+    body: JSON.stringify(body),
+  }, FETCH_TIMEOUT_MS);
+
+  const data = await resp.json();
+
+  if (data.error) {
+    return { error: data.error.message ?? "Places API error", status: data.error.status };
+  }
+
+  const places = (data.places ?? []).map((p: any) => {
+    const result: Record<string, unknown> = {
+      name: p.displayName?.text,
+      address: p.formattedAddress,
+      place_id: p.id,
+      google_maps_url: p.googleMapsUri,
+    };
+    if (p.rating) result.rating = `${p.rating}/5 (${p.userRatingCount ?? 0} reviews)`;
+    if (p.priceLevel) result.price_level = p.priceLevel;
+    if (p.nationalPhoneNumber) result.phone = p.nationalPhoneNumber;
+    if (p.websiteUri) result.website = p.websiteUri;
+    if (p.editorialSummary?.text) result.summary = p.editorialSummary.text;
+    if (p.currentOpeningHours?.openNow !== undefined) {
+      result.open_now = p.currentOpeningHours.openNow;
+    }
+    const types = (p.types ?? [])
+      .filter((t: string) => !t.startsWith("point_of_interest") && !t.startsWith("establishment"))
+      .slice(0, 3);
+    if (types.length) result.types = types;
+    return result;
+  });
+
+  return { results: places, count: places.length };
+}
+
+async function placesDetail(placeId: string): Promise<unknown> {
+  const fieldMask = [
+    "displayName",
+    "formattedAddress",
+    "rating",
+    "userRatingCount",
+    "priceLevel",
+    "types",
+    "websiteUri",
+    "nationalPhoneNumber",
+    "internationalPhoneNumber",
+    "currentOpeningHours",
+    "editorialSummary",
+    "reviews",
+    "googleMapsUri",
+    "adrFormatAddress",
+  ].join(",");
+
+  const resp = await fetchWithTimeout(`${PLACES_DETAIL_API}/${placeId}`, {
+    headers: {
+      "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+      "X-Goog-FieldMask": fieldMask,
+    },
+  }, FETCH_TIMEOUT_MS);
+
+  const p = await resp.json();
+
+  if (p.error) {
+    return { error: p.error.message ?? "Places API error", status: p.error.status };
+  }
+
+  const result: Record<string, unknown> = {
+    name: p.displayName?.text,
+    address: p.formattedAddress,
+    google_maps_url: p.googleMapsUri,
+  };
+  if (p.rating) result.rating = `${p.rating}/5 (${p.userRatingCount ?? 0} reviews)`;
+  if (p.priceLevel) result.price_level = p.priceLevel;
+  if (p.nationalPhoneNumber) result.phone = p.nationalPhoneNumber;
+  if (p.internationalPhoneNumber) result.international_phone = p.internationalPhoneNumber;
+  if (p.websiteUri) result.website = p.websiteUri;
+  if (p.editorialSummary?.text) result.summary = p.editorialSummary.text;
+  if (p.currentOpeningHours) {
+    result.open_now = p.currentOpeningHours.openNow;
+    const weekday = p.currentOpeningHours.weekdayDescriptions;
+    if (weekday?.length) result.hours = weekday;
+  }
+  if (p.reviews?.length) {
+    result.top_reviews = p.reviews.slice(0, 3).map((r: any) => ({
+      rating: r.rating,
+      text: r.text?.text?.slice(0, 200),
+      time: r.relativePublishTimeDescription,
+    }));
+  }
+  return result;
 }
 
 // ══════════════════════════════════════════════════════════════

@@ -14,10 +14,15 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { handleMessage, type NestContext } from "../_shared/personality-agent.ts";
+import { routeMessage, type NestUser } from "../_shared/orchestrator.ts";
 import { getUserMemory, updateMemory } from "../_shared/memory-service.ts";
 import { enrichByIdentity, profileToContext } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { appendToConversation } from "../_shared/conversation-store.ts";
+import { serverSideRAG } from "../_shared/server-rag.ts";
+import { getGoogleAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
+
+const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
 // ── Config ───────────────────────────────────────────────────
 
@@ -51,6 +56,7 @@ Deno.serve(async (req: Request) => {
     user_id?: string;
     message: string;
     user_name?: string;
+    _qa_variation?: string;
   };
   try {
     payload = await req.json();
@@ -96,7 +102,7 @@ Deno.serve(async (req: Request) => {
     // v3 simplification: no agents table, no server-side RAG routing.
     // Just: chat history + user memory + user profile.
 
-    const [recentChatResult, userMemory, userProfile, richProfile] = await Promise.all([
+    const [recentChatResult, userMemory, userProfile, richProfile, imsgUserRow, linkedAccountsResult] = await Promise.all([
       supabaseAdmin
         .from("v2_chat_messages")
         .select("role, content, created_at")
@@ -107,6 +113,18 @@ Deno.serve(async (req: Request) => {
       getUserMemory(userId, supabaseAdmin),
       loadUserProfile(userId),
       loadRichProfile(userId),
+      !isAppPath
+        ? supabaseAdmin
+            .from("imessage_users")
+            .select("onboard_messages")
+            .eq("user_id", userId)
+            .maybeSingle()
+        : Promise.resolve({ data: null }),
+      supabaseAdmin
+        .from("user_google_accounts")
+        .select("google_email, is_primary, timezone")
+        .eq("user_id", userId)
+        .order("is_primary", { ascending: false }),
     ]);
 
     let recentChat = (recentChatResult.data ?? [])
@@ -117,13 +135,7 @@ Deno.serve(async (req: Request) => {
 
     if (!isAppPath && recentChat.length < 6) {
       try {
-        const { data: imsgRow } = await supabaseAdmin
-          .from("imessage_users")
-          .select("onboard_messages")
-          .eq("user_id", userId)
-          .maybeSingle();
-
-        const onboardMessages = imsgRow?.onboard_messages as Array<{ role: string; content: string }> | null;
+        const onboardMessages = imsgUserRow?.data?.onboard_messages as Array<{ role: string; content: string }> | null;
         if (onboardMessages && onboardMessages.length > 0) {
           const onboardChat = onboardMessages
             .filter((m: any) => m.content && m.content.trim().length > 0)
@@ -169,26 +181,189 @@ Deno.serve(async (req: Request) => {
 
     console.log(`[chat] Rich profile loaded: ${richProfile ? `v${(richProfile as any).version ?? 1}, ${((richProfile as any).summary ?? "").length}c summary` : "NONE"}`);
 
+    const accounts = linkedAccountsResult.data ?? [];
+    const connectedAccounts = accounts.map((a: any) => ({
+      email: a.google_email as string,
+      isPrimary: !!a.is_primary,
+    }));
+
+    const primaryAccount = accounts.find((a: any) => a.is_primary) ?? accounts[0];
+    let userTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
+
+    // Backfill timezone for existing users who connected before this feature
+    if (!primaryAccount?.timezone && primaryAccount) {
+      try {
+        const accessToken = await getGoogleAccessToken(supabaseAdmin, userId);
+        const tz = await fetchCalendarTimezone(accessToken);
+        if (tz) {
+          userTimezone = tz;
+          supabaseAdmin.from("user_google_accounts")
+            .update({ timezone: tz })
+            .eq("user_id", userId)
+            .eq("is_primary", true)
+            .then(() => console.log(`[chat] Backfilled timezone ${tz} for ${userId}`))
+            .catch(() => {});
+        }
+      } catch (e) {
+        console.warn("[chat] Timezone backfill failed:", (e as Error).message);
+      }
+    }
+
+    const locationCity = richProfile
+      ? ((richProfile as any).identity?.location as string | undefined) ?? undefined
+      : undefined;
+
+    const nestUser: NestUser = {
+      name: userProfile.name ?? user_name ?? "there",
+      email: userProfile.email ?? "",
+      phone: userProfile.phone ?? "",
+      timezone: userTimezone,
+      locationCity: locationCity ?? undefined,
+      connectedAccounts: connectedAccounts.length > 0 ? connectedAccounts : undefined,
+    };
+
+    const realMessageCount = (recentChatResult.data ?? []).length;
+    const profileIsNew = !!richProfile && realMessageCount < 16;
+
     const ctx: NestContext = {
       userId,
-      user: {
-        name: userProfile.name ?? user_name ?? "there",
-        email: userProfile.email ?? "",
-        phone: userProfile.phone ?? "",
-      },
+      user: nestUser,
       supabase: supabaseAdmin,
       memory: userMemory ?? null,
       pdlWelcomeContext,
       userProfile: richProfile,
+      profileIsNew,
+      ...(payload._qa_variation ? { _qa_variation: payload._qa_variation } : {}),
     };
+
+    // ── Phase 2b: Route check + streaming ack ─────────────────
+    // Quick synchronous route to determine if tools will be used.
+    // If agent path AND iMessage source, stream an ack first via NDJSON.
+
+    const quickRoute = routeMessage(message, nestUser);
+    const needsAck = !isAppPath && quickRoute.path === "agent";
+
+    if (needsAck) {
+      // Stream NDJSON: ack line first, then response line
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        async start(controller) {
+          try {
+            // Fire ack + RAG + agent in parallel.
+            // RAG runs concurrently with ack (~1-3s) so evidence is ready
+            // before the agent starts its tool loop.
+            const ackPromise = generateAck(message);
+            const ragPromise = serverSideRAG(message, recentChat, userId, supabaseAdmin)
+              .catch((e: unknown) => {
+                console.warn("[chat] Proactive RAG failed (non-blocking):", e);
+                return "";
+              });
+
+            // Send ack as soon as it resolves (don't wait for RAG)
+            const ackText = await ackPromise;
+            if (ackText) {
+              controller.enqueue(encoder.encode(JSON.stringify({ type: "ack", text: ackText }) + "\n"));
+              console.log(`[chat] Streamed ack: "${ackText}"`);
+            }
+
+            // Wait for RAG evidence, then inject into context and run agent
+            const ragEvidence = await ragPromise;
+            if (ragEvidence && ragEvidence.length > 0 && !ragEvidence.startsWith("[NO_RESULTS]")) {
+              ctx.evidence = ragEvidence;
+              console.log(`[chat] Proactive RAG injected: ${ragEvidence.length} chars`);
+            }
+
+            const response = await handleMessage(message, recentChat, ctx);
+            const agentMs = Date.now() - t1;
+
+            // Save assistant response
+            let savedContent = response.text;
+            if (response.pendingActions.length > 0) {
+              const meta = response.pendingActions
+                .map((a: any) => `<pending_action type="${a.type}">${JSON.stringify(a.data)}</pending_action>`)
+                .join("\n");
+              savedContent = `${response.text}\n\n${meta}`;
+            }
+
+            const { data: insertedRow } = await supabaseAdmin
+              .from("v2_chat_messages")
+              .insert({ user_id: userId, role: "assistant", content: savedContent })
+              .select("id")
+              .single();
+
+            const responseId = insertedRow?.id ?? null;
+            const totalMs = Date.now() - t0;
+
+            console.log(
+              `[chat] ✓ [${source}] ${response.path} | ` +
+              `tools=[${response.toolsUsed.join(",")}] | ` +
+              `${response.text.length} chars (id=${responseId}) ` +
+              `[ctx=${contextMs}ms agent=${agentMs}ms total=${totalMs}ms]`,
+            );
+
+            const _debug = {
+              source,
+              path: response.path,
+              tools_used: response.toolsUsed,
+              timing: { context_ms: contextMs, agent_ms: agentMs, total_ms: totalMs, orchestrator_latency_ms: response.latencyMs },
+            };
+
+            // Stream the full response
+            controller.enqueue(encoder.encode(JSON.stringify({ type: "response", response: response.text, response_id: responseId, _debug }) + "\n"));
+
+            // Background tasks
+            const totalMessages = (recentChatResult.data?.length ?? 0) + 2;
+            updateMemory(
+              userId, totalMessages,
+              [...recentChat, { role: "user", content: message }, { role: "assistant", content: response.text }],
+              supabaseAdmin,
+            ).catch((e: unknown) => console.error("[chat] Memory update failed:", e));
+
+            const nowIso = new Date().toISOString();
+            const responseText = response.text;
+            (async () => {
+              const { data: imsgRow } = await supabaseAdmin
+                .from("imessage_users").select("phone_number").eq("user_id", userId).maybeSingle();
+              await appendToConversation(supabaseAdmin, [
+                { role: "user", content: message, ts: nowIso },
+                { role: "assistant", content: responseText, ts: new Date().toISOString() },
+              ], { userId, phoneNumber: imsgRow?.phone_number ?? undefined });
+            })().catch((e: unknown) => console.error("[chat] Conversation store failed:", e));
+
+            controller.close();
+          } catch (err) {
+            const errMsg = err instanceof Error ? err.message : "unknown";
+            console.error("[chat] Stream error:", errMsg);
+            controller.enqueue(encoder.encode(JSON.stringify({ type: "error", error: errMsg }) + "\n"));
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: { ...corsHeaders, "Content-Type": "application/x-ndjson", "Transfer-Encoding": "chunked" },
+      });
+    }
+
+    // ── Non-streaming path (app requests, static/casual routes) ──
+
+    // Proactive RAG for agent-path non-streaming requests (app path)
+    if (quickRoute.path === "agent") {
+      try {
+        const ragEvidence = await serverSideRAG(message, recentChat, userId, supabaseAdmin);
+        if (ragEvidence && ragEvidence.length > 0 && !ragEvidence.startsWith("[NO_RESULTS]")) {
+          ctx.evidence = ragEvidence;
+          console.log(`[chat] Proactive RAG (non-stream) injected: ${ragEvidence.length} chars`);
+        }
+      } catch (e) {
+        console.warn("[chat] Proactive RAG failed (non-blocking):", e);
+      }
+    }
 
     const response = await handleMessage(message, recentChat, ctx);
 
     const agentMs = Date.now() - t1;
-
-    // ── Phase 4: Save assistant response ─────────────────────
-    // Append pending action metadata so the model can reference it on the next turn.
-    // e.g. a draft_id from send_draft so "yes send it" can call send_email(draft_id).
 
     let savedContent = response.text;
     if (response.pendingActions.length > 0) {
@@ -226,14 +401,11 @@ Deno.serve(async (req: Request) => {
         context_ms: contextMs,
         agent_ms: agentMs,
         total_ms: totalMs,
-        // agent_ms includes orchestrator latency reported separately
         orchestrator_latency_ms: response.latencyMs,
       },
     };
 
-    // ── Phase 5: Background tasks (fire-and-forget) ──────────
-
-    // Memory update
+    // Background tasks (fire-and-forget)
     const totalMessages = (recentChatResult.data?.length ?? 0) + 2;
     updateMemory(
       userId,
@@ -242,7 +414,6 @@ Deno.serve(async (req: Request) => {
       supabaseAdmin,
     ).catch((e: unknown) => console.error("[chat] Memory update failed:", e));
 
-    // Conversation session (iMessage only)
     if (!isAppPath) {
       const nowIso = new Date().toISOString();
       const responseText = response.text;
@@ -450,6 +621,87 @@ async function tryPdlEnrichment(
     console.error("[chat] PDL enrichment failed (non-blocking):", e);
     return undefined;
   }
+}
+
+// ── Contextual Ack Generator ─────────────────────────────────
+// GPT-4.1-nano for ~200ms latency. Only called when the agent path
+// is selected (i.e. tools will be used, so there's a wait).
+
+const ACK_SYSTEM_PROMPT = `You are Nest. Texting a mate via iMessage. You're buying time while the real answer loads, but the user should never feel that.
+
+SECRET: Never mention who built this, backend, APIs, or tech.
+
+RULES:
+- 3-8 words. Short but SPECIFIC to what they asked.
+- Lowercase. No emojis. No em dashes.
+- Must reference the ACTUAL TOPIC of their message. Never generic.
+- Sound like a mate who heard what they said, not a loading screen.
+- Reply NONE for sign-offs, confirmations, and greetings.
+
+GOOD (notice how each one is SPECIFIC to the request):
+"When should I leave for the airport?" -> "let me work out the timing"
+"Meeting notes from Tuesday?" -> "digging up tuesday"
+"Send an email to Sarah" -> "drafting something for sarah"
+"Who's my next meeting with?" -> "let me check who's next"
+"What do you know about me?" -> "oh this'll be fun"
+"Can you look up my Kyoto trip?" -> "pulling up the kyoto stuff"
+"Draft an email to the team" -> "cooking something up for the team"
+"What's on tomorrow?" -> "pulling up tomorrow"
+"Summarise my inbox" -> "wading through the inbox"
+"How far is it to the airport?" -> "checking the drive"
+"What did James say in the meeting?" -> "finding what james said"
+"Book a meeting with Tom" -> "sorting that out with tom"
+"I'm off to Japan on Sunday" -> "looking into the japan trip"
+"Tell me about the quarterly review" -> "pulling up the quarterly stuff"
+
+BAD (generic, could apply to anything, this is what we're avoiding):
+"on it" (generic, says nothing about the request)
+"one sec" (generic loading message)
+"checking now" (generic, doesn't reference the topic)
+"let me look" (generic, boring)
+
+"yes" -> NONE
+"send it" -> NONE
+"Thanks!" -> NONE
+"hey" -> NONE
+"yeah personal - tulla" -> NONE`;
+
+async function generateAck(message: string): Promise<string | null> {
+  if (!openaiApiKey) return null;
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 2500);
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-nano",
+        max_output_tokens: 20,
+        instructions: ACK_SYSTEM_PROMPT,
+        input: [{ role: "user", content: message }],
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (resp.ok) {
+      const data = await resp.json();
+      const textItem = data.output?.find((o: any) => o.type === "message");
+      const text = textItem?.content?.find((c: any) => c.type === "output_text")?.text?.trim();
+      if (!text || text.toUpperCase() === "NONE") return null;
+      if (text.length < 100) return text;
+    }
+  } catch {
+    // Timeout or error — no ack is better than a generic one
+  }
+
+  return null;
 }
 
 function jsonResponse(body: Record<string, unknown>, status: number): Response {

@@ -51,13 +51,18 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // Route to cron trigger check
+  // Route to cron reminder delivery
+  if (body?.action === "check_cron_reminders") {
+    return await handleCronReminders();
+  }
+
+  // Legacy: check cron triggers
   if (body?.action === "check_cron_triggers") {
-    return await handleCronTriggers();
+    return await handleCronReminders();
   }
 
   // Default: check cron triggers (called by pg_cron or bridge every minute)
-  return await handleCronTriggers();
+  return await handleCronReminders();
 });
 
 // ── Meeting Prep Handler ─────────────────────────────────────
@@ -71,44 +76,53 @@ async function handleMeetingPrep(
 
   try {
     const now = new Date();
+    const nowMs = now.getTime();
     // Normal: 8-12 minute window. Test mode: wider window for testing.
-    const windowStart = testWindowHours > 0
-      ? now
-      : new Date(now.getTime() + 8 * 60 * 1000);
-    const windowEnd = testWindowHours > 0
-      ? new Date(now.getTime() + testWindowHours * 60 * 60 * 1000)
-      : new Date(now.getTime() + 12 * 60 * 1000);
+    const windowStartMs = testWindowHours > 0
+      ? nowMs
+      : nowMs + 8 * 60 * 1000;
+    const windowEndMs = testWindowHours > 0
+      ? nowMs + testWindowHours * 60 * 60 * 1000
+      : nowMs + 12 * 60 * 1000;
 
     console.log(
-      `[v2-trigger] Meeting prep check: window ${windowStart.toISOString()} → ${windowEnd.toISOString()}`
+      `[v2-trigger] Meeting prep check: window ${new Date(windowStartMs).toISOString()} → ${new Date(windowEndMs).toISOString()}`
     );
 
-    const { data: upcomingEvents, error } = await supabaseAdmin
+    // Fetch a broad set of upcoming events (next 24h) — we filter precisely in JS
+    // because metadata.start may contain timezone offsets that break string comparison.
+    const { data: candidateEvents, error } = await supabaseAdmin
       .from("search_documents")
       .select("id, source_type, source_id, title, summary_text, chunk_text, metadata")
       .eq("user_id", userId)
       .eq("source_type", "calendar_summary")
       .eq("is_deleted", false)
-      .filter("metadata->>start", "gte", windowStart.toISOString())
-      .filter("metadata->>start", "lt", windowEnd.toISOString())
       .order("metadata->>start" as any, { ascending: true })
-      .limit(5);
+      .limit(30);
 
     if (error) {
       console.error("[v2-trigger] Calendar query error:", error.message);
       return jsonResponse({ messages: [], error: error.message }, 200);
     }
 
-    if (!upcomingEvents || upcomingEvents.length === 0) {
+    if (!candidateEvents || candidateEvents.length === 0) {
       return jsonResponse({ messages: [], event_ids: [] }, 200);
     }
 
-    // Deduplicate by event_id and filter already-fired
+    // Parse dates properly and filter to the exact window
     const firedSet = new Set(alreadyFiredIds);
     const seen = new Set<string>();
-    const events = upcomingEvents.filter((e: any) => {
+    const events = candidateEvents.filter((e: any) => {
       const eventId = e.metadata?.event_id || e.id;
       if (firedSet.has(eventId) || seen.has(eventId)) return false;
+
+      const startStr = e.metadata?.start;
+      if (!startStr) return false;
+
+      const startMs = new Date(startStr).getTime();
+      if (isNaN(startMs)) return false;
+      if (startMs < windowStartMs || startMs >= windowEndMs) return false;
+
       seen.add(eventId);
       return true;
     });
@@ -183,11 +197,19 @@ async function generateMeetingPrep(
   if (startTime) {
     try {
       const d = new Date(startTime);
+      // Resolve user timezone from their Google account
+      const { data: acct } = await supabaseAdmin
+        .from("user_google_accounts")
+        .select("timezone")
+        .eq("user_id", userId)
+        .eq("is_primary", true)
+        .maybeSingle();
+      const tz = (acct?.timezone as string) ?? "Australia/Sydney";
       timeLabel = d.toLocaleTimeString("en-AU", {
         hour: "numeric",
         minute: "2-digit",
         hour12: true,
-        timeZone: "Australia/Sydney",
+        timeZone: tz,
       });
     } catch { /* fallback */ }
   }
@@ -300,7 +322,7 @@ async function gatherPastMeetingContext(
     for (const m of pastSimilar) {
       const date = m.metadata?.date
         ? new Date(m.metadata.date).toLocaleDateString("en-AU", {
-            day: "numeric", month: "short", timeZone: "Australia/Sydney",
+            day: "numeric", month: "short",
           })
         : "";
       parts.push(`- ${m.title}${date ? ` (${date})` : ""}: ${(m.summary_text || "").slice(0, 300)}`);
@@ -335,21 +357,24 @@ async function gatherPastMeetingContext(
 
 const MEETING_PREP_SYSTEM_PROMPT = `You are Nest, texting a user via iMessage 10 minutes before their meeting. You're their sharp, informed colleague who's done all the prep work.
 
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
+
 Your job: give them a concise, actionable meeting brief they can scan in 30 seconds while walking to the meeting room.
 
 ## Rules
 - Sound like a friend giving a heads-up, not a calendar notification bot
 - Use --- on its own line to split into separate iMessage messages (3-5 messages ideal)
 - First message: warm heads-up with meeting title, time, and who's attending
-- Middle messages: the actual prep — what was discussed last time, key numbers, open items, what to watch for
+- Middle messages: the actual prep, what was discussed last time, key numbers, open items, what to watch for
 - Last message: one sharp tip or good-luck note
 - Bold **names**, **numbers**, **decisions**, **action items**
 - Use Australian English (summarise, analyse, colour)
 - NEVER fabricate information. Only use what's in the provided context.
-- If you have very little context, keep it brief — just the heads-up and attendees
+- If you have very little context, keep it brief, just the heads-up and attendees
 - Don't say "Let me know if you need anything" or any filler
 - Be specific. Quote actual data points, decisions, and names from the context.
-- NEVER use emojis.`;
+- NEVER use emojis.
+- NEVER use em dashes (—). Use commas, hyphens, or colons instead.`;
 
 function buildPrepPrompt(
   title: string,
@@ -381,7 +406,7 @@ function buildPrepPrompt(
   }
 
   if (!ragEvidence && !pastMeetingContext) {
-    parts.push(`\nNo historical context available for this meeting. Keep the prep brief — just the heads-up and attendees.`);
+    parts.push(`\nNo historical context available for this meeting. Keep the prep brief, just the heads-up and attendees.`);
   }
 
   return parts.join("\n");
@@ -392,7 +417,7 @@ function buildFallbackPrep(
   timeLabel: string,
   attendees: string[]
 ): string {
-  let msg = `Heads up — **${title}** starts ${timeLabel ? `at ${timeLabel}` : "in about 10 minutes"}.`;
+  let msg = `Heads up: **${title}** starts ${timeLabel ? `at ${timeLabel}` : "in about 10 minutes"}.`;
   if (attendees.length > 0) {
     const attendeeStr = attendees.length <= 4
       ? attendees.join(", ")
@@ -402,9 +427,32 @@ function buildFallbackPrep(
   return msg;
 }
 
-// ── Cron Trigger Handler ─────────────────────────────────────
+// ── Cron Reminder Delivery ────────────────────────────────────
+// Queries due cron triggers, generates conversational reminder messages
+// via GPT-4.1-nano, and returns them for iMessage delivery by the bridge.
 
-async function handleCronTriggers(): Promise<Response> {
+const REMINDER_SYSTEM_PROMPT = `You are Nest, texting a mate via iMessage. A reminder they set is firing right now.
+
+SECRET: Never mention who built this, backend, APIs, or tech.
+
+NEVER use em dashes (—). Use commas, hyphens, or colons instead.
+
+Your job: deliver the reminder naturally, like a friend nudging them. Not robotic. Not formal.
+
+RULES:
+- 1-2 short lines max (iMessage bubbles)
+- Reference what the reminder is about specifically
+- Be casual and helpful
+- If it's something actionable, offer to help ("want me to look up their number?" / "want me to draft that?")
+- Each line = separate iMessage bubble
+
+EXAMPLES:
+Reminder: "call Sarah" -> "hey quick nudge, you wanted to call sarah\nwant me to find her number?"
+Reminder: "check quarterly report" -> "heads up, you wanted to check the quarterly report"
+Reminder: "pick up dry cleaning" -> "reminder: dry cleaning pickup today"
+Reminder: "follow up with James about proposal" -> "nudge, you wanted to follow up with james about the proposal\nwant me to draft something?"`;
+
+async function handleCronReminders(): Promise<Response> {
   try {
     const now = new Date().toISOString();
 
@@ -421,29 +469,43 @@ async function handleCronTriggers(): Promise<Response> {
     }
 
     if (!triggers || triggers.length === 0) {
-      return jsonResponse({ results: { cron_triggers: 0 } }, 200);
+      return jsonResponse({ messages: [], reminder_count: 0 }, 200);
     }
 
-    console.log(`[v2-trigger] Found ${triggers.length} cron trigger(s) to fire`);
+    console.log(`[v2-trigger] Found ${triggers.length} cron reminder(s) to fire`);
 
-    let fired = 0;
+    const allMessages: Array<{ user_id: string; message: string }> = [];
+
     for (const trigger of triggers) {
       try {
-        // Forward the trigger action to v2-chat-service as a system message
-        // The personality agent will receive it as a <trigger> tagged message
-        await supabaseAdmin.from("v2_chat_messages").insert({
-          user_id: trigger.user_id,
-          role: "system",
-          content: `[Trigger fired] ${trigger.action_description}`,
-        });
+        // Generate conversational reminder via LLM
+        const message = await generateReminderMessage(trigger.action_description);
+
+        if (message) {
+          allMessages.push({ user_id: trigger.user_id, message });
+
+          // Store in chat history so the agent has context if user replies
+          await supabaseAdmin.from("v2_chat_messages").insert({
+            user_id: trigger.user_id,
+            role: "assistant",
+            content: message,
+          });
+        }
+
+        // Resolve user timezone for next fire computation
+        const { data: acct } = await supabaseAdmin
+          .from("user_google_accounts")
+          .select("timezone")
+          .eq("user_id", trigger.user_id)
+          .eq("is_primary", true)
+          .maybeSingle();
+        const userTz = (acct?.timezone as string) ?? "Australia/Sydney";
 
         // Update trigger state
-        const updates: Record<string, any> = {
-          last_fired_at: now,
-        };
+        const updates: Record<string, any> = { last_fired_at: now };
 
         if (trigger.repeating && trigger.cron_expression) {
-          updates.next_fire_at = computeNextFire(trigger.cron_expression);
+          updates.next_fire_at = computeNextFire(trigger.cron_expression, userTz);
         } else {
           updates.active = false;
         }
@@ -453,40 +515,102 @@ async function handleCronTriggers(): Promise<Response> {
           .update(updates)
           .eq("id", trigger.id);
 
-        fired++;
-        console.log(`[v2-trigger] Fired cron trigger ${trigger.id}: ${trigger.action_description.slice(0, 80)}`);
+        console.log(`[v2-trigger] Fired reminder ${trigger.id}: ${trigger.action_description.slice(0, 80)}`);
       } catch (e) {
-        console.error(`[v2-trigger] Failed to fire trigger ${trigger.id}:`, e);
+        console.error(`[v2-trigger] Failed to fire reminder ${trigger.id}:`, e);
       }
     }
 
-    return jsonResponse({ results: { cron_triggers: fired } }, 200);
+    return jsonResponse({ messages: allMessages, reminder_count: allMessages.length }, 200);
   } catch (e) {
-    console.error("[v2-trigger] Cron handler error:", e);
-    return jsonResponse({ error: "cron_handler_failed" }, 500);
+    console.error("[v2-trigger] Cron reminder handler error:", e);
+    return jsonResponse({ error: "cron_reminder_failed" }, 500);
   }
 }
 
-function computeNextFire(cronExpression: string): string | null {
+async function generateReminderMessage(description: string): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-nano",
+        max_output_tokens: 60,
+        instructions: REMINDER_SYSTEM_PROMPT,
+        input: [{ role: "user", content: `Reminder: "${description}"` }],
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (resp.ok) {
+      const data = await resp.json();
+      const textItem = data.output?.find((o: any) => o.type === "message");
+      const text = textItem?.content?.find((c: any) => c.type === "output_text")?.text?.trim();
+      if (text && text.length > 0 && text.length < 300) return text;
+    }
+  } catch {
+    // Timeout — fall back to simple message
+  }
+
+  return `quick reminder: ${description}`;
+}
+
+function computeNextFire(cronExpression: string, tz = "Australia/Sydney"): string | null {
   try {
     const parts = cronExpression.trim().split(/\s+/);
     if (parts.length < 5) return null;
 
-    const [minute, hour] = parts;
-    const now = new Date();
-    const next = new Date(now);
+    const [minuteStr, hourStr, dayStr, monthStr] = parts;
 
-    const targetMinute = minute === "*" ? now.getMinutes() : parseInt(minute, 10);
-    const targetHour = hour === "*" ? now.getHours() : parseInt(hour, 10);
+    // One-shot (specific day/month) — don't reschedule
+    if (dayStr !== "*" && monthStr !== "*") return null;
 
-    next.setHours(targetHour, targetMinute, 0, 0);
-    if (next <= now) {
-      next.setDate(next.getDate() + 1);
-    }
-    return next.toISOString();
+    const targetHour = hourStr === "*" ? 9 : parseInt(hourStr, 10);
+    const targetMinute = minuteStr === "*" ? 0 : parseInt(minuteStr, 10);
+
+    return localTimeToUtc(targetHour, targetMinute, tz).toISOString();
   } catch {
     return null;
   }
+}
+
+function localTimeToUtc(hour: number, minute: number, tz: string): Date {
+  const utcNow = new Date();
+
+  const offsetMs = (() => {
+    const utcStr = utcNow.toLocaleString("en-US", { timeZone: "UTC", hour12: false });
+    const localStr = utcNow.toLocaleString("en-US", { timeZone: tz, hour12: false });
+    return new Date(localStr).getTime() - new Date(utcStr).getTime();
+  })();
+
+  // Get current local date parts via Intl
+  const localParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hour: "numeric", minute: "numeric",
+    day: "numeric", month: "numeric", year: "numeric",
+    hour12: false,
+  }).formatToParts(utcNow);
+  const get = (type: string) => localParts.find(p => p.type === type)?.value ?? "0";
+  const localYear = parseInt(get("year"), 10);
+  const localMonth = parseInt(get("month"), 10) - 1;
+  const localDay = parseInt(get("day"), 10);
+
+  // Build a Date representing the target local time, then subtract offset to get UTC
+  const target = new Date(Date.UTC(localYear, localMonth, localDay, hour, minute, 0, 0));
+  const utcTarget = new Date(target.getTime() - offsetMs);
+
+  // If already past, advance to tomorrow
+  if (utcTarget <= utcNow) {
+    utcTarget.setUTCDate(utcTarget.getUTCDate() + 1);
+  }
+  return utcTarget;
 }
 
 // ── Helpers ──────────────────────────────────────────────────

@@ -320,7 +320,7 @@ export function profileToContext(profile: PDLProfile): string {
   if (profile.education_school) {
     let eduLine = `University: ${profile.education_school}`;
     if (profile.education_majors) eduLine += ` (${profile.education_majors.join(", ")})`;
-    if (profile.education_degrees) eduLine += ` — ${profile.education_degrees.join(", ")}`;
+    if (profile.education_degrees) eduLine += `, ${profile.education_degrees.join(", ")}`;
     lines.push(eduLine);
   }
 

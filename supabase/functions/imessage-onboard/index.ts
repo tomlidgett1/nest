@@ -2,6 +2,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { enrichByIdentity, profileToContext } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { linkConversationsToUser } from "../_shared/conversation-store.ts";
+import { refreshAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -278,6 +279,23 @@ async function handlePost(req: Request) {
     );
     console.log(`[onboard] Stored account ${profile.email} in user_google_accounts`);
 
+    // Fetch and store Google Calendar timezone (non-blocking)
+    (async () => {
+      try {
+        const { token: accessToken } = await refreshAccessToken(refreshToken!);
+        const tz = await fetchCalendarTimezone(accessToken);
+        if (tz) {
+          await admin.from("user_google_accounts")
+            .update({ timezone: tz })
+            .eq("user_id", uid)
+            .eq("google_email", profile!.email);
+          console.log(`[onboard] Stored timezone ${tz} for ${profile!.email}`);
+        }
+      } catch (e) {
+        console.warn("[onboard] Timezone fetch failed (non-blocking):", (e as Error).message);
+      }
+    })();
+
     if (imessageRowId && (profile?.name || profile?.email)) {
       const patch: Record<string, string> = { updated_at: new Date().toISOString() };
       if (profile.name) patch.display_name = profile.name;
@@ -421,7 +439,7 @@ async function sendPostSignupWelcome(
     await delay(4000);
     await admin.from("outbound_imessages").insert({
       phone_number: phoneNumber,
-      content: `alright, you made it in.\nyou and me—let’s shake things up.\ngo on, hit me with your first question`,
+      content: `you're in.\nno rules, no bullshit - just answers.\nhit me with your first question`,
     });
     return;
   }
@@ -449,6 +467,8 @@ async function generateWelcome(name: string, pdlContext: string): Promise<string
   }
 
   const systemPrompt = `You are Nest, a sharp, witty AI assistant that lives in iMessage. The user just connected their Google account and you're about to send them their first real message.
+
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
 
 You have detailed intel on this person (see PROFILE INTEL). Your message should show you've done your homework while they were setting up. Be cheeky, confident, slightly cocky. The goal is to make them think "how does this thing know who I am?"
 

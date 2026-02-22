@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { refreshAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -120,7 +121,23 @@ async function handleAddCallback(req: Request) {
 
     const accountId = upsertData?.id;
     console.log(`[manage-google-accounts] Linked ${profile.email} → ${original_user_id} (account ${accountId})`);
-    // Ingestion is triggered automatically by the DB trigger on user_google_accounts INSERT (pg_net → ingest-pipeline)
+
+    // Fetch and store timezone (non-blocking)
+    (async () => {
+      try {
+        const { token: accessToken } = await refreshAccessToken(provider_refresh_token);
+        const tz = await fetchCalendarTimezone(accessToken);
+        if (tz) {
+          await admin.from("user_google_accounts")
+            .update({ timezone: tz })
+            .eq("user_id", original_user_id)
+            .eq("google_email", profile.email);
+          console.log(`[manage-google-accounts] Stored timezone ${tz} for ${profile.email}`);
+        }
+      } catch (e) {
+        console.warn("[manage-google-accounts] Timezone fetch failed:", (e as Error).message);
+      }
+    })();
 
     return jsonRes({
       success: true,

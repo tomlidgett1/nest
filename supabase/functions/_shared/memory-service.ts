@@ -121,7 +121,7 @@ You will receive the latest batch of messages. Merge them into the existing summ
 Produce a JSON object with exactly these fields:
 {
   "summary": "A rolling summary covering the ENTIRE conversation history. Include: key facts about the user (name, job, company, interests), important decisions, tasks completed, tasks pending, ongoing threads, personal details shared, and anything Nest should remember. Keep under 600 words. Be specific with names, dates, and details. Never lose information from the existing summary unless it's been superseded.",
-  "writing_style": "The user's texting style: formality, message length, slang, punctuation, emoji usage, greeting patterns. Be specific and concise.",
+  "writing_style": "A CONCRETE, SPECIFIC description of the user's iMessage texting style. Include ALL of these dimensions: (1) average message length in words, (2) capitalisation (all lowercase / sentence case / mixed), (3) punctuation habits (periods? commas? question marks? none?), (4) emoji usage (never / rare / frequent), (5) abbreviations or slang they use (list specific ones), (6) greeting patterns (hey / hi / nothing / yo), (7) sign-off patterns, (8) formality level (1-5 scale, 1=very casual, 5=formal), (9) typical response they seem to prefer from Nest (short punchy vs detailed). Example: 'avg 8 words, all lowercase, no periods, no emoji, uses abbreviations (u, ur, tbh), greets with hey or nothing, formality 2/5, prefers short punchy responses'",
   "preferences": {
     "communication_style": "how they prefer info delivered",
     "topics_of_interest": ["recurring topics"],

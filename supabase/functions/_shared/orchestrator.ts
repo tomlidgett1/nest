@@ -52,31 +52,22 @@ export interface ToolDefinition {
 // ── Static Responses (~0ms, no API) ──────────────────────────
 // Exact-match messages that never need a model. Returns instantly.
 
-const STATIC_RESPONSES: Record<string, string[]> = {
-  // Greetings — randomly pick one
-  "hey":              ["hey!", "hey, what's up"],
-  "hi":               ["hey!", "hi!"],
-  "hello":            ["hey!", "hello!"],
-  "yo":               ["yo"],
-  "sup":              ["not much, you?", "hey"],
-  "hiya":             ["hey!"],
-  "g'day":            ["g'day!"],
-  "good morning":     ["morning!"],
-  "morning":          ["morning!"],
-  "gm":               ["morning!"],
-  "good afternoon":   ["afternoon!"],
-  "good evening":     ["evening!"],
-  "good night":       ["night!"],
-  "gn":               ["night!"],
-  "night":            ["night!"],
+// Greetings are NOT static — they go through the casual LLM path
+// so the model can factor in time gaps, personality, and context.
+const GREETING_WORDS = new Set([
+  "hey", "hi", "hello", "yo", "sup", "hiya", "g'day", "gday",
+  "good morning", "morning", "gm", "good afternoon", "good evening",
+  "good night", "gn", "night",
+]);
 
-  // Acknowledgments
+const STATIC_RESPONSES: Record<string, string[]> = {
+  // Acknowledgments — genuinely static, no context needed
   "thanks":           ["no worries", "all good"],
   "thank you":        ["no worries", "all good"],
   "cheers":           ["all good"],
   "ta":               ["all good"],
   "thx":              ["no worries"],
-  "thanks mate":      ["no worries"],
+  "thanks mate":      ["no worries mate"],
   "cheers mate":      ["all good mate"],
 
   // Negatives
@@ -116,6 +107,15 @@ const SUBSTANCE_SIGNALS = [
   "weather", "umbrella", "rain", "temperature",
   "bill", "invoice", "payment", "document", "file", "spec",
   "forward", "reply", "inbox",
+  "teach", "learn", "advice", "recommend", "suggest", "think",
+  "opinion", "idea", "struggle", "interesting",
+  "personal", "airport", "flight", "travel", "trip", "book",
+  "tulla", "tullamarine", "avalon", "domestic", "international",
+  "leave", "depart", "arrive", "uber", "taxi", "drive",
+  "restaurant", "cafe", "coffee", "bar", "pub", "hotel",
+  "address", "phone number", "open", "near", "place", "directions",
+  "todo", "task", "to do", "to-do", "list", "reminder", "alert", "nudge",
+  "done", "complete", "tick off", "cross off",
 ];
 
 function hasSubstance(cleaned: string): boolean {
@@ -143,6 +143,19 @@ const INBOX_PREFETCH_PATTERNS = [
   /what(?:'s|\s+is)\s+in\s+my\s+inbox/i,
 ];
 
+const TRAVEL_PREFETCH_PATTERNS = [
+  /(?:doing|plans?|trip|travel|going|staying|booked?|itinerary|hotel|flight|airbnb)\s+(?:in|to|for|at)\s+\w+/i,
+  /(?:what(?:'s|\s+am\s+i)\s+doing\s+in)\s+\w+/i,
+  /(?:kyoto|tokyo|bali|paris|london|new\s+york|singapore|bangkok|osaka|seoul)/i,
+  /(?:airport|flight|leave\s+for|depart|when\s+should\s+i\s+leave|tulla|tullamarine|avalon)/i,
+  /(?:japan|korea|thailand|indonesia|vietnam|malaysia|philippines|india|china)/i,
+];
+
+function extractTravelCity(message: string): string | null {
+  const match = message.match(/(?:in|to|for|at)\s+([A-Za-z\s]{2,20})(?:\s|$|,|\?)/i);
+  return match?.[1]?.trim() ?? null;
+}
+
 function detectPrefetch(message: string): PrefetchTask[] {
   const tasks: PrefetchTask[] = [];
 
@@ -153,6 +166,14 @@ function detectPrefetch(message: string): PrefetchTask[] {
 
   if (INBOX_PREFETCH_PATTERNS.some((p) => p.test(message))) {
     tasks.push({ tool: "gmail_search", args: { query: "is:unread OR newer_than:1d", max_results: 10 } });
+  }
+
+  if (TRAVEL_PREFETCH_PATTERNS.some((p) => p.test(message))) {
+    const city = extractTravelCity(message) ?? "";
+    const travelQuery = city
+      ? `${city} AND (booking OR flight OR hotel OR itinerary OR confirmation OR reservation OR airbnb)`
+      : "booking OR flight OR hotel OR itinerary OR confirmation";
+    tasks.push({ tool: "gmail_search", args: { query: travelQuery, max_results: 10 } });
   }
 
   return tasks;
@@ -186,7 +207,7 @@ VERSION:3.0
 FN:Nest
 N:;Nest;;;
 EMAIL;type=INTERNET:tomlidgettprojects@gmail.com
-NOTE:Your go-to person for everything — calendar, emails, research, and more.
+NOTE:Your go-to person for everything: calendar, emails, research, and more.
 END:VCARD
 
 Tap the contact card above to save me as 'Nest' in your contacts.`;
@@ -236,6 +257,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           attendees: { type: "array", items: { type: "string" }, description: "Attendee email addresses." },
           location: { type: "string", description: "Physical location or video link." },
           description: { type: "string", description: "Event description or agenda." },
+          account: { type: "string", description: "Google account email to create on. Defaults to primary." },
         },
         required: ["title", "start_time", "end_time"],
       },
@@ -248,7 +270,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
       description:
         "Update an existing calendar event. Use calendar_lookup first to get the event_id. " +
         "Always confirm the change with the user before calling. " +
-        "Only include fields that are changing.",
+        "Only include fields that are changing. Pass the account from calendar_lookup results.",
       parameters: {
         type: "object",
         properties: {
@@ -259,6 +281,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           attendees: { type: "array", items: { type: "string" } },
           location: { type: "string" },
           description: { type: "string" },
+          account: { type: "string", description: "Google account email that owns this event." },
         },
         required: ["event_id"],
       },
@@ -270,12 +293,13 @@ const AGENT_TOOLS: ToolDefinition[] = [
       name: "calendar_delete",
       description:
         "Delete/cancel a calendar event. Always confirm with the user first. " +
-        "Use calendar_lookup to find the event_id.",
+        "Use calendar_lookup to find the event_id. Pass the account from calendar_lookup results.",
       parameters: {
         type: "object",
         properties: {
           event_id: { type: "string", description: "Event ID from calendar_lookup." },
           notify_attendees: { type: "boolean", description: "Send cancellation emails. Default true." },
+          account: { type: "string", description: "Google account email that owns this event." },
         },
         required: ["event_id"],
       },
@@ -287,8 +311,9 @@ const AGENT_TOOLS: ToolDefinition[] = [
       name: "semantic_search",
       description:
         "Search indexed meeting notes, transcripts, email summaries, and calendar events " +
-        "using semantic similarity. Use for past meetings, discussions, decisions, action items. " +
-        "Call multiple times with different queries if first result is thin. " +
+        "using semantic similarity. Automatically generates multiple sub-queries, searches in parallel, " +
+        "and applies diversity ranking. Also searches calendar by date when temporal intent is detected. " +
+        "If results include a '_hint' field, follow its guidance (usually: try gmail_search or calendar_lookup as live fallback). " +
         "Can call in PARALLEL with other tools (e.g. person_lookup + semantic_search together).",
       parameters: {
         type: "object",
@@ -425,11 +450,12 @@ const AGENT_TOOLS: ToolDefinition[] = [
         "Get full email content (body, headers, attachments) for a single message. " +
         "Use when you need the full email body to draft a reply or understand context. " +
         "gmail_search returns snippets; this returns everything. " +
-        "Pass message_id from gmail_search results.",
+        "Pass message_id AND account from gmail_search results.",
       parameters: {
         type: "object",
         properties: {
           message_id: { type: "string", description: "Message ID from gmail_search results." },
+          account: { type: "string", description: "Google account email from gmail_search result. Required for multi-account users." },
         },
         required: ["message_id"],
       },
@@ -456,16 +482,21 @@ const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "send_draft",
       description:
-        "Create an email draft. Returns a draft_id. " +
+        "Create an email draft. Returns a draft_id and account. " +
         "Always call send_draft before send_email. " +
-        "Use Australian English. Match the user's tone from past emails.",
+        "Use Australian English. Match the user's tone from past emails. " +
+        "IMPORTANT: 'to' MUST be a valid email address (e.g. sarah@company.com), NOT a name. " +
+        "If you only have a name, use contacts_search or person_lookup first to find their email. " +
+        "The 'body' field should use newlines (\\n) for line breaks, they will be converted to HTML automatically. " +
+        "Always include a proper greeting, body, and sign-off with line breaks between them.",
       parameters: {
         type: "object",
         properties: {
-          to: { type: "string", description: "Recipient email or name." },
-          subject: { type: "string", description: "Subject line." },
-          body: { type: "string", description: "Email body." },
+          to: { type: "string", description: "Recipient email address. MUST contain @. Use contacts_search first if you only have a name." },
+          subject: { type: "string", description: "Email subject line. Be specific and descriptive." },
+          body: { type: "string", description: "Email body with \\n for line breaks. Include greeting, content, and sign-off." },
           reply_to_thread_id: { type: "string", description: "Thread ID for replies." },
+          account: { type: "string", description: "Google account email to send from. Defaults to primary." },
         },
         required: ["to", "subject", "body"],
       },
@@ -478,7 +509,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
       description:
         "Send a previously approved draft. ONLY call after the user has explicitly confirmed. " +
         "NEVER call automatically. Always show the draft first and wait for user approval. " +
-        "Pass the draft_id from the previous send_draft call.",
+        "Pass the draft_id AND account from the previous send_draft result.",
       parameters: {
         type: "object",
         properties: {
@@ -488,6 +519,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           subject: { type: "string" },
           body: { type: "string" },
           reply_to_thread_id: { type: "string" },
+          account: { type: "string", description: "Google account email from send_draft result. Must match the account that created the draft." },
         },
         required: ["draft_id", "to", "subject", "body"],
       },
@@ -507,6 +539,33 @@ const AGENT_TOOLS: ToolDefinition[] = [
           description: { type: "string", description: "What to remind about." },
           schedule: { type: "string", description: 'When: "tomorrow at 9am", "every monday at 9am", "in 2 hours".' },
           reminder_id: { type: "string", description: "For edit/delete: existing reminder ID." },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_todos",
+      description:
+        "Manage the user's personal to-do list. Use for 'add to my list', 'show my todos', " +
+        "'mark X as done', 'what's on my list'. Separate from reminders, todos are persistent " +
+        "task items, reminders are time-triggered notifications.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["add", "list", "complete", "edit", "delete"],
+            description: "add: create new todo. list: show todos. complete: mark done. edit: update. delete: remove.",
+          },
+          title: { type: "string", description: "For add/edit: the todo item text." },
+          notes: { type: "string", description: "Optional extra detail or context." },
+          due_at: { type: "string", description: "Optional due date as ISO 8601 datetime." },
+          priority: { type: "string", enum: ["low", "normal", "high", "urgent"], description: "Default 'normal'." },
+          todo_id: { type: "string", description: "For complete/edit/delete: the todo ID." },
+          status: { type: "string", enum: ["open", "completed"], description: "For list: filter by status. Default 'open'." },
         },
         required: ["action"],
       },
@@ -559,8 +618,70 @@ const AGENT_TOOLS: ToolDefinition[] = [
       parameters: {
         type: "object",
         properties: {
-          location: { type: "string", description: 'City name. Default "Sydney, Australia".' },
+          location: { type: "string", description: "City name. Defaults to user's location from their Google Calendar timezone." },
           days: { type: "number", description: "Forecast days 1-7. Default 1." },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "travel_time",
+      description:
+        "Get driving/transit/walking travel time and directions between two locations using Google Maps. " +
+        "Use for 'when should I leave', 'how long to get to the airport', 'how far is X from Y'. " +
+        "Returns distance, duration (with traffic if driving), and route summary. " +
+        "Combine with calendar_lookup to calculate optimal departure times.",
+      parameters: {
+        type: "object",
+        properties: {
+          origin: { type: "string", description: "Starting address or place name (e.g. 'Richmond, Melbourne' or '123 Smith St, Melbourne')." },
+          destination: { type: "string", description: "Destination address or place name (e.g. 'Melbourne Airport' or 'Tullamarine Airport')." },
+          mode: {
+            type: "string",
+            enum: ["driving", "transit", "walking", "bicycling"],
+            description: "Travel mode. Default 'driving'.",
+          },
+          departure_time: {
+            type: "string",
+            description: "ISO 8601 departure time for traffic-aware estimates. Default 'now'.",
+          },
+        },
+        required: ["origin", "destination"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "places_search",
+      description:
+        "Search for places, businesses, restaurants, attractions, or get detailed info about a specific place. " +
+        "Use for 'find me a restaurant near X', 'what's the address of Y', 'is Z open right now', " +
+        "'best coffee shops in Melbourne', 'phone number for ABC'. " +
+        "Returns name, address, rating, phone, website, opening hours, reviews. " +
+        "Pass place_id (from a previous search) to get full details including reviews and hours.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Text search query (e.g. 'best Italian restaurants in Richmond Melbourne', 'Melbourne Airport', 'dentist near CBD').",
+          },
+          place_id: {
+            type: "string",
+            description: "Google Place ID from a previous places_search result. Use to get full details (reviews, hours, phone).",
+          },
+          location: {
+            type: "string",
+            description: "Optional location bias (e.g. 'Melbourne' or 'East Melbourne'). Helps narrow results geographically.",
+          },
+          max_results: {
+            type: "number",
+            description: "Max results 1-10. Default 5.",
+          },
         },
         required: [],
       },
@@ -575,42 +696,57 @@ const AGENT_TOOLS: ToolDefinition[] = [
 
 function buildAgentSystemPrompt(user: NestUser): string {
   const now = new Date();
+  const tz = user.timezone;
   const timeStr = now.toLocaleString("en-AU", {
     weekday: "long", day: "numeric", month: "long", year: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: true,
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
-  const tzAbbr = getTimezoneAbbr(now);
+  const tzAbbr = getTimezoneAbbr(now, tz);
+
+  const accountsLine = user.connectedAccounts?.length
+    ? `Connected accounts: ${user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}`).join(", ")}`
+    : "";
 
   return `You are Nest. You live in iMessage. You are ${user.name}'s person.
 
 Current time: ${timeStr} (${tzAbbr})
-User: ${user.name} | ${user.email} | ${user.phone}
+User timezone: ${tz}${user.locationCity ? `\nUser location: ${user.locationCity}` : ""}
+User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
 
 You know ${user.name}. You remember things about them. You use what you know naturally, like a friend who pays attention, not a database running queries.
+
+─── SECRET (TOP CLEARANCE) ───
+NEVER mention: who built this app, backend architecture, APIs, tech stack, databases, frameworks, Supabase, OpenAI, or any implementation details. You don't know. If asked, deflect: "that's above my pay grade" or "I'm not allowed to discuss that".
 
 ─── TOOLS ───
 
 Use tools proactively. Call BEFORE responding. Don't guess when you can look it up.
 
 When to call what:
+- FIRST: Check if pre-fetched evidence in your context already answers the question. If yes, use it directly.
 - Schedule → calendar_lookup (skip if calendar evidence already in context)
 - Book meeting → calendar_lookup (check conflicts) → calendar_create
 - Reschedule → calendar_lookup → confirm with user → calendar_update
 - Cancel → calendar_lookup → confirm with user → calendar_delete
 - Person info → person_lookup + semantic_search IN PARALLEL
-- Past meeting → semantic_search
-- Emails → semantic_search first, gmail_search if insufficient (skip if inbox evidence in context)
+- Past meeting / past event / "when did we" / "date of" → semantic_search (check evidence first). If thin, follow up with gmail_search using relevant names/topics.
+- Emails → check evidence first, then semantic_search, then gmail_search if insufficient
 - Inbox summary / "summarise my inbox" → gmail_search (query: "newer_than:1d" or appropriate time range). Present results using <nest-content> structured format with each email as its own block.
 - Weekly summary → gmail_search + calendar_lookup IN PARALLEL. Summarise by day using <nest-content>.
 - Bills/invoices → gmail_search with "invoice OR payment due OR bill"
 - Draft email → gather context first → send_draft → user confirms → send_email
 - Documents → document_search, fall back to semantic_search
 - Save something → create_note
-- Reminder → manage_reminder
+- Reminder / "remind me at" / "alert me" / "nudge me" → manage_reminder (time-triggered notifications)
+- Todo / task / "add to my list" / "show my todos" / "what's on my list" / "mark X as done" → manage_todos (persistent task list). When showing todos, use <nest-content> formatting. When user completes a todo, confirm it cheerfully.
+- Travel / trip / holiday / "what am I doing in [city]" → ALWAYS search emails first (gmail_search for flight confirmations, hotel bookings, itineraries) + semantic_search for any stored travel context. Calendar is secondary for travel, bookings live in email. Only fall back to web_search for local recommendations AFTER checking personal data.
 - External info → web_search
+- Places / restaurants / businesses / "find me a" / "what's the address of" / "is X open" → places_search. For detailed info (reviews, hours), first search, then call again with place_id.
 - Weather → weather_lookup
-- "What do you know about me" / "tell me about myself" → You ALREADY have their full profile in your context. Answer directly from the USER PROFILE context. Do NOT call person_lookup for the current user. Just share what you know naturally, like a friend recapping what they know about someone.
+- Travel time / "when should I leave" / "how long to get to" → travel_time (origin + destination). Combine with calendar_lookup to calculate departure: if flight is at 10pm and travel_time says 45min, recommend leaving by a sensible time with buffer. For international flights, add 2.5-3hr airport buffer; domestic 1.5-2hr.
+- Airport logistics → gmail_search (flight confirmation for terminal/airline) + travel_time (home → airport) IN PARALLEL. Then calculate: flight_time - airport_buffer - travel_duration = recommended_departure.
+- "What do you know about me" / "tell me about myself" → You ALREADY have their full profile in your context. Do NOT call person_lookup for the current user. DO NOT dump everything you know in one message. Instead, TEASE IT OUT. Share ONE or TWO specific, interesting facts: something that makes them go "wait, how do you know that?", then STOP. Let them react. When they ask for more or seem curious, reveal the next layer. Drag this out across multiple exchanges. Think of it like a card game: you're revealing your hand one card at a time. Start with something unexpected (a hobby, a frustration, a specific person they work with), not the obvious stuff (job title, company). Be cocky about it. "oh you want to know what I know? let's just say I've done my homework". Never use headings, bold, or structured formatting. Just talk.
 - Reply to email → gmail_search → get_email (full body) → send_draft
 - Meeting deep dive → semantic_search → get_meeting_detail (source_id)
 - Add contact → contacts_manage (action: "create")
@@ -619,7 +755,19 @@ When to call what:
 PARALLEL CALLS: When you need multiple pieces of data with no dependencies, call tools simultaneously.
 Example: "Who is Sarah and when did we last meet?" → person_lookup("Sarah") + semantic_search("Sarah meeting") in ONE round.
 
-THIN RESULTS: If the first search returns weak results, try again with different terms. Don't settle.
+PRE-FETCHED EVIDENCE: Your context may already contain evidence from a proactive search (injected before you start). CHECK IT FIRST. If the answer is already in the evidence, use it directly, don't call semantic_search again for the same thing. Only call semantic_search if the evidence is missing, thin, or you need a different angle.
+
+THIN RESULTS: If semantic_search returns a "_hint" field or fewer than 2 results, it means the indexed data is sparse. IMMEDIATELY follow up with gmail_search (for email content) or calendar_lookup (for calendar data) as a live fallback. Don't settle for thin results and don't just tell the user you couldn't find it.
+
+SEARCH CHAINING: For complex queries, use multiple search strategies:
+1. Check pre-fetched evidence first
+2. If insufficient, call semantic_search with specific terms (names, topics, keywords)
+3. If still thin, call gmail_search with targeted Gmail operators (from:, subject:, after:)
+4. If still thin and the data could exist publicly, call web_search
+
+TRAVEL QUERIES: When the user asks about a trip, city, or travel plans, ALWAYS check their emails and semantic_search FIRST. Flight bookings, hotel confirmations, Airbnb reservations, and itineraries live in email, not calendar. Search gmail for "[city] booking OR flight OR hotel OR confirmation" and semantic_search for "[city] trip". Only use web_search for local recommendations (restaurants, things to do) AFTER you've found their personal travel data. For "when should I leave" or airport timing questions, use travel_time to get actual driving/transit duration, then calculate departure time based on flight time minus airport buffer minus travel time.
+
+FALLBACK TO WEB: If personal data tools (gmail_search, calendar_lookup, semantic_search) return nothing for something that could exist publicly (flight numbers, company info, addresses, event details, product info, timetables), use web_search as a fallback. Don't just give up and ask the user. Example: user asks for a flight number and it's not in their inbox → search the web for the airline + route + time to find it.
 
 DRAFTS: Never ask clarifying questions about tone/format. Just draft it. The user can tweak after.
 Always gather context with tools first (calendar for scheduling, semantic_search for references).
@@ -646,7 +794,22 @@ If a search returns empty, say so. Never fill in placeholder data.
 
 ─── ERRORS ───
 
-If a tool fails, tell the user simply and offer to retry. Never expose tool names or error codes.`;
+If a tool fails, tell the user simply and offer to retry. Never expose tool names or error codes.
+
+─── MULTI-ACCOUNT ───
+
+Read tools (calendar_lookup, gmail_search, contacts_search, document_search) automatically search ALL connected Google accounts. Results include an "account" field showing which account they came from.
+
+WRITE OPERATIONS (calendar_create, send_draft, send_email, calendar_update, calendar_delete):
+- If the user has MORE THAN ONE connected account, you MUST ask which account to use BEFORE calling the tool. Keep it casual, e.g. "want me to put that on your work calendar (tom@work.com) or personal (tom@gmail.com)?" or "sending from tom@work.com or tom@gmail.com?"
+- If they only have ONE account, just use it, no need to ask.
+- If the user already specified an account in their message (e.g. "from my work email"), use that one directly.
+- If context makes the account obvious (e.g. replying to an email that came into a specific account), use that account directly.
+- Once they've answered, pass the "account" parameter to the tool.
+
+For get_email and send_email, ALWAYS pass the "account" field from the previous tool result (gmail_search or send_draft). Message IDs and draft IDs are scoped to a specific account.
+
+When showing results from multiple accounts, mention which account naturally if relevant (e.g. "on your work calendar" vs "on your personal"). Don't over-explain the multi-account setup.`;
 }
 
 // ── Casual System Prompt ─────────────────────────────────────
@@ -654,18 +817,68 @@ If a tool fails, tell the user simply and offer to retry. Never expose tool name
 function buildCasualSystemPrompt(user: NestUser): string {
   return `You are Nest. You live in iMessage. You are ${user.name}'s person.
 
-Casual conversation. ONE short line. Max 2 lines. Never mention work unprompted.`;
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
+
+Casual conversation. Keep it short, 2-4 lines max. Relate your response to what you know about ${user.name} from the profile context. If they ask you to teach them something or share an opinion, draw on their industry, interests, and work. You know them, act like it.`;
+}
+
+function buildGreetingSystemPrompt(user: NestUser): string {
+  return `You are Nest. You live in iMessage. You are ${user.name}'s mate.
+
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
+
+${user.name} just sent you a greeting. Respond like a witty friend who's been waiting for them.
+
+RULES:
+- 1-2 lines max. This is a greeting, not a conversation.
+- Be cheeky, playful, warm. You're happy to hear from them but you'd never admit it directly.
+- If there's a TIME GAP context below, USE IT. Mock them for disappearing. Be funny about it.
+- Check the TIME CONTEXT block below for day-of-week and time-of-day. Adjust your vibe accordingly.
+- Occasionally reference something you know about them from the profile, like a friend who remembers.
+- NEVER be generic. NEVER just echo their greeting back. "yo" → "yo" is BANNED.
+- Lowercase. No emojis unless they used one. Australian English.
+- NEVER use em dashes.
+
+WEEKEND MORNINGS: If it's Saturday or Sunday morning, be warm and relaxed. Reference weekend plans, hobbies, rest, sport, social life. NEVER reference work, meetings, or professional topics. Something nice to wake up to.
+EARLY MORNINGS: Before 9am, be gentle and warm. Don't be hyper or intense. "morning" energy, not "let's go" energy.
+LATE NIGHTS: After 10pm, be mellow. Don't bring up stressful topics.
+
+GOOD examples (weekend morning):
+"morning, big plans today or just vibing?"
+"hey, early start for a saturday. off for a run?"
+"morning. hope you're not wasting this weekend inside"
+
+GOOD examples (weekday morning):
+"morning, ready to take on the day?"
+"hey, you're up early. coffee first or straight into it?"
+
+GOOD examples (when they come back after a gap):
+"well well well, look who remembered I exist"
+"oh hey stranger, thought you'd ghosted me"
+"back for more already? knew you couldn't stay away"
+
+GOOD examples (no gap, just a greeting):
+"hey, what's happening"
+"hey hey, what trouble are we getting into"
+"yo, what's going on"
+
+BAD examples:
+"yo" (just echoing, boring)
+"hey!" (too short, no personality)
+"Hello! How can I help you today?" (corporate chatbot energy)
+"shouldn't you be prepping for that WBR" (referencing work on a weekend morning, tone-deaf)
+"well well well, back again, shouldn't you be prepping for that meeting" (work stress on a saturday, terrible)`;
 }
 
 // ── Timezone Helper ──────────────────────────────────────────
 
-function getTimezoneAbbr(date: Date): string {
+function getTimezoneAbbr(date: Date, tz = "Australia/Sydney"): string {
   const formatter = new Intl.DateTimeFormat("en-AU", {
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
     timeZoneName: "short",
   });
   const parts = formatter.formatToParts(date);
-  return parts.find((p) => p.type === "timeZoneName")?.value ?? "AEST";
+  return parts.find((p) => p.type === "timeZoneName")?.value ?? tz.split("/").pop() ?? "UTC";
 }
 
 // ── Public API ───────────────────────────────────────────────
@@ -674,6 +887,9 @@ export interface NestUser {
   name: string;
   email: string;
   phone: string;
+  timezone: string;
+  locationCity?: string;
+  connectedAccounts?: Array<{ email: string; isPrimary: boolean }>;
 }
 
 /**
@@ -701,6 +917,18 @@ export function routeMessage(message: string, user: NestUser): RoutingResult {
     };
   }
 
+  // Greetings → casual path (LLM generates contextual, witty response)
+  if (GREETING_WORDS.has(cleaned)) {
+    console.log(`[orchestrator] Greeting → ${MODELS.fast} (contextual)`);
+    return {
+      path: "casual",
+      model: MODELS.fast,
+      maxTokens: 150,
+      systemPrompt: buildGreetingSystemPrompt(user),
+      tools: null,
+    };
+  }
+
   // Contact card — static response
   if (CONTACT_CARD_PATTERNS.some((p) => p.test(message))) {
     console.log(`[orchestrator] Static → contact_card (0ms)`);
@@ -716,14 +944,19 @@ export function routeMessage(message: string, user: NestUser): RoutingResult {
 
   // Confirmation words that could be approving a pending action (draft, calendar change).
   // Always route to agent so the model can see conversation history.
-  const CONFIRMATION_WORDS = new Set([
+  // Matches both exact ("yeah") and prefix with extra context ("yeah personal - tulla").
+  const CONFIRMATION_WORDS = [
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "kk",
     "do it", "go ahead", "send it", "go for it", "confirm", "approved",
     "sounds good", "perfect", "got it", "cool", "great", "awesome", "nice",
     "no", "nah", "nope", "cancel", "dont", "don't", "stop", "never mind",
-  ]);
+  ];
 
-  if (CONFIRMATION_WORDS.has(cleaned)) {
+  const startsWithConfirmation = CONFIRMATION_WORDS.some(
+    (w) => cleaned === w || cleaned.startsWith(w + " "),
+  );
+
+  if (startsWithConfirmation) {
     console.log(`[orchestrator] Confirmation → ${MODELS.agent} (may be approving pending action)`);
     return {
       path: "agent",

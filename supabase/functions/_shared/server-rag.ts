@@ -983,7 +983,7 @@ function buildEvidenceBlocks(results: SearchResult[], max: number): EvidenceBloc
           timeZone: "Australia/Sydney",
         });
         const attendees = r.metadata?.attendees || "";
-        body = `${timeTag}${r.title || "Event"} — ${dateLabel} at ${timeLabel}`;
+        body = `${timeTag}${r.title || "Event"}: ${dateLabel} at ${timeLabel}`;
         if (attendees) body += `\nAttendees: ${attendees}`;
         const summary = (r.summary_text || "").trim();
         if (summary && !summary.startsWith(r.title || "###")) {
@@ -1027,7 +1027,7 @@ function formatEvidence(
     const e = evidence[i];
     const pct = `${Math.round(e.score * 100)}%`;
     parts.push(
-      `[${i + 1}] ${e.title} — Relevance: ${pct}\n` +
+      `[${i + 1}] ${e.title}, Relevance: ${pct}\n` +
       `Source: ${e.sourceType} | ID: ${e.sourceId}\n` +
       `Details: ${e.text}\n`
     );

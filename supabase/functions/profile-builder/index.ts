@@ -10,9 +10,11 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   getGoogleAccessToken,
+  getAllAccountTokens,
   listGmailMessages,
   getGmailMessage,
 } from "../_shared/gmail-helpers.ts";
+import type { AccountToken } from "../_shared/gmail-helpers.ts";
 import { enrichByIdentity, profileToContext } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 
@@ -354,8 +356,8 @@ async function synthesiseProfile(
     .join("\n---\n");
 
   const calendarSummary = [
-    ...calendarData.recentEvents.map((e) => `[PAST] ${e.date} — ${e.title} (${e.attendees.join(", ")})`),
-    ...calendarData.upcomingEvents.map((e) => `[UPCOMING] ${e.date} — ${e.title} (${e.attendees.join(", ")})`),
+    ...calendarData.recentEvents.map((e) => `[PAST] ${e.date}: ${e.title} (${e.attendees.join(", ")})`),
+    ...calendarData.upcomingEvents.map((e) => `[UPCOMING] ${e.date}: ${e.title} (${e.attendees.join(", ")})`),
   ].join("\n");
 
   const weeklyVolume = emailData.allMessages.filter((m) => {
@@ -379,7 +381,7 @@ async function synthesiseProfile(
 
   const systemPrompt = `You are building a deep psychological and professional profile of a user for their AI assistant. The assistant will use this to anticipate needs, match communication style, and feel like it truly knows them.
 
-Analyse EVERYTHING provided — especially their SENT emails (their actual voice) and calendar patterns.
+Analyse EVERYTHING provided, especially their SENT emails (their actual voice) and calendar patterns.
 
 Return a JSON object with these exact keys:
 
@@ -391,18 +393,18 @@ Return a JSON object with these exact keys:
   "preferences": ["3-5 things they clearly prefer or value, e.g. 'prefers brief updates over long reports', 'likes to schedule things early', 'values punctuality'"],
   "values": ["3-5 core values evident from their behaviour, e.g. 'team player', 'detail-oriented', 'efficiency-focused'"],
   "communication_style": "2-3 sentences describing their overall communication personality. Are they formal or casual? Verbose or terse? Do they use humour? How do they handle conflict?",
-  "decision_making": "1-2 sentences on how they seem to make decisions — fast/slow, data-driven/intuitive, collaborative/independent",
+  "decision_making": "1-2 sentences on how they seem to make decisions: fast/slow, data-driven/intuitive, collaborative/independent",
   "hobbies": ["any hobbies, sports, fitness activities, creative pursuits detected from emails, calendar, or subscriptions"],
-  "travel": ["any trips, destinations, flights, or travel plans detected — include dates if available"],
-  "upcoming_events": ["any notable upcoming personal or professional events — conferences, trips, deadlines, celebrations"],
-  "personal_commitments": ["any personal life signals — wedding planning, family events, health appointments, etc."],
+  "travel": ["any trips, destinations, flights, or travel plans detected, include dates if available"],
+  "upcoming_events": ["any notable upcoming personal or professional events: conferences, trips, deadlines, celebrations"],
+  "personal_commitments": ["any personal life signals: wedding planning, family events, health appointments, etc."],
   "writing_style": "One detailed sentence about their writing style for emails specifically",
   "typical_day": "3-4 sentences painting a picture of what a typical day looks like for this person",
   "contact_relationships": [{"name": "contact name", "email": "email", "relationship": "brief description e.g. 'direct report', 'manager', 'external client', 'friend'"}],
-  "summary": "A rich 5-7 sentence profile summary. Write it as if you're briefing someone who needs to deeply understand this person — their role, how they work, what drives them, what frustrates them, their personality, and what their life looks like outside work. Be specific, vivid, and human. No generic filler."
+  "summary": "A rich 5-7 sentence profile summary. Write it as if you're briefing someone who needs to deeply understand this person: their role, how they work, what drives them, what frustrates them, their personality, and what their life looks like outside work. Be specific, vivid, and human. No generic filler."
 }
 
-Be specific. Use actual evidence from the emails. Don't guess — if you can't determine something, omit it. But where evidence exists, go deep.`;
+Be specific. Use actual evidence from the emails. Don't guess: if you can't determine something, omit it. But where evidence exists, go deep.`;
 
   try {
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -461,7 +463,11 @@ Deno.serve(async (req: Request) => {
   console.log(`[profile-builder] Starting deep profile build for ${userId}`);
 
   try {
-    const accessToken = await getGoogleAccessToken(admin, userId);
+    const accounts = await getAllAccountTokens(admin, userId);
+
+    if (accounts.length === 0) {
+      return json({ error: "no_google_accounts", detail: "User has no connected Google accounts" }, 400);
+    }
 
     const { data: imsgUser } = await admin
       .from("imessage_users")
@@ -469,27 +475,128 @@ Deno.serve(async (req: Request) => {
       .eq("user_id", userId)
       .maybeSingle();
 
-    const { data: googleAcct } = await admin
-      .from("user_google_accounts")
-      .select("google_email, google_name")
-      .eq("user_id", userId)
-      .eq("is_primary", true)
-      .maybeSingle();
-
-    const email = googleAcct?.google_email ?? imsgUser?.google_email ?? "";
-    const name = googleAcct?.google_name ?? imsgUser?.display_name ?? "Unknown";
+    const primaryAcct = accounts.find((a) => a.isPrimary) ?? accounts[0];
+    const email = primaryAcct.email;
+    const name = imsgUser?.display_name ?? "Unknown";
     const phone = imsgUser?.phone_number ?? null;
-    const companyDomain = lookupCompanyDomain(email);
 
-    console.log(`[profile-builder] User: ${name} <${email}>`);
+    // Find the best company domain across all accounts
+    const companyDomains = accounts
+      .map((a) => lookupCompanyDomain(a.email))
+      .filter(Boolean) as string[];
+    const companyDomain = companyDomains[0] ?? null;
 
-    // Run all scans in parallel
-    const [emailData, calendarData, pdlProfile, companyInfo] = await Promise.all([
-      deepScanEmails(accessToken, email),
-      deepScanCalendar(accessToken),
+    console.log(`[profile-builder] User: ${name} | Accounts: ${accounts.map((a) => a.email).join(", ")}`);
+
+    // Scan ALL connected accounts in parallel
+    const perAccountScans = await Promise.all(
+      accounts.map(async (acct) => {
+        console.log(`[profile-builder] Scanning ${acct.email}...`);
+        const [emails, calendar] = await Promise.all([
+          deepScanEmails(acct.accessToken, acct.email).catch((e) => {
+            console.warn(`[profile-builder] Email scan failed for ${acct.email}:`, (e as Error).message);
+            return { topContacts: [], sentEmails: [], receivedEmails: [], travelEmails: [], allMessages: [] } as Awaited<ReturnType<typeof deepScanEmails>>;
+          }),
+          deepScanCalendar(acct.accessToken).catch((e) => {
+            console.warn(`[profile-builder] Calendar scan failed for ${acct.email}:`, (e as Error).message);
+            return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [] } as Awaited<ReturnType<typeof deepScanCalendar>>;
+          }),
+        ]);
+        return { acct, emails, calendar };
+      }),
+    );
+
+    // Merge email data across all accounts
+    const mergedEmailData = {
+      topContacts: [] as Array<{ name: string; email: string; count: number }>,
+      sentEmails: [] as EmailMessage[],
+      receivedEmails: [] as EmailMessage[],
+      travelEmails: [] as EmailMessage[],
+      allMessages: [] as EmailMessage[],
+    };
+
+    const contactAgg = new Map<string, { name: string; email: string; count: number }>();
+    for (const { emails } of perAccountScans) {
+      mergedEmailData.sentEmails.push(...emails.sentEmails);
+      mergedEmailData.receivedEmails.push(...emails.receivedEmails);
+      mergedEmailData.travelEmails.push(...emails.travelEmails);
+      mergedEmailData.allMessages.push(...emails.allMessages);
+      for (const c of emails.topContacts) {
+        const existing = contactAgg.get(c.email);
+        if (existing) {
+          existing.count += c.count;
+        } else {
+          contactAgg.set(c.email, { ...c });
+        }
+      }
+    }
+    mergedEmailData.topContacts = [...contactAgg.values()]
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 20);
+
+    // Merge calendar data across all accounts
+    const mergedCalendarData = {
+      meetingFrequency: null as string | null,
+      recurringMeetings: [] as string[],
+      keyCollaborators: [] as string[],
+      recentEvents: [] as Array<{ title: string; date: string; attendees: string[] }>,
+      upcomingEvents: [] as Array<{ title: string; date: string; attendees: string[] }>,
+    };
+
+    const seenRecurring = new Set<string>();
+    const collabCounts = new Map<string, number>();
+    let totalWeeklyMeetings = 0;
+
+    for (const { calendar } of perAccountScans) {
+      mergedCalendarData.recentEvents.push(...calendar.recentEvents);
+      mergedCalendarData.upcomingEvents.push(...calendar.upcomingEvents);
+      for (const r of calendar.recurringMeetings) {
+        if (!seenRecurring.has(r)) {
+          seenRecurring.add(r);
+          mergedCalendarData.recurringMeetings.push(r);
+        }
+      }
+      for (const c of calendar.keyCollaborators) {
+        collabCounts.set(c, (collabCounts.get(c) ?? 0) + 1);
+      }
+      if (calendar.meetingFrequency) {
+        const match = calendar.meetingFrequency.match(/\d+/);
+        if (match) totalWeeklyMeetings += parseInt(match[0], 10);
+      }
+    }
+
+    mergedCalendarData.keyCollaborators = [...collabCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([email]) => email);
+
+    mergedCalendarData.meetingFrequency = totalWeeklyMeetings > 20
+      ? "very heavy (20+ per week)"
+      : totalWeeklyMeetings > 10 ? "heavy (10-20 per week)"
+      : totalWeeklyMeetings > 5 ? "moderate (5-10 per week)"
+      : totalWeeklyMeetings > 0 ? "light (under 5 per week)"
+      : null;
+
+    // Sort events by date
+    mergedCalendarData.recentEvents.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    mergedCalendarData.upcomingEvents.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    const emailData = mergedEmailData;
+    const calendarData = mergedCalendarData;
+
+    // PDL + company info (parallel)
+    const [pdlProfile, companyInfo] = await Promise.all([
       (async (): Promise<PDLProfile | null> => {
         const cached = imsgUser?.pdl_profile as PDLProfile | null;
         if (cached?.job_title) return cached;
+        // Try work email first, then personal
+        for (const acct of accounts) {
+          const domain = lookupCompanyDomain(acct.email);
+          if (domain) {
+            const result = await enrichByIdentity({ email: acct.email, name, phone: phone ?? undefined });
+            if (result?.job_title) return result;
+          }
+        }
         return enrichByIdentity({ email, name, phone: phone ?? undefined });
       })(),
       companyDomain
@@ -504,7 +611,7 @@ Deno.serve(async (req: Request) => {
       ? await searchWeb(`${name} ${companyDomain} professional background`)
       : null;
 
-    console.log(`[profile-builder] Scanned: ${emailData.allMessages.length} emails (${emailData.sentEmails.length} sent), ${calendarData.recentEvents.length + calendarData.upcomingEvents.length} calendar events`);
+    console.log(`[profile-builder] Scanned: ${emailData.allMessages.length} emails (${emailData.sentEmails.length} sent) across ${accounts.length} accounts, ${calendarData.recentEvents.length + calendarData.upcomingEvents.length} calendar events`);
 
     // Deep LLM synthesis
     const pdlContext = pdlProfile ? profileToContext(pdlProfile) : null;

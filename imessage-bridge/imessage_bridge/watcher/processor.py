@@ -1,12 +1,20 @@
-"""Process new iMessages: check user status, onboard new users, forward to V2 agent."""
+"""Process new iMessages: check user status, onboard new users, forward to V2 agent.
+
+v2 — Concurrent per-user processing. Each user's messages are handled in
+their own asyncio Task so 50 users messaging simultaneously don't queue
+behind each other. Per-user locks prevent reply interleaving within a
+single conversation.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
 import time
+from collections import defaultdict
 
 import httpx
 
@@ -18,22 +26,18 @@ from .chat_db import IncomingMessage, fetch_new_messages
 logger = logging.getLogger("imessage_bridge.watcher.processor")
 _debug_logger = logging.getLogger("imessage_bridge.debug")
 
-_MAX_BACKOFF = 30.0
-_backoff = 0.0
-
-# Phone number to enable deep debug logging for
 _DEBUG_PHONE = "+61414187820"
+
+MAX_CONCURRENT_AGENTS = 20
+USER_QUEUE_TIMEOUT = 300.0
 
 
 def _dbg(phone: str, msg: str, *args: object) -> None:
-    """Print rich debug output only for the target phone number."""
     if phone != _DEBUG_PHONE:
         return
     formatted = msg % args if args else msg
     _debug_logger.info("🔍 %s", formatted)
 
-_SEND_COOLDOWN_SECONDS = 8.0
-_INTER_MESSAGE_DELAY = 1.0
 
 _JUNK_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^https?://\S+$"),
@@ -59,9 +63,6 @@ _CASUAL_WORDS = {
     "how are you", "how's it going", "what's up", "whats up",
 }
 
-# These look casual but are often confirmations for pending actions
-# (e.g. "yes" after "want me to send it?"). Route through agent so
-# the model can see conversation history and act on them.
 _NEVER_CASUAL = {
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "kk",
     "do it", "go ahead", "send", "send it", "go for it", "confirm",
@@ -100,11 +101,9 @@ def _pick_fallback_ack() -> str:
     return random.choice(_ACK_FALLBACKS)
 
 
-# ── User status cache (avoids hitting Supabase on every message) ──
+# ── User status cache ─────────────────────────────────────────
 
 class _UserCache:
-    """In-memory cache of imessage_users lookups. TTL-based."""
-
     def __init__(self, ttl: float = 60.0) -> None:
         self._cache: dict[str, dict] = {}
         self._timestamps: dict[str, float] = {}
@@ -129,50 +128,93 @@ class _UserCache:
         self._timestamps.pop(phone, None)
 
 
+# ── Processor ─────────────────────────────────────────────────
+
 class MessageProcessor:
-    """Watches for new iMessages and routes them based on user status."""
+    """Concurrent per-user message processor.
+
+    Architecture:
+      - on_chat_db_changed() reads new messages, groups by sender, and
+        dispatches each sender's batch as a separate asyncio.Task.
+      - Per-user asyncio.Lock ensures messages from the same sender are
+        processed sequentially (preserving conversation order).
+      - A global Semaphore caps concurrent agent HTTP calls.
+      - State (last_rowid, processed_guids) is protected by an asyncio.Lock.
+    """
 
     def __init__(self, config: Config, state: BridgeState) -> None:
         self.config = config
         self.state = state
         self._http = httpx.AsyncClient(timeout=180.0)
-        self._processing = False
-        self._last_send_time: float = 0.0
         self._user_cache = _UserCache(ttl=15.0)
 
+        self._user_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._agent_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AGENTS)
+        self._state_lock = asyncio.Lock()
+        self._active_tasks: set[asyncio.Task] = set()
+        self._last_response_ids: dict[str, str | None] = {}
+        self._fetching = False
+
     async def on_chat_db_changed(self) -> None:
-        global _backoff
-
-        if self._processing:
-            logger.debug("Already processing, skipping overlapping trigger")
+        if self._fetching:
             return
-
-        elapsed = time.monotonic() - self._last_send_time
-        if elapsed < _SEND_COOLDOWN_SECONDS:
-            logger.debug("Cooldown active (%.1fs ago), skipping FS event", elapsed)
-            return
-
-        self._processing = True
+        self._fetching = True
         try:
-            # Multi-user mode: fetch from all senders (target_phone=None)
             messages = fetch_new_messages(
                 chat_db_path=self.config.chat_db_path,
                 target_phone=None,
                 last_rowid=self.state.last_rowid,
             )
 
-            for i, msg in enumerate(messages):
+            to_process: list[IncomingMessage] = []
+            for msg in messages:
                 if msg.guid in self.state.processed_guids:
-                    self.state.last_rowid = max(self.state.last_rowid, msg.rowid)
+                    async with self._state_lock:
+                        self.state.last_rowid = max(self.state.last_rowid, msg.rowid)
                     continue
 
                 if _is_junk_message(msg.text):
                     logger.debug("Skipping junk [ROWID %d]: %s", msg.rowid, msg.text[:80])
+                    async with self._state_lock:
+                        self.state.last_rowid = msg.rowid
+                        self.state.processed_guids.add(msg.guid)
+                        self.state.save()
+                    continue
+
+                async with self._state_lock:
                     self.state.last_rowid = msg.rowid
                     self.state.processed_guids.add(msg.guid)
                     self.state.save()
-                    continue
 
+                to_process.append(msg)
+
+            if not to_process:
+                return
+
+            by_sender: dict[str, list[IncomingMessage]] = defaultdict(list)
+            for msg in to_process:
+                by_sender[msg.sender].append(msg)
+
+            logger.info(
+                "Dispatching %d message(s) from %d user(s) concurrently",
+                len(to_process), len(by_sender),
+            )
+
+            for sender, sender_msgs in by_sender.items():
+                task = asyncio.create_task(
+                    self._process_user_batch(sender, sender_msgs),
+                    name=f"user:{sender}",
+                )
+                self._active_tasks.add(task)
+                task.add_done_callback(self._active_tasks.discard)
+
+        finally:
+            self._fetching = False
+
+    async def _process_user_batch(self, sender: str, messages: list[IncomingMessage]) -> None:
+        """Process a batch of messages from a single sender, sequentially and under lock."""
+        async with self._user_locks[sender]:
+            for msg in messages:
                 logger.info(
                     "New iMessage [ROWID %d] from %s: %s",
                     msg.rowid, msg.sender, msg.text[:120],
@@ -184,50 +226,33 @@ class MessageProcessor:
                 _dbg(msg.sender, "  Text:  %s", msg.text)
                 _dbg(msg.sender, "-" * 70)
 
-                if i > 0:
-                    await asyncio.sleep(_INTER_MESSAGE_DELAY)
-
                 try:
-                    # Look up user status for this sender
-                    user_info = await self._get_user_info(msg.sender)
-
-                    _dbg(msg.sender, "👤 USER LOOKUP: %s",
-                         f"status={user_info['status']}, user_id={user_info.get('user_id', 'N/A')}, name={user_info.get('display_name', 'N/A')}"
-                         if user_info else "NOT FOUND (new user)")
-
-                    if user_info is None:
-                        _dbg(msg.sender, "🆕 Routing → _onboard_new_user()")
-                        # Brand new phone number — create entry and start onboarding
-                        await self._onboard_new_user(msg)
-                    elif user_info["status"] == "pending" or user_info["status"] == "onboarding":
-                        _dbg(msg.sender, "📋 Routing → _continue_onboarding()")
-                        # User hasn't completed signup, continue the conversation
-                        await self._continue_onboarding(msg, user_info)
-                    elif user_info["status"] == "active":
-                        _dbg(msg.sender, "✅ Routing → _process_active_user()")
-                        # Active user — normal conversation flow
-                        await self._process_active_user(msg, user_info)
-                    else:
-                        logger.warning("Unknown user status: %s", user_info["status"])
-
-                    _backoff = 0.0
+                    await self._route_message(msg)
                 except Exception:
-                    logger.exception("Failed to process message %s", msg.guid)
-                    _backoff = min(_backoff * 2 or 1.0, _MAX_BACKOFF)
-                    logger.info("Backing off %.1fs before next attempt", _backoff)
-                    await asyncio.sleep(_backoff)
-                    continue
+                    logger.exception("Failed to process message %s from %s", msg.guid, sender)
 
-                self.state.last_rowid = msg.rowid
-                self.state.processed_guids.add(msg.guid)
-                self.state.save()
-        finally:
-            self._processing = False
+    async def _route_message(self, msg: IncomingMessage) -> None:
+        user_info = await self._get_user_info(msg.sender)
+
+        _dbg(msg.sender, "👤 USER LOOKUP: %s",
+             f"status={user_info['status']}, user_id={user_info.get('user_id', 'N/A')}, name={user_info.get('display_name', 'N/A')}"
+             if user_info else "NOT FOUND (new user)")
+
+        if user_info is None:
+            _dbg(msg.sender, "🆕 Routing → _onboard_new_user()")
+            await self._onboard_new_user(msg)
+        elif user_info["status"] in ("pending", "onboarding"):
+            _dbg(msg.sender, "📋 Routing → _continue_onboarding()")
+            await self._continue_onboarding(msg, user_info)
+        elif user_info["status"] == "active":
+            _dbg(msg.sender, "✅ Routing → _process_active_user()")
+            await self._process_active_user(msg, user_info)
+        else:
+            logger.warning("Unknown user status: %s", user_info["status"])
 
     # ── User Lookup ───────────────────────────────────────────
 
     async def _get_user_info(self, phone: str) -> dict | None:
-        """Look up a phone number in imessage_users. Returns None if not found."""
         cached = self._user_cache.get(phone)
         if cached is not None:
             return cached if cached.get("_exists") else None
@@ -253,7 +278,6 @@ class MessageProcessor:
                     self._user_cache.set(phone, user)
                     return user
 
-            # Not found
             self._user_cache.set(phone, {"_exists": False})
             return None
         except Exception:
@@ -263,7 +287,6 @@ class MessageProcessor:
     # ── New User Onboarding ───────────────────────────────────
 
     async def _onboard_new_user(self, msg: IncomingMessage) -> None:
-        """Create a new imessage_users entry and start the conversational onboarding."""
         logger.info("New user detected: %s", msg.sender)
 
         try:
@@ -314,7 +337,6 @@ class MessageProcessor:
     # ── Continue Onboarding Conversation ─────────────────────
 
     async def _continue_onboarding(self, msg: IncomingMessage, user_info: dict) -> None:
-        """Continue the pre-signup conversation, or route to active if they signed up."""
         self._user_cache.invalidate(msg.sender)
         fresh_info = await self._get_user_info(msg.sender)
         if fresh_info and fresh_info.get("status") == "active" and fresh_info.get("user_id"):
@@ -335,7 +357,6 @@ class MessageProcessor:
 
     @staticmethod
     def _build_pdl_context(pdl_profile: dict | None) -> str | None:
-        """Convert a cached PDL profile dict into a context string for the LLM."""
         if not pdl_profile or not isinstance(pdl_profile, dict):
             return None
         lines: list[str] = []
@@ -412,7 +433,6 @@ class MessageProcessor:
         onboard_url: str,
         pdl_context: str | None = None,
     ) -> None:
-        """Call v2-onboard-chat and send the response."""
         try:
             payload: dict = {
                 "phone": msg.sender,
@@ -438,7 +458,6 @@ class MessageProcessor:
             if resp.status_code != 200:
                 logger.error("v2-onboard-chat returned %d: %s", resp.status_code, resp.text[:300])
                 await send_imessage(msg.sender, "Hey, something went wrong on my end. Text me again in a sec.")
-                self._last_send_time = time.monotonic()
                 return
 
             data = resp.json()
@@ -449,45 +468,14 @@ class MessageProcessor:
 
             logger.info("Onboard chat response (%d chars, count=%d): %s", len(response_text), message_count, response_text[:120])
             await send_imessage(msg.sender, response_text)
-            self._last_send_time = time.monotonic()
 
         except Exception:
             logger.exception("Failed to call v2-onboard-chat for %s", msg.sender)
             await send_imessage(msg.sender, "Hey, something went wrong on my end. Text me again in a sec.")
-            self._last_send_time = time.monotonic()
-
-    # ── Contextual Acknowledgments ──────────────────────────────
-
-    async def _generate_contextual_ack(self, message: str) -> str | None:
-        """Call v2-ack edge function for a contextual acknowledgment.
-        Returns None if the message is conversational and no ack is needed."""
-        try:
-            resp = await self._http.post(
-                self.config.v2_ack_url,
-                headers={
-                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"message": message},
-                timeout=4.0,
-            )
-
-            if resp.status_code == 200:
-                ack = resp.json().get("ack")
-                if ack and isinstance(ack, str) and len(ack) < 100:
-                    return ack.strip()
-                return None
-        except httpx.TimeoutException:
-            logger.debug("Ack edge function timed out")
-        except Exception:
-            logger.debug("Ack edge function failed", exc_info=True)
-
-        return None
 
     # ── Active User Processing ────────────────────────────────
 
     async def _process_active_user(self, msg: IncomingMessage, user_info: dict) -> None:
-        """Process a message from an active (authenticated) user."""
         user_id = user_info.get("user_id")
         if not user_id:
             logger.error("Active user %s has no user_id", msg.sender)
@@ -495,23 +483,21 @@ class MessageProcessor:
             return
 
         display_name = user_info.get("display_name")
-        is_casual = _is_casual(msg.text)
         _dbg(msg.sender, "⚙️  PROCESSING ACTIVE USER")
         _dbg(msg.sender, "  user_id:      %s", user_id)
         _dbg(msg.sender, "  display_name: %s", display_name or "(none)")
-        _dbg(msg.sender, "  is_casual:    %s", is_casual)
 
         agent_start = time.monotonic()
 
-        # No ack — let the agent respond directly without a two-phase feel
-        _dbg(msg.sender, "💬 Calling agent directly (no ack)")
-        response_text = await self._forward_to_agent(msg, user_id, display_name)
+        async with self._agent_semaphore:
+            _dbg(msg.sender, "💬 Calling agent (streaming)")
+            response_text = await self._forward_to_agent_streaming(msg, user_id, display_name)
 
         agent_elapsed = time.monotonic() - agent_start
         _dbg(msg.sender, "⏱ Agent round-trip: %.1fs", agent_elapsed)
 
         if response_text:
-            resp_id = self._last_response_id
+            resp_id = self._last_response_ids.get(msg.sender)
             if resp_id:
                 self.state.sent_message_ids.add(resp_id)
 
@@ -521,7 +507,6 @@ class MessageProcessor:
                 _dbg(msg.sender, "  ... (%d more chars)", len(response_text) - 500)
 
             sent = await send_imessage(msg.sender, response_text)
-            self._last_send_time = time.monotonic()
 
             if sent:
                 logger.info("Reply sent to %s via iMessage", msg.sender)
@@ -535,24 +520,18 @@ class MessageProcessor:
 
         _dbg(msg.sender, "=" * 70)
 
+    # ── Agent Communication ───────────────────────────────────
+
     async def _forward_to_agent(
         self, msg: IncomingMessage, user_id: str, display_name: str | None = None
     ) -> str | None:
-        """POST the message to the v2-chat-service edge function."""
-        self._last_response_id: str | None = None
+        self._last_response_ids[msg.sender] = None
 
-        body: dict = {
-            "user_id": user_id,
-            "message": msg.text,
-        }
+        body: dict = {"user_id": user_id, "message": msg.text}
         if display_name:
             body["user_name"] = display_name
 
         _dbg(msg.sender, "🌐 CALLING v2-chat-service")
-        _dbg(msg.sender, "  URL:     %s", self.config.v2_chat_service_url)
-        _dbg(msg.sender, "  Payload: user_id=%s, message='%s', user_name=%s",
-             user_id, msg.text[:100], display_name or "(none)")
-
         req_start = time.monotonic()
 
         resp = await self._http.post(
@@ -567,49 +546,174 @@ class MessageProcessor:
         req_elapsed = time.monotonic() - req_start
 
         if resp.status_code != 200:
-            logger.error(
-                "Edge function returned %d: %s",
-                resp.status_code, resp.text[:500],
-            )
+            logger.error("Edge function returned %d: %s", resp.status_code, resp.text[:500])
             _dbg(msg.sender, "❌ Edge function returned HTTP %d (%.1fs)", resp.status_code, req_elapsed)
-            _dbg(msg.sender, "  Body: %s", resp.text[:500])
             raise RuntimeError(f"v2-chat-service error: {resp.status_code}")
-
-        data = resp.json()
-        response_text = data.get("response", "")
-        self._last_response_id = data.get("response_id")
-        debug_info = data.get("_debug")
 
         _dbg(msg.sender, "🌐 RESPONSE received (HTTP %d, %.1fs)", resp.status_code, req_elapsed)
 
-        if debug_info:
-            _dbg(msg.sender, "-" * 50)
-            _dbg(msg.sender, "🧠 ORCHESTRATION DEBUG:")
-            _dbg(msg.sender, "  Source:  %s", debug_info.get("source"))
-            _dbg(msg.sender, "  Path:    %s", debug_info.get("path"))
+        response_text: str | None = None
+        content_type = resp.headers.get("content-type", "")
 
-            tools_used = debug_info.get("tools_used", [])
-            if tools_used:
-                _dbg(msg.sender, "  Tools:   %s", ", ".join(tools_used))
-            else:
-                _dbg(msg.sender, "  Tools:   (none)")
-
-            timing = debug_info.get("timing", {})
-            _dbg(msg.sender, "-" * 50)
-            _dbg(msg.sender, "⏱ TIMING:")
-            _dbg(msg.sender, "  Context:       %dms", timing.get("context_ms", 0))
-            _dbg(msg.sender, "  Agent:         %dms", timing.get("agent_ms", 0))
-            _dbg(msg.sender, "  Orchestrator:  %dms", timing.get("orchestrator_latency_ms", 0))
-            _dbg(msg.sender, "  Total:         %dms", timing.get("total_ms", 0))
-            _dbg(msg.sender, "-" * 50)
+        if "ndjson" in content_type:
+            for line in resp.text.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "ack":
+                    ack_text = event.get("text", "")
+                    if ack_text:
+                        _dbg(msg.sender, "⚡ ACK (legacy path): \"%s\"", ack_text)
+                        await send_imessage(msg.sender, ack_text)
+                elif event.get("type") == "response":
+                    response_text = event.get("response", "")
+                    self._last_response_ids[msg.sender] = event.get("response_id")
+                    debug_info = event.get("_debug")
+                    if debug_info:
+                        self._log_debug_info(msg.sender, debug_info)
+        else:
+            data = resp.json()
+            response_text = data.get("response", "")
+            self._last_response_ids[msg.sender] = data.get("response_id")
+            debug_info = data.get("_debug")
+            if debug_info:
+                self._log_debug_info(msg.sender, debug_info)
 
         if not response_text:
             logger.debug("Empty response from agent")
-            _dbg(msg.sender, "⚠️ Empty response text from agent")
             return None
 
         logger.info("Agent response (%d chars): %s", len(response_text), response_text[:120])
         return response_text
 
+    async def _forward_to_agent_streaming(
+        self, msg: IncomingMessage, user_id: str, display_name: str | None = None
+    ) -> str | None:
+        """POST to v2-chat-service and handle NDJSON streaming.
+
+        Streams ack immediately, returns full response text.
+        Falls back to standard JSON if the response isn't NDJSON.
+        """
+        self._last_response_ids[msg.sender] = None
+
+        body: dict = {"user_id": user_id, "message": msg.text}
+        if display_name:
+            body["user_name"] = display_name
+
+        _dbg(msg.sender, "🌐 CALLING v2-chat-service (streaming)")
+        _dbg(msg.sender, "  URL:     %s", self.config.v2_chat_service_url)
+        _dbg(msg.sender, "  Payload: user_id=%s, message='%s', user_name=%s",
+             user_id, msg.text[:100], display_name or "(none)")
+
+        req_start = time.monotonic()
+        response_text: str | None = None
+
+        try:
+            async with self._http.stream(
+                "POST",
+                self.config.v2_chat_service_url,
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            ) as stream:
+                if stream.status_code != 200:
+                    body_text = ""
+                    async for chunk in stream.aiter_text():
+                        body_text += chunk
+                    _dbg(msg.sender, "❌ Edge function returned HTTP %d (%.1fs)", stream.status_code, time.monotonic() - req_start)
+                    raise RuntimeError(f"v2-chat-service error: {stream.status_code}")
+
+                content_type = stream.headers.get("content-type", "")
+                is_ndjson = "ndjson" in content_type
+
+                if is_ndjson:
+                    buffer = ""
+                    async for chunk in stream.aiter_text():
+                        buffer += chunk
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                logger.warning("Bad NDJSON line: %s", line[:200])
+                                continue
+
+                            event_type = event.get("type")
+
+                            if event_type == "ack":
+                                ack_text = event.get("text", "")
+                                if ack_text:
+                                    _dbg(msg.sender, "⚡ ACK received: \"%s\" (%.1fs)", ack_text, time.monotonic() - req_start)
+                                    await send_imessage(msg.sender, ack_text)
+
+                            elif event_type == "response":
+                                response_text = event.get("response", "")
+                                self._last_response_ids[msg.sender] = event.get("response_id")
+                                debug_info = event.get("_debug")
+                                if debug_info:
+                                    self._log_debug_info(msg.sender, debug_info)
+
+                            elif event_type == "error":
+                                logger.error("Stream error from service: %s", event.get("error"))
+                else:
+                    full_body = ""
+                    async for chunk in stream.aiter_text():
+                        full_body += chunk
+                    data = json.loads(full_body)
+                    response_text = data.get("response", "")
+                    self._last_response_ids[msg.sender] = data.get("response_id")
+                    debug_info = data.get("_debug")
+                    if debug_info:
+                        self._log_debug_info(msg.sender, debug_info)
+
+        except httpx.TimeoutException:
+            logger.error("v2-chat-service timed out for %s", msg.sender)
+            _dbg(msg.sender, "❌ v2-chat-service TIMED OUT (%.1fs)", time.monotonic() - req_start)
+            raise RuntimeError("v2-chat-service timeout")
+
+        req_elapsed = time.monotonic() - req_start
+        _dbg(msg.sender, "🌐 RESPONSE complete (%.1fs)", req_elapsed)
+
+        if not response_text:
+            logger.debug("Empty response from agent")
+            return None
+
+        logger.info("Agent response (%d chars): %s", len(response_text), response_text[:120])
+        return response_text
+
+    def _log_debug_info(self, phone: str, debug_info: dict) -> None:
+        _dbg(phone, "-" * 50)
+        _dbg(phone, "🧠 ORCHESTRATION DEBUG:")
+        _dbg(phone, "  Source:  %s", debug_info.get("source"))
+        _dbg(phone, "  Path:    %s", debug_info.get("path"))
+
+        tools_used = debug_info.get("tools_used", [])
+        if tools_used:
+            _dbg(phone, "  Tools:   %s", ", ".join(tools_used))
+        else:
+            _dbg(phone, "  Tools:   (none)")
+
+        timing = debug_info.get("timing", {})
+        _dbg(phone, "-" * 50)
+        _dbg(phone, "⏱ TIMING:")
+        _dbg(phone, "  Context:       %dms", timing.get("context_ms", 0))
+        _dbg(phone, "  Agent:         %dms", timing.get("agent_ms", 0))
+        _dbg(phone, "  Orchestrator:  %dms", timing.get("orchestrator_latency_ms", 0))
+        _dbg(phone, "  Total:         %dms", timing.get("total_ms", 0))
+        _dbg(phone, "-" * 50)
+
     async def close(self) -> None:
+        for task in self._active_tasks:
+            task.cancel()
+        if self._active_tasks:
+            await asyncio.gather(*self._active_tasks, return_exceptions=True)
         await self._http.aclose()

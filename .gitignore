@@ -1,0 +1,7 @@
+.DS_Store
+*.profraw
+.env
+.venv/
+node_modules/
+__pycache__/
+*.pyc

@@ -23,25 +23,10 @@ REQUEST_TIMEOUT = 30.0
 
 # Drip sequence: (step, delay_minutes, message_template)
 # {{URL}} is replaced with the user's onboard URL at send time.
+# Single follow-up only — don't spam users who haven't signed up.
 _DRIP_SEQUENCE: list[tuple[int, int, str]] = [
     (1, 10,
-     "still here\njust need your Google account to get started\n\n{{URL}}"),
-    (2, 60,
-     "your calendar just happened and I wasn't there for it\n"
-     "one tap and I'll have tomorrow sorted\n\n{{URL}}"),
-    (3, 240,
-     "not to be dramatic but there are meetings happening right now"
-     " that I could've prepped you for\n\n{{URL}}"),
-    (4, 1440,
-     "day two of knowing you exist but not being able to help\n"
-     "this is what purgatory feels like\n\n{{URL}}"),
-    (5, 2880,
-     "most people who ghost me end up coming back\n"
-     "I don't take it personally\n\n{{URL}}"),
-    (6, 5760,
-     "alright last message from me\nif you ever want someone who reads"
-     " all your emails, remembers every meeting, and never calls in sick,"
-     " you know where I am\n\n{{URL}}"),
+     "still here when you're ready to verify you're human\n\n{{URL}}"),
 ]
 
 
@@ -62,6 +47,11 @@ class TriggerChecker:
                 await self._check_triggers()
             except Exception:
                 logger.exception("Trigger check failed")
+
+            try:
+                await self._check_cron_reminders()
+            except Exception:
+                logger.exception("Cron reminder check failed")
 
             try:
                 await self._check_onboard_drips()
@@ -167,6 +157,85 @@ class TriggerChecker:
         except Exception:
             logger.exception("Trigger check failed for user %s", user_id[:8])
 
+    # ── Cron reminder delivery ─────────────────────────────
+
+    async def _check_cron_reminders(self) -> None:
+        """Poll v2-trigger for due cron reminders and deliver via iMessage."""
+        url = f"{self.config.supabase_url}/functions/v1/v2-trigger"
+
+        try:
+            resp = await self._http.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"action": "check_cron_reminders"},
+            )
+
+            if resp.status_code != 200:
+                logger.warning(
+                    "v2-trigger cron reminders returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return
+
+            data = resp.json()
+            messages = data.get("messages", [])
+
+            if not messages:
+                return
+
+            logger.info("Cron reminders: %d message(s) to deliver", len(messages))
+
+            # Look up phone numbers for each user
+            for item in messages:
+                user_id = item.get("user_id")
+                message = item.get("message")
+                if not user_id or not message:
+                    continue
+
+                phone = await self._get_user_phone(user_id)
+                if not phone:
+                    logger.warning("No phone for user %s, skipping reminder", user_id[:8])
+                    continue
+
+                sent = await send_imessage(phone, message)
+                if sent:
+                    logger.info("Reminder sent to %s: %s", phone, message[:60])
+                else:
+                    logger.error("Failed to send reminder to %s", phone)
+                await asyncio.sleep(2.0)
+
+        except httpx.TimeoutException:
+            logger.warning("v2-trigger cron reminder request timed out")
+        except Exception:
+            logger.exception("Cron reminder check failed")
+
+    async def _get_user_phone(self, user_id: str) -> str | None:
+        """Look up a user's phone number from imessage_users."""
+        try:
+            resp = await self._http.get(
+                f"{self.config.supabase_url}/rest/v1/imessage_users",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "status": "eq.active",
+                    "select": "phone_number",
+                    "limit": "1",
+                },
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "apikey": self.config.supabase_service_role_key,
+                },
+            )
+            if resp.status_code == 200:
+                rows = resp.json()
+                if rows:
+                    return rows[0].get("phone_number")
+        except Exception:
+            logger.exception("Failed to look up phone for user %s", user_id[:8])
+        return None
+
     # ── Onboarding drip sequence ────────────────────────────
 
     async def _check_onboard_drips(self) -> None:
@@ -232,7 +301,7 @@ class TriggerChecker:
                 f"{self.config.supabase_url}/rest/v1/imessage_users",
                 params={
                     "status": "in.(pending,onboarding)",
-                    "drip_step": "lt.6",
+                    "drip_step": "lt.1",
                     "select": "phone_number,onboarding_token,onboard_count,drip_step,last_drip_at,updated_at",
                 },
                 headers={

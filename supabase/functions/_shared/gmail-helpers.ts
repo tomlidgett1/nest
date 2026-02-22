@@ -98,6 +98,102 @@ export async function getAccessTokenForAccount(
   return result.token;
 }
 
+// ── Multi-account helpers ────────────────────────────────────
+
+export interface AccountToken {
+  accountId: string;
+  email: string;
+  accessToken: string;
+  isPrimary: boolean;
+}
+
+/**
+ * Get fresh access tokens for ALL linked Google accounts.
+ * Uses Promise.allSettled so one failed account doesn't block the rest.
+ * Falls back to legacy single-token table if no multi-account rows exist.
+ */
+export async function getAllAccountTokens(
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<AccountToken[]> {
+  const { data: accounts } = await supabase
+    .from("user_google_accounts")
+    .select("id, google_email, refresh_token, is_primary")
+    .eq("user_id", userId)
+    .order("is_primary", { ascending: false });
+
+  if (!accounts?.length) {
+    const token = await getGoogleAccessToken(supabase, userId);
+    return [{ accountId: "legacy", email: "primary", accessToken: token, isPrimary: true }];
+  }
+
+  const results = await Promise.allSettled(
+    accounts.map(async (acct) => {
+      const result = await refreshAccessToken(acct.refresh_token);
+      if (result._newRefreshToken && result._newRefreshToken !== acct.refresh_token) {
+        await supabase
+          .from("user_google_accounts")
+          .update({ refresh_token: result._newRefreshToken })
+          .eq("id", acct.id);
+      }
+      return {
+        accountId: acct.id,
+        email: acct.google_email,
+        accessToken: result.token,
+        isPrimary: !!acct.is_primary,
+      } as AccountToken;
+    }),
+  );
+
+  const tokens = results
+    .filter((r): r is PromiseFulfilledResult<AccountToken> => r.status === "fulfilled")
+    .map((r) => r.value);
+
+  for (const r of results) {
+    if (r.status === "rejected") {
+      console.warn(`[gmail-helpers] Token refresh failed for one account: ${(r.reason as Error).message}`);
+    }
+  }
+
+  if (tokens.length === 0) {
+    throw new Error(`All Google account token refreshes failed for user ${userId}`);
+  }
+
+  return tokens;
+}
+
+/**
+ * Get a fresh access token for a specific Google account by email.
+ * Falls back to primary if the requested email isn't found.
+ */
+export async function getTokenForEmail(
+  supabase: SupabaseClient,
+  userId: string,
+  accountEmail: string,
+): Promise<{ accessToken: string; email: string }> {
+  const { data: acct } = await supabase
+    .from("user_google_accounts")
+    .select("id, google_email, refresh_token")
+    .eq("user_id", userId)
+    .eq("google_email", accountEmail)
+    .maybeSingle();
+
+  if (acct?.refresh_token) {
+    const result = await refreshAccessToken(acct.refresh_token);
+    if (result._newRefreshToken && result._newRefreshToken !== acct.refresh_token) {
+      await supabase
+        .from("user_google_accounts")
+        .update({ refresh_token: result._newRefreshToken })
+        .eq("id", acct.id);
+    }
+    return { accessToken: result.token, email: acct.google_email };
+  }
+
+  console.warn(`[gmail-helpers] Account ${accountEmail} not found for user ${userId}, falling back to primary`);
+  const token = await getGoogleAccessToken(supabase, userId);
+  return { accessToken: token, email: accountEmail };
+}
+
 /**
  * Exchange a refresh token for a fresh access token.
  * Low-level helper — callers decide where the refresh token comes from.
@@ -355,7 +451,45 @@ function countAttachments(payload: any): number {
   return count;
 }
 
+// ── Google Calendar timezone ─────────────────────────────────
+
+const CALENDAR_SETTINGS_API = "https://www.googleapis.com/calendar/v3/users/me/settings/timezone";
+
+/**
+ * Fetch the user's timezone from Google Calendar settings.
+ * Returns an IANA timezone string (e.g. "Australia/Melbourne") or null on failure.
+ */
+export async function fetchCalendarTimezone(accessToken: string): Promise<string | null> {
+  try {
+    const resp = await fetch(CALENDAR_SETTINGS_API, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!resp.ok) {
+      console.warn(`[gmail-helpers] Calendar timezone fetch failed (${resp.status})`);
+      return null;
+    }
+    const data = await resp.json();
+    const tz = data.value as string | undefined;
+    if (tz && tz.includes("/")) {
+      console.log(`[gmail-helpers] Calendar timezone: ${tz}`);
+      return tz;
+    }
+    return null;
+  } catch (e) {
+    console.warn("[gmail-helpers] Calendar timezone fetch error:", (e as Error).message);
+    return null;
+  }
+}
+
 // ── Raw email encoding (RFC 2822 compliant) ─────────────────
+
+function plainTextToHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>\n");
+}
 
 function createRawEmail(
   to: string[],
@@ -364,6 +498,10 @@ function createRawEmail(
   cc?: string[],
   bcc?: string[],
 ): string {
+  const htmlBody = body.includes("<br") || body.includes("<p") || body.includes("<div")
+    ? body
+    : plainTextToHtml(body);
+
   const headers: string[] = [
     "MIME-Version: 1.0",
     `To: ${to.join(", ")}`,
@@ -375,13 +513,17 @@ function createRawEmail(
   headers.push("Content-Transfer-Encoding: base64");
   headers.push("");
 
-  const bodyBase64 = btoa(unescape(encodeURIComponent(body)));
+  const bodyBase64 = btoa(unescape(encodeURIComponent(htmlBody)));
   headers.push(bodyBase64);
 
   return base64UrlEncode(headers.join("\r\n"));
 }
 
 function createRawReply(body: string): string {
+  const htmlBody = body.includes("<br") || body.includes("<p") || body.includes("<div")
+    ? body
+    : plainTextToHtml(body);
+
   const headers: string[] = [
     "MIME-Version: 1.0",
     "Content-Type: text/html; charset=utf-8",
@@ -389,7 +531,7 @@ function createRawReply(body: string): string {
     "",
   ];
 
-  const bodyBase64 = btoa(unescape(encodeURIComponent(body)));
+  const bodyBase64 = btoa(unescape(encodeURIComponent(htmlBody)));
   headers.push(bodyBase64);
 
   return base64UrlEncode(headers.join("\r\n"));

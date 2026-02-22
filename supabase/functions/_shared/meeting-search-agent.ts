@@ -14,7 +14,7 @@ not the user directly.
 ## How to work
 1. Start with semantic_search to find relevant pieces
 2. If you need the full picture, pull the transcript or notes from your best matches
-3. When a question spans multiple meetings, synthesise across them — don't just 
+3. When a question spans multiple meetings, synthesise across them, don't just 
    list results. Connect the dots.
 4. Always note which meeting(s) the info came from (title + roughly when)
 
