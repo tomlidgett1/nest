@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard'
 import AddAccountCallback from './pages/AddAccountCallback'
 import Privacy from './pages/Privacy'
 import Terms from './pages/Terms'
+import QA from './pages/QA'
 
 export default function App() {
   const location = useLocation()
@@ -19,6 +20,7 @@ export default function App() {
         <Route path="/add-account-callback" element={<AddAccountCallback />} />
         <Route path="/privacy" element={<Privacy />} />
         <Route path="/terms" element={<Terms />} />
+        <Route path="/qa" element={<QA />} />
       </Routes>
     </AnimatePresence>
   )

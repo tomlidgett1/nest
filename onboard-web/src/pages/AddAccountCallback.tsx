@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'motion/react'
 import { supabase } from '../lib/supabase'
 
@@ -50,11 +50,16 @@ function AnimatedCheck() {
 
 export default function AddAccountCallback() {
   const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
+  const hasProcessed = useRef(false)
   const [status, setStatus] = useState<Status>('loading')
   const [errorMessage, setErrorMessage] = useState('')
 
   useEffect(() => {
+    if (hasProcessed.current) return
+    hasProcessed.current = true
+
+    const params = new URLSearchParams(window.location.search)
+    const code = params.get('code')
     let cancelled = false
 
     async function linkAccount() {
@@ -68,12 +73,16 @@ export default function AddAccountCallback() {
           return
         }
 
-        const code = searchParams.get('code')
         let newSession = null
 
         if (code) {
           const { data, error } = await supabase.auth.exchangeCodeForSession(code)
           if (error) {
+            if (error.message.includes('PKCE code verifier not found')) {
+              setStatus('error')
+              setErrorMessage('Account linking session expired. Please start again from the dashboard in the same browser tab.')
+              return
+            }
             setStatus('error')
             setErrorMessage(error.message)
             return
@@ -148,7 +157,7 @@ export default function AddAccountCallback() {
 
     linkAccount()
     return () => { cancelled = true }
-  }, [searchParams, navigate])
+  }, [navigate])
 
   return (
     <motion.div
