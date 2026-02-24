@@ -1,146 +1,85 @@
-import { Link } from 'react-router-dom'
 import { motion } from 'motion/react'
+import { Link } from 'react-router-dom'
 
-const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
+const sections = [
+  {
+    title: '1. Acceptance of terms',
+    body: ['By using Nest, you agree to these terms. If you do not agree, do not use the service.'],
+  },
+  {
+    title: '2. Service description',
+    body: [
+      'Nest is an AI assistant available through iMessage. It connects to Gmail, Calendar, and Contacts to help complete tasks through natural conversation.',
+    ],
+  },
+  {
+    title: '3. Eligibility',
+    body: ['You must be at least 13 years old and legally able to accept these terms.'],
+  },
+  {
+    title: '4. Account responsibility',
+    body: [
+      'You are responsible for activity on your connected accounts and for protecting account access.',
+    ],
+  },
+  {
+    title: '5. AI-generated actions',
+    body: [
+      'Nest uses AI to interpret requests and perform actions. You are responsible for reviewing important actions and communications.',
+    ],
+  },
+  {
+    title: '6. Liability',
+    body: [
+      'The service is provided as-is. To the maximum extent allowed by law, Nest is not liable for indirect or consequential losses.',
+    ],
+  },
+  {
+    title: '7. Contact',
+    body: ['For questions about these terms, contact tlidgett@icloud.com.'],
+  },
+]
 
 export default function Terms() {
   return (
     <motion.div
-      className="page"
+      className="min-h-screen bg-[#FAFAFA] font-sans selection:bg-gray-200 pb-20"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.3 }}
+      transition={{ duration: 0.25 }}
     >
-      <header className="top-bar">
-        <Link to="/" aria-label="Back to home">
-          <img src="/nest-logo.png" alt="Nest" className="top-bar-logo" />
-        </Link>
-        <div style={{ width: 34 }} />
+      <header className="sticky top-0 z-50 bg-[#FAFAFA]/80 backdrop-blur-md border-b border-gray-200/50">
+        <div className="mx-auto max-w-3xl px-6 py-4 flex items-center justify-between">
+          <Link to="/" className="flex items-center gap-3">
+            <img src="/nest-logo.png" alt="Nest" className="h-8 w-8 rounded-[10px] shadow-sm" />
+            <span className="text-lg font-semibold tracking-tight text-gray-900">Nest</span>
+          </Link>
+          <Link to="/" className="rounded-full border border-gray-200 bg-white px-4 py-1.5 text-sm font-medium text-gray-700 shadow-sm hover:bg-gray-50 transition-colors">
+            Back
+          </Link>
+        </div>
       </header>
 
-      <motion.main
-        className="legal-page"
-        initial={{ opacity: 0, y: 12 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ ...spring, delay: 0.1 }}
-      >
-        <h1>Terms of Service</h1>
-        <p className="legal-updated">Last updated: 18 February 2026</p>
+      <main className="mx-auto max-w-3xl px-6 pt-12 md:pt-16 pb-12">
+        <h1 className="text-3xl font-bold tracking-tight text-gray-900 mb-2">Terms of Service</h1>
+        <p className="text-sm text-gray-500 mb-10">Last updated: 18 February 2026</p>
 
-        <section>
-          <h2>1. Acceptance of Terms</h2>
-          <p>
-            By accessing or using Nest (the "Service"), you agree to be bound by these Terms of Service ("Terms"). If you do not agree to these Terms, you may not use the Service.
-          </p>
-        </section>
-
-        <section>
-          <h2>2. Description of Service</h2>
-          <p>
-            Nest is an AI-powered productivity assistant accessible via iMessage. The Service connects to your Google account (Gmail, Calendar, Contacts) to help you manage emails, schedule meetings, and handle tasks through natural conversation.
-          </p>
-        </section>
-
-        <section>
-          <h2>3. Eligibility</h2>
-          <p>
-            You must be at least 13 years of age to use the Service. By using the Service, you represent and warrant that you meet this requirement and have the legal capacity to enter into these Terms.
-          </p>
-        </section>
-
-        <section>
-          <h2>4. Account Registration</h2>
-          <p>
-            To use the Service, you must authenticate with a Google account. You are responsible for maintaining the security of your account and for all activities that occur under your account. You agree to notify us immediately of any unauthorised use.
-          </p>
-        </section>
-
-        <section>
-          <h2>5. Permitted Use</h2>
-          <p>You agree to use the Service only for lawful purposes and in accordance with these Terms. You agree not to:</p>
-          <ul>
-            <li>Use the Service for any illegal or unauthorised purpose</li>
-            <li>Attempt to gain unauthorised access to any part of the Service</li>
-            <li>Interfere with or disrupt the Service or its infrastructure</li>
-            <li>Use the Service to send spam, phishing messages, or other unsolicited communications</li>
-            <li>Reverse-engineer, decompile, or disassemble any part of the Service</li>
-            <li>Use the Service in a manner that could damage, disable, or impair the Service</li>
-          </ul>
-        </section>
-
-        <section>
-          <h2>6. Google Account Access</h2>
-          <p>
-            By connecting your Google account, you grant Nest permission to access and interact with your Gmail, Google Calendar, and Google Contacts on your behalf, solely to fulfil your requests. You may revoke this access at any time through your Google account settings or by removing your account from Nest.
-          </p>
-        </section>
-
-        <section>
-          <h2>7. AI-Generated Actions</h2>
-          <p>
-            Nest uses artificial intelligence to interpret your requests and take actions on your behalf (such as sending emails or scheduling events). While we strive for accuracy, AI-generated actions may occasionally be incorrect or incomplete. You acknowledge that:
-          </p>
-          <ul>
-            <li>You are responsible for reviewing actions taken by Nest on your behalf</li>
-            <li>Nest is not liable for any consequences arising from AI-generated actions</li>
-            <li>You should verify important communications before they are sent</li>
-          </ul>
-        </section>
-
-        <section>
-          <h2>8. Intellectual Property</h2>
-          <p>
-            The Service, including its design, features, and content, is owned by Nest and is protected by intellectual property laws. You are granted a limited, non-exclusive, non-transferable licence to use the Service for personal, non-commercial purposes.
-          </p>
-        </section>
-
-        <section>
-          <h2>9. Limitation of Liability</h2>
-          <p>
-            To the maximum extent permitted by law, Nest and its operators shall not be liable for any indirect, incidental, special, consequential, or punitive damages, including but not limited to loss of data, revenue, or business opportunities, arising from your use of the Service.
-          </p>
-          <p>
-            The Service is provided "as is" and "as available" without warranties of any kind, either express or implied, including but not limited to implied warranties of merchantability, fitness for a particular purpose, and non-infringement.
-          </p>
-        </section>
-
-        <section>
-          <h2>10. Indemnification</h2>
-          <p>
-            You agree to indemnify and hold harmless Nest and its operators from any claims, damages, losses, or expenses (including legal fees) arising from your use of the Service or violation of these Terms.
-          </p>
-        </section>
-
-        <section>
-          <h2>11. Termination</h2>
-          <p>
-            We may suspend or terminate your access to the Service at any time, with or without cause, with or without notice. Upon termination, your right to use the Service will immediately cease. You may also terminate your account at any time by contacting us.
-          </p>
-        </section>
-
-        <section>
-          <h2>12. Changes to Terms</h2>
-          <p>
-            We reserve the right to modify these Terms at any time. We will notify you of material changes by posting the updated Terms on this page. Your continued use of the Service after changes are posted constitutes acceptance of the revised Terms.
-          </p>
-        </section>
-
-        <section>
-          <h2>13. Governing Law</h2>
-          <p>
-            These Terms shall be governed by and construed in accordance with the laws of Australia, without regard to its conflict of law provisions.
-          </p>
-        </section>
-
-        <section>
-          <h2>14. Contact Us</h2>
-          <p>
-            If you have any questions about these Terms, please contact us at:
-          </p>
-          <p><strong>nestchatapp123@gmail.com</strong></p>
-        </section>
-      </motion.main>
+        <div className="space-y-8">
+          {sections.map((section) => (
+            <section key={section.title}>
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">{section.title}</h2>
+              <div className="space-y-3">
+                {section.body.map((paragraph) => (
+                  <p key={paragraph} className="text-gray-600 leading-relaxed">
+                    {paragraph}
+                  </p>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      </main>
     </motion.div>
   )
 }

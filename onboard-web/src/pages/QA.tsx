@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   fetchUsers,
   sendMessageMulti,
+  sendMessageSingle,
   saveFeedback,
   loadFeedback,
   deleteFeedback,
@@ -13,7 +14,7 @@ import {
   type AgentResponse,
 } from '../lib/qa-api'
 
-// ── Bubble splitter — each \n = separate iMessage bubble ─────
+type QAMode = 'comparison' | 'conversation'
 
 function splitIntoBubbles(text: string): string[] {
   return text
@@ -23,6 +24,7 @@ function splitIntoBubbles(text: string): string[] {
 }
 
 export default function QA() {
+  const [mode, setMode] = useState<QAMode>('conversation')
   const [users, setUsers] = useState<QAUser[]>([])
   const [selectedUserId, setSelectedUserId] = useState<string>('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -39,11 +41,17 @@ export default function QA() {
   } | null>(null)
   const [noteText, setNoteText] = useState('')
 
-  // Multi-response state: after sending, we show N variants to pick from
+  // Comparison mode state
   const [pendingVariants, setPendingVariants] = useState<{
     query: string
     variants: AgentResponse[]
   } | null>(null)
+
+  // Conversation mode state — highlighted messages for feedback
+  const [highlightedIds, setHighlightedIds] = useState<Set<string>>(new Set())
+  const [convFeedbackModal, setConvFeedbackModal] = useState(false)
+  const [convFeedbackNote, setConvFeedbackNote] = useState('')
+  const [convFeedbackRating, setConvFeedbackRating] = useState<'good' | 'bad'>('bad')
 
   const chatEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -82,9 +90,9 @@ export default function QA() {
     return map
   }
 
-  // ── Send: fires 3 parallel requests ────────────────────────
+  // ── Send: Comparison mode (3 variants) ──────────────────────
 
-  async function handleSend() {
+  async function handleSendComparison() {
     if (!input.trim() || !selectedUserId || sending) return
 
     const userMsg: ChatMessage = {
@@ -107,7 +115,6 @@ export default function QA() {
         ])
       })
 
-      // Remove ack messages
       setMessages((prev) => prev.filter((m) => m.role !== 'ack'))
 
       if (variants.length === 0) {
@@ -117,7 +124,6 @@ export default function QA() {
         ])
       } else {
         setPendingVariants({ query, variants })
-        // Auto-select first variant's debug
         setSelectedMsgId(variants[0].id)
       }
     } catch (e) {
@@ -131,7 +137,60 @@ export default function QA() {
     }
   }
 
-  // ── Pick a variant ─────────────────────────────────────────
+  // ── Send: Conversation mode (single response) ──────────────
+
+  async function handleSendConversation() {
+    if (!input.trim() || !selectedUserId || sending) return
+
+    const userMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: input.trim(),
+      timestamp: new Date().toISOString(),
+    }
+    setMessages((prev) => [...prev, userMsg])
+    setInput('')
+    setSending(true)
+
+    try {
+      const result = await sendMessageSingle(selectedUserId, input.trim(), (ackText) => {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: 'ack', content: ackText, timestamp: new Date().toISOString() },
+        ])
+      })
+
+      setMessages((prev) => {
+        const withoutAcks = prev.filter((m) => m.role !== 'ack')
+        return [
+          ...withoutAcks,
+          {
+            id: result.id,
+            role: 'assistant' as const,
+            content: result.response,
+            responseId: result.responseId,
+            debug: result.debug,
+            timestamp: new Date().toISOString(),
+          },
+        ]
+      })
+    } catch (e) {
+      setMessages((prev) => [
+        ...prev.filter((m) => m.role !== 'ack'),
+        { id: crypto.randomUUID(), role: 'assistant', content: `Error: ${(e as Error).message}`, timestamp: new Date().toISOString() },
+      ])
+    } finally {
+      setSending(false)
+      inputRef.current?.focus()
+    }
+  }
+
+  function handleSend() {
+    if (mode === 'comparison') handleSendComparison()
+    else handleSendConversation()
+  }
+
+  // ── Comparison: pick a variant ──────────────────────────────
 
   function handlePickVariant(variant: AgentResponse, rating: 'good' | 'bad') {
     if (!pendingVariants) return
@@ -144,7 +203,7 @@ export default function QA() {
     setNoteText('')
   }
 
-  async function submitFeedback() {
+  async function submitComparisonFeedback() {
     if (!noteModal) return
     const chosen = (pendingVariants ?? noteModal).variants.find((v) => v.id === noteModal.variantId)
     if (!chosen) return
@@ -162,7 +221,6 @@ export default function QA() {
         chosen_variant: chosen.id,
       })
 
-      // Commit the chosen variant into the chat
       const assistantMsg: ChatMessage = {
         id: chosen.id,
         role: 'assistant',
@@ -181,11 +239,84 @@ export default function QA() {
     }
   }
 
+  // ── Conversation: toggle highlight on a message ─────────────
+
+  function toggleHighlight(msgId: string) {
+    setHighlightedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(msgId)) next.delete(msgId)
+      else next.add(msgId)
+      return next
+    })
+  }
+
+  // ── Conversation: submit feedback for highlighted chain ─────
+
+  async function submitConversationFeedback() {
+    if (highlightedIds.size === 0) return
+
+    const highlighted = messages.filter((m) => highlightedIds.has(m.id))
+    const allToolsCalled = highlighted
+      .filter((m) => m.debug?.tools_used)
+      .flatMap((m) => m.debug!.tools_used)
+    const uniqueTools = [...new Set(allToolsCalled)]
+
+    const allDebug = highlighted
+      .filter((m) => m.debug)
+      .map((m) => m.debug!)
+
+    const configSummary: Record<string, unknown> = {
+      user_id: selectedUserId,
+      user_email: selectedUser?.google_email ?? 'unknown',
+      mode: 'conversation',
+      message_count: messages.length,
+      highlighted_count: highlighted.length,
+      debug_entries: allDebug,
+    }
+
+    const queryParts = highlighted.filter((m) => m.role === 'user').map((m) => m.content)
+    const responseParts = highlighted.filter((m) => m.role === 'assistant').map((m) => m.content)
+
+    try {
+      await saveFeedback({
+        user_id: selectedUserId,
+        query: queryParts.join(' | ') || '(no user messages highlighted)',
+        response: responseParts.join(' | ') || '(no assistant messages highlighted)',
+        rating: convFeedbackRating,
+        note: convFeedbackNote || undefined,
+        debug_json: allDebug.length > 0 ? allDebug[0] : null,
+        conversation_json: {
+          mode: 'conversation',
+          highlighted_messages: highlighted,
+          full_conversation: messages,
+          tools_called: uniqueTools,
+          config: configSummary,
+        },
+      })
+
+      setConvFeedbackModal(false)
+      setConvFeedbackNote('')
+      setHighlightedIds(new Set())
+      refreshFeedback()
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
   function handleSwitchUser(userId: string) {
     setSelectedUserId(userId)
     setMessages([])
     setSelectedMsgId(null)
     setPendingVariants(null)
+    setHighlightedIds(new Set())
+  }
+
+  function handleSwitchMode(newMode: QAMode) {
+    setMode(newMode)
+    setMessages([])
+    setSelectedMsgId(null)
+    setPendingVariants(null)
+    setHighlightedIds(new Set())
   }
 
   async function handleExport() {
@@ -203,9 +334,8 @@ export default function QA() {
     }
   }
 
-  // ── Render ─────────────────────────────────────────────────
+  // ── Debug panel data ────────────────────────────────────────
 
-  // Find the debug for the selected variant (from pending or committed messages)
   const selectedDebug: DebugInfo | null | undefined = (() => {
     if (selectedMsg?.debug) return selectedMsg.debug
     if (pendingVariants && selectedMsgId) {
@@ -223,6 +353,8 @@ export default function QA() {
     }
     return null
   })()
+
+  // ── Render ──────────────────────────────────────────────────
 
   return (
     <div style={S.container}>
@@ -289,6 +421,7 @@ export default function QA() {
                 <div style={S.feedbackCardTop}>
                   <span style={{ ...S.ratingDot, background: fb.rating === 'good' ? '#34C759' : '#FF3B30' }} />
                   <span style={S.feedbackEmail}>{fb.google_email ?? 'unknown'}</span>
+                  {fb.conversation_json && <span style={S.convBadge}>conv</span>}
                   <button
                     style={S.deleteBtn}
                     onClick={(e) => { e.stopPropagation(); deleteFeedback(fb.id).then(refreshFeedback) }}
@@ -307,33 +440,143 @@ export default function QA() {
 
       {/* ── CENTRE — CHAT ── */}
       <div style={S.chatPanel}>
+        {/* Tab switcher */}
         <div style={S.chatHeader}>
-          <span style={S.chatTitle}>
-            {selectedUser ? selectedUser.google_email : 'Select a user to start'}
-          </span>
-          {messages.length > 0 && (
-            <button style={S.clearBtn} onClick={() => { setMessages([]); setSelectedMsgId(null); setPendingVariants(null) }}>
-              Clear
+          <div style={S.tabContainer}>
+            <button
+              style={{
+                ...S.tabBtn,
+                ...(mode === 'conversation' ? S.tabBtnActive : {}),
+              }}
+              onClick={() => handleSwitchMode('conversation')}
+            >
+              Conversation
             </button>
-          )}
+            <button
+              style={{
+                ...S.tabBtn,
+                ...(mode === 'comparison' ? S.tabBtnActive : {}),
+              }}
+              onClick={() => handleSwitchMode('comparison')}
+            >
+              3-Response Comparison
+            </button>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {mode === 'conversation' && highlightedIds.size > 0 && (
+              <button
+                style={S.feedbackActionBtn}
+                onClick={() => { setConvFeedbackModal(true); setConvFeedbackNote(''); setConvFeedbackRating('bad') }}
+              >
+                Leave Feedback ({highlightedIds.size})
+              </button>
+            )}
+            {messages.length > 0 && (
+              <button style={S.clearBtn} onClick={() => { setMessages([]); setSelectedMsgId(null); setPendingVariants(null); setHighlightedIds(new Set()) }}>
+                Clear
+              </button>
+            )}
+          </div>
         </div>
+
+        {/* Conversation mode hint */}
+        {mode === 'conversation' && messages.length > 0 && highlightedIds.size === 0 && (
+          <div style={S.hintBar}>
+            Click messages to highlight them, then leave feedback on that chain
+          </div>
+        )}
 
         <div style={S.chatMessages}>
           {messages.length === 0 && !pendingVariants && (
             <div style={S.emptyChat}>
               <p style={{ fontSize: 15, color: '#8A8580' }}>
-                {selectedUserId ? 'Send a message — 3 variants will be generated' : 'Pick a user from the sidebar'}
+                {selectedUserId
+                  ? mode === 'comparison'
+                    ? 'Send a message — 3 variants will be generated'
+                    : 'Send a message to start a conversation'
+                  : 'Pick a user from the sidebar'}
               </p>
             </div>
           )}
 
-          {/* Committed messages */}
-          {messages.map((msg) => (
+          {/* ── Conversation Mode Messages ── */}
+          {mode === 'conversation' && messages.map((msg) => {
+            const isHighlighted = highlightedIds.has(msg.id)
+
+            if (msg.role === 'user') {
+              return (
+                <div
+                  key={msg.id}
+                  style={{ ...S.msgRow, justifyContent: 'flex-end' }}
+                  onClick={() => toggleHighlight(msg.id)}
+                >
+                  <div style={{
+                    ...S.bubble,
+                    ...S.convUserBubble,
+                    ...(isHighlighted ? S.highlightedBubble : {}),
+                  }}>
+                    <p style={{ ...S.bubbleText, color: '#fff' }}>{msg.content}</p>
+                  </div>
+                </div>
+              )
+            }
+
+            if (msg.role === 'ack') {
+              return (
+                <div key={msg.id} style={{ ...S.msgRow, justifyContent: 'flex-start' }}>
+                  <div style={{ ...S.bubble, ...S.ackBubble }}>
+                    <p style={S.bubbleText}>{msg.content}</p>
+                  </div>
+                </div>
+              )
+            }
+
+            if (msg.role === 'assistant') {
+              const bubbles = splitIntoBubbles(msg.content)
+              return (
+                <div
+                  key={msg.id}
+                  style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start' }}
+                  onClick={() => { toggleHighlight(msg.id); setSelectedMsgId(msg.id) }}
+                >
+                  {bubbles.map((line, i) => (
+                    <div
+                      key={`${msg.id}-${i}`}
+                      style={{
+                        ...S.bubble,
+                        ...S.convAssistantBubble,
+                        ...(isHighlighted ? S.highlightedBubble : {}),
+                        ...(i === 0 && bubbles.length > 1 ? { borderTopLeftRadius: 18, borderBottomLeftRadius: 6 } : {}),
+                        ...(i > 0 && i < bubbles.length - 1 ? { borderTopLeftRadius: 6, borderBottomLeftRadius: 6 } : {}),
+                        ...(i === bubbles.length - 1 && bubbles.length > 1 ? { borderTopLeftRadius: 6, borderBottomLeftRadius: 18 } : {}),
+                      }}
+                    >
+                      <p style={S.bubbleText}>{line}</p>
+                    </div>
+                  ))}
+                  {msg.debug && (
+                    <div style={{ ...S.bubbleMeta, marginLeft: 4 }}>
+                      <span style={S.metaTag}>{msg.debug.path}</span>
+                      {msg.debug.tools_used?.length > 0 && (
+                        <span style={S.metaTag}>{msg.debug.tools_used.join(', ')}</span>
+                      )}
+                      <span style={S.metaTag}>{msg.debug.timing.total_ms}ms</span>
+                    </div>
+                  )}
+                </div>
+              )
+            }
+
+            return null
+          })}
+
+          {/* ── Comparison Mode Messages ── */}
+          {mode === 'comparison' && messages.map((msg) => (
             <div key={msg.id}>
               {msg.role === 'user' && (
                 <div style={{ ...S.msgRow, justifyContent: 'flex-end' }}>
-                  <div style={{ ...S.bubble, ...S.userBubble }}>
-                    <p style={S.bubbleText}>{msg.content}</p>
+                  <div style={{ ...S.bubble, ...S.convUserBubble }}>
+                    <p style={{ ...S.bubbleText, color: '#fff' }}>{msg.content}</p>
                   </div>
                 </div>
               )}
@@ -376,8 +619,8 @@ export default function QA() {
             </div>
           ))}
 
-          {/* Pending variants — pick one */}
-          {pendingVariants && (
+          {/* Pending variants (comparison mode only) */}
+          {mode === 'comparison' && pendingVariants && (
             <div style={S.variantsContainer}>
               <p style={S.variantsLabel}>3 style variants generated — pick the best, rate the rest</p>
               {pendingVariants.variants.map((variant, idx) => (
@@ -398,7 +641,6 @@ export default function QA() {
                     <span style={S.variantLatency}>{variant.latencyMs}ms</span>
                   </div>
 
-                  {/* Show as iMessage bubbles */}
                   <div style={S.variantBubbles}>
                     {splitIntoBubbles(variant.response).map((line, i) => (
                       <div key={i} style={S.variantBubble}>
@@ -434,7 +676,9 @@ export default function QA() {
           {sending && (
             <div style={{ ...S.msgRow, justifyContent: 'flex-start' }}>
               <div style={{ ...S.bubble, ...S.ackBubble }}>
-                <p style={S.bubbleText}>generating 3 variants...</p>
+                <p style={S.bubbleText}>
+                  {mode === 'comparison' ? 'generating 3 variants...' : 'thinking...'}
+                </p>
               </div>
             </div>
           )}
@@ -464,6 +708,31 @@ export default function QA() {
         <div style={S.sidebarHeader}>
           <h3 style={S.debugTitle}>Debug</h3>
         </div>
+
+        {/* Highlighted messages summary (conversation mode) */}
+        {mode === 'conversation' && highlightedIds.size > 0 && (
+          <div style={S.highlightSummary}>
+            <label style={S.debugSectionLabel}>Highlighted Messages</label>
+            <p style={{ fontSize: 12, color: '#1A1A1A', margin: '0 0 6px' }}>
+              {highlightedIds.size} message{highlightedIds.size !== 1 ? 's' : ''} selected
+            </p>
+            {messages.filter((m) => highlightedIds.has(m.id)).map((m) => (
+              <div key={m.id} style={S.highlightPreview}>
+                <span style={{
+                  ...S.highlightRole,
+                  color: m.role === 'user' ? '#007AFF' : '#1A1A1A',
+                }}>
+                  {m.role === 'user' ? 'You' : 'Bot'}:
+                </span>
+                <span style={S.highlightText}>
+                  {m.content.slice(0, 80)}{m.content.length > 80 ? '...' : ''}
+                </span>
+              </div>
+            ))}
+            <div style={S.debugDivider} />
+          </div>
+        )}
+
         {selectedDebug ? (
           <div style={S.debugContent}>
             <DebugField label="Path" value={selectedDebug.path} />
@@ -501,13 +770,15 @@ export default function QA() {
         ) : (
           <div style={S.debugEmpty}>
             <p style={{ fontSize: 13, color: '#8A8580' }}>
-              Click a variant or message to view debug info
+              {mode === 'conversation'
+                ? 'Click a message to view debug info'
+                : 'Click a variant or message to view debug info'}
             </p>
           </div>
         )}
       </div>
 
-      {/* ── NOTE MODAL ── */}
+      {/* ── COMPARISON NOTE MODAL ── */}
       {noteModal && (
         <div style={S.modalOverlay} onClick={() => setNoteModal(null)}>
           <div style={S.modal} onClick={(e) => e.stopPropagation()}>
@@ -526,7 +797,83 @@ export default function QA() {
               <button style={S.modalCancel} onClick={() => setNoteModal(null)}>Cancel</button>
               <button
                 style={{ ...S.modalSubmit, background: noteModal.rating === 'good' ? '#34C759' : '#FF3B30' }}
-                onClick={submitFeedback}
+                onClick={submitComparisonFeedback}
+              >Save Feedback</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── CONVERSATION FEEDBACK MODAL ── */}
+      {convFeedbackModal && (
+        <div style={S.modalOverlay} onClick={() => setConvFeedbackModal(false)}>
+          <div style={{ ...S.modal, width: 480 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={S.modalTitle}>Conversation Feedback</h3>
+            <p style={{ fontSize: 13, color: '#8A8580', marginBottom: 12 }}>
+              {highlightedIds.size} message{highlightedIds.size !== 1 ? 's' : ''} highlighted
+            </p>
+
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ ...S.sectionLabel, marginBottom: 6 }}>Rating</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  style={{
+                    ...S.ratingBtn,
+                    ...(convFeedbackRating === 'good' ? { background: '#34C759', color: '#fff', borderColor: '#34C759' } : {}),
+                  }}
+                  onClick={() => setConvFeedbackRating('good')}
+                >Good</button>
+                <button
+                  style={{
+                    ...S.ratingBtn,
+                    ...(convFeedbackRating === 'bad' ? { background: '#FF3B30', color: '#fff', borderColor: '#FF3B30' } : {}),
+                  }}
+                  onClick={() => setConvFeedbackRating('bad')}
+                >Bad</button>
+              </div>
+            </div>
+
+            <label style={{ ...S.sectionLabel, marginBottom: 6 }}>Note</label>
+            <textarea
+              style={S.textarea}
+              value={convFeedbackNote}
+              onChange={(e) => setConvFeedbackNote(e.target.value)}
+              placeholder="What went wrong or right in this chain? (e.g. 'lost context after 3rd message', 'great follow-up')"
+              rows={4}
+              autoFocus
+            />
+
+            <div style={S.convPreviewBox}>
+              <label style={{ ...S.debugSectionLabel, marginBottom: 4 }}>Highlighted Chain Preview</label>
+              {messages.filter((m) => highlightedIds.has(m.id)).map((m) => (
+                <div key={m.id} style={{ marginBottom: 4 }}>
+                  <span style={{
+                    fontSize: 11,
+                    fontWeight: 600,
+                    color: m.role === 'user' ? '#007AFF' : '#1A1A1A',
+                  }}>
+                    {m.role === 'user' ? 'User' : 'Bot'}:
+                  </span>
+                  <span style={{ fontSize: 11, color: '#555', marginLeft: 4 }}>
+                    {m.content.slice(0, 120)}{m.content.length > 120 ? '...' : ''}
+                  </span>
+                  {m.debug?.tools_used && m.debug.tools_used.length > 0 && (
+                    <span style={{ fontSize: 10, color: '#8A8580', marginLeft: 4 }}>
+                      [{m.debug.tools_used.join(', ')}]
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            <div style={S.modalActions}>
+              <button style={S.modalCancel} onClick={() => setConvFeedbackModal(false)}>Cancel</button>
+              <button
+                style={{
+                  ...S.modalSubmit,
+                  background: convFeedbackRating === 'good' ? '#34C759' : '#FF3B30',
+                }}
+                onClick={submitConversationFeedback}
               >Save Feedback</button>
             </div>
           </div>
@@ -586,6 +933,10 @@ const S: Record<string, React.CSSProperties> = {
   feedbackCardTop: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 },
   ratingDot: { width: 8, height: 8, borderRadius: '50%', flexShrink: 0 },
   feedbackEmail: { fontSize: 11, color: '#8A8580', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const },
+  convBadge: {
+    fontSize: 9, fontWeight: 600, color: '#8A8580', background: 'rgba(0,0,0,0.04)',
+    padding: '1px 5px', borderRadius: 3, textTransform: 'uppercase' as const, letterSpacing: 0.3,
+  },
   deleteBtn: { fontSize: 11, color: '#B5B0A9', background: 'none', border: 'none', cursor: 'pointer', padding: '0 2px', lineHeight: 1 },
   feedbackQuery: { fontSize: 12, color: '#1A1A1A', lineHeight: 1.4, marginBottom: 2 },
   feedbackNote: { fontSize: 11, color: '#8A8580', fontStyle: 'italic', lineHeight: 1.3, marginBottom: 2 },
@@ -594,13 +945,36 @@ const S: Record<string, React.CSSProperties> = {
 
   chatPanel: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' },
   chatHeader: {
-    padding: '12px 20px', borderBottom: '1px solid rgba(0,0,0,0.06)',
+    padding: '10px 20px', borderBottom: '1px solid rgba(0,0,0,0.06)',
     display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: '#fff',
   },
+
+  // Tab switcher
+  tabContainer: {
+    display: 'flex', alignItems: 'center', background: '#f3f4f6', padding: 2, borderRadius: 6,
+  },
+  tabBtn: {
+    display: 'flex', alignItems: 'center', gap: 6, padding: '6px 12px', fontSize: 13, fontWeight: 500,
+    borderRadius: 6, border: 'none', background: 'transparent', color: '#6b7280', cursor: 'pointer',
+    transition: 'all 0.15s',
+  },
+  tabBtnActive: {
+    color: '#1f2937', background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,0.06)',
+  },
+
+  hintBar: {
+    padding: '6px 20px', fontSize: 11, color: '#8A8580', background: '#FAFAF8',
+    borderBottom: '1px solid rgba(0,0,0,0.04)', textAlign: 'center' as const,
+  },
+
   chatTitle: { fontSize: 14, fontWeight: 600, color: '#1A1A1A' },
   clearBtn: {
     fontSize: 12, color: '#8A8580', background: 'none',
     border: '1px solid rgba(0,0,0,0.08)', borderRadius: 4, padding: '4px 10px', cursor: 'pointer',
+  },
+  feedbackActionBtn: {
+    fontSize: 12, fontWeight: 600, color: '#fff', background: '#1A1A1A',
+    border: 'none', borderRadius: 6, padding: '6px 14px', cursor: 'pointer',
   },
   chatMessages: {
     flex: 1, overflowY: 'auto' as const, padding: '16px 20px',
@@ -608,14 +982,31 @@ const S: Record<string, React.CSSProperties> = {
   },
   emptyChat: { flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center' },
   msgRow: { display: 'flex', width: '100%' },
-  bubble: { maxWidth: '70%', padding: '8px 12px', borderRadius: 12, position: 'relative' as const, cursor: 'default' },
-  userBubble: { background: '#007AFF', color: '#fff', borderBottomRightRadius: 4 },
+  bubble: { maxWidth: '70%', padding: '8px 12px', borderRadius: 18, position: 'relative' as const, cursor: 'default' },
+
+  // Conversation mode bubbles — proper iMessage style
+  convUserBubble: {
+    background: '#007AFF', color: '#fff', borderBottomRightRadius: 4,
+    cursor: 'pointer', transition: 'box-shadow 0.15s',
+  },
+  convAssistantBubble: {
+    background: '#E9E9EB', color: '#1A1A1A', borderBottomLeftRadius: 4,
+    cursor: 'pointer', maxWidth: '85%', transition: 'box-shadow 0.15s',
+  },
+
+  // Comparison mode bubbles (original style)
   assistantBubble: {
     background: '#fff', color: '#1A1A1A', border: '1px solid rgba(0,0,0,0.06)',
     cursor: 'pointer', maxWidth: '85%',
   },
   ackBubble: { background: '#F1ECE1', color: '#8A8580', borderBottomLeftRadius: 4, fontStyle: 'italic' },
   selectedBubble: { outline: '2px solid #007AFF', outlineOffset: 1 },
+
+  // Highlighted bubble (conversation mode feedback selection)
+  highlightedBubble: {
+    boxShadow: '0 0 0 2px #FF9500',
+  },
+
   bubbleText: { fontSize: 14, lineHeight: 1.5, whiteSpace: 'pre-wrap' as const, wordBreak: 'break-word' as const, margin: 0 },
   bubbleMeta: { display: 'flex', gap: 4, marginTop: 4, flexWrap: 'wrap' as const },
   metaTag: {
@@ -623,7 +1014,7 @@ const S: Record<string, React.CSSProperties> = {
     background: 'rgba(0,0,0,0.04)', color: '#8A8580', fontWeight: 500,
   },
 
-  // Variants
+  // Variants (comparison mode)
   variantsContainer: {
     display: 'flex', flexDirection: 'column', gap: 10, padding: '8px 0',
   },
@@ -693,6 +1084,28 @@ const S: Record<string, React.CSSProperties> = {
     marginRight: 4, marginBottom: 4,
   },
 
+  // Highlight summary in debug sidebar
+  highlightSummary: { padding: '12px 16px', borderBottom: '1px solid rgba(0,0,0,0.06)' },
+  highlightPreview: {
+    display: 'flex', gap: 4, alignItems: 'flex-start', marginBottom: 3,
+    fontSize: 11, lineHeight: 1.4,
+  },
+  highlightRole: { fontWeight: 600, flexShrink: 0 },
+  highlightText: { color: '#555' },
+
+  // Rating buttons in conversation feedback modal
+  ratingBtn: {
+    flex: 1, padding: '8px 0', fontSize: 13, fontWeight: 600,
+    border: '1px solid rgba(0,0,0,0.1)', borderRadius: 6, background: '#fff',
+    color: '#1A1A1A', cursor: 'pointer', transition: 'all 0.15s',
+  },
+
+  // Conversation preview box in modal
+  convPreviewBox: {
+    background: '#F8F6F1', borderRadius: 6, padding: 10, marginBottom: 12,
+    maxHeight: 160, overflowY: 'auto' as const,
+  },
+
   modalOverlay: {
     position: 'fixed' as const, inset: 0, background: 'rgba(0,0,0,0.3)',
     display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
@@ -703,6 +1116,7 @@ const S: Record<string, React.CSSProperties> = {
     width: '100%', padding: '10px 12px', fontSize: 13,
     border: '1px solid rgba(0,0,0,0.1)', borderRadius: 6, outline: 'none',
     resize: 'vertical' as const, fontFamily: 'inherit', marginBottom: 12,
+    boxSizing: 'border-box' as const,
   },
   modalActions: { display: 'flex', justifyContent: 'flex-end', gap: 8 },
   modalCancel: {

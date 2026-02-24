@@ -11,11 +11,11 @@ type Status = 'loading' | 'success' | 'error'
 
 function LoadingDots() {
   return (
-    <div className="loading-dots">
-      {[0, 1, 2].map(i => (
+    <div className="mb-6 flex items-center justify-center gap-2">
+      {[0, 1, 2].map((i) => (
         <motion.div
           key={i}
-          className="loading-dot"
+          className="h-2.5 w-2.5 rounded-full bg-gray-400"
           animate={{ y: [0, -6, 0] }}
           transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }}
         />
@@ -27,7 +27,7 @@ function LoadingDots() {
 function AnimatedCheck() {
   return (
     <motion.div
-      className="checkmark-circle"
+      className="mb-5 flex h-14 w-14 items-center justify-center rounded-full bg-green-50"
       initial={{ scale: 0 }}
       animate={{ scale: 1 }}
       transition={{ type: 'spring', stiffness: 400, damping: 20 }}
@@ -35,7 +35,7 @@ function AnimatedCheck() {
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
         <motion.path
           d="M20 6L9 17L4 12"
-          stroke="#4A6340"
+          stroke="#16a34a"
           strokeWidth="2.5"
           strokeLinecap="round"
           strokeLinejoin="round"
@@ -161,13 +161,13 @@ export default function AddAccountCallback() {
 
   return (
     <motion.div
-      className="page"
+      className="min-h-screen flex items-center justify-center bg-[#FAFAFA] font-sans selection:bg-gray-200"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
     >
-      <div className="content">
+      <div className="w-full max-w-sm px-6 text-center">
         <AnimatePresence mode="wait">
           {status === 'loading' && (
             <motion.div
@@ -176,11 +176,11 @@ export default function AddAccountCallback() {
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.2 }}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
+              className="flex flex-col items-center"
             >
               <LoadingDots />
               <motion.h1
-                className="title"
+                className="text-2xl font-bold tracking-tight text-gray-900 mb-2"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ ...spring, delay: 0.1 }}
@@ -188,7 +188,7 @@ export default function AddAccountCallback() {
                 Linking account...
               </motion.h1>
               <motion.p
-                className="subtitle"
+                className="text-gray-500"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 transition={{ ...spring, delay: 0.2 }}
@@ -204,11 +204,11 @@ export default function AddAccountCallback() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
+              className="flex flex-col items-center"
             >
               <AnimatedCheck />
               <motion.h1
-                className="title success-text"
+                className="text-2xl font-bold tracking-tight text-green-700 mb-2"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ ...spring, delay: 0.3 }}
@@ -216,7 +216,7 @@ export default function AddAccountCallback() {
                 Account linked
               </motion.h1>
               <motion.p
-                className="subtitle"
+                className="text-gray-500"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 transition={{ ...spring, delay: 0.4 }}
@@ -232,19 +232,17 @@ export default function AddAccountCallback() {
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={spring}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
+              className="flex flex-col items-center"
             >
-              <h1 className="title error-text">Something went wrong</h1>
-              {errorMessage && <p className="error-detail">{errorMessage}</p>}
-              <div style={{ marginTop: 32, width: '100%' }}>
-                <motion.button
-                  className="button"
-                  onClick={() => navigate('/dashboard', { replace: true })}
-                  whileTap={{ scale: 0.97 }}
-                >
-                  Back to Dashboard
-                </motion.button>
-              </div>
+              <h1 className="text-2xl font-bold tracking-tight text-red-600 mb-4">Something went wrong</h1>
+              {errorMessage && <p className="text-sm text-gray-600 bg-red-50 p-4 rounded-xl border border-red-100 mb-8 w-full">{errorMessage}</p>}
+              <motion.button
+                className="flex w-full items-center justify-center rounded-full bg-gray-900 px-6 py-3.5 text-base font-medium text-white shadow-sm hover:bg-black transition-colors"
+                onClick={() => navigate('/dashboard', { replace: true })}
+                whileTap={{ scale: 0.97 }}
+              >
+                Back to Dashboard
+              </motion.button>
             </motion.div>
           )}
         </AnimatePresence>

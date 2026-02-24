@@ -1,23 +1,21 @@
+import type { Session } from '@supabase/supabase-js'
+import { AnimatePresence, motion } from 'motion/react'
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { motion, AnimatePresence } from 'motion/react'
 import { supabase } from '../lib/supabase'
-import type { Session } from '@supabase/supabase-js'
 
 const ONBOARD_URL = import.meta.env.VITE_ONBOARD_FUNCTION_URL
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
-
-const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
 
 type Status = 'loading' | 'success' | 'error' | 'email_conflict'
 
 function LoadingDots() {
   return (
-    <div className="loading-dots">
-      {[0, 1, 2].map(i => (
+    <div className="mb-6 flex items-center justify-center gap-2">
+      {[0, 1, 2].map((i) => (
         <motion.div
           key={i}
-          className="loading-dot"
+          className="h-2.5 w-2.5 rounded-full bg-gray-400"
           animate={{ y: [0, -6, 0] }}
           transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }}
         />
@@ -29,7 +27,7 @@ function LoadingDots() {
 function AnimatedCheck() {
   return (
     <motion.div
-      className="checkmark-circle"
+      className="mb-5 mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-green-50"
       initial={{ scale: 0 }}
       animate={{ scale: 1 }}
       transition={{ type: 'spring', stiffness: 400, damping: 20 }}
@@ -37,7 +35,7 @@ function AnimatedCheck() {
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
         <motion.path
           d="M20 6L9 17L4 12"
-          stroke="#4A6340"
+          stroke="#16a34a"
           strokeWidth="2.5"
           strokeLinecap="round"
           strokeLinejoin="round"
@@ -74,36 +72,32 @@ export default function Callback() {
         let providerRefreshToken = ''
 
         if (window.location.hash) {
-          const hashParams = Object.fromEntries(
-            new URLSearchParams(window.location.hash.slice(1))
-          )
-          const at = hashParams['access_token']
-          const rt = hashParams['refresh_token']
-          providerToken = hashParams['provider_token'] ?? ''
-          providerRefreshToken = hashParams['provider_refresh_token'] ?? ''
+          const hashParams = Object.fromEntries(new URLSearchParams(window.location.hash.slice(1)))
+          const at = hashParams.access_token
+          const rt = hashParams.refresh_token
+          providerToken = hashParams.provider_token ?? ''
+          providerRefreshToken = hashParams.provider_refresh_token ?? ''
           if (at && rt) {
             const { data, error } = await supabase.auth.setSession({ access_token: at, refresh_token: rt })
             if (!error) session = data.session
           }
         }
 
-        if (!session) {
-          if (code) {
-            const { data, error } = await supabase.auth.exchangeCodeForSession(code)
-            if (error) {
-              if (error.message.includes('PKCE code verifier not found')) {
-                setStatus('error')
-                setErrorMessage('Sign-in session expired. Please restart sign in from the Nest home page in the same browser tab.')
-                return
-              }
+        if (!session && code) {
+          const { data, error } = await supabase.auth.exchangeCodeForSession(code)
+          if (error) {
+            if (error.message.includes('PKCE code verifier not found')) {
               setStatus('error')
-              setErrorMessage(error.message)
+              setErrorMessage('Sign-in session expired. Please restart sign in from the Nest home page in the same browser tab.')
               return
             }
-            session = data.session
-            providerToken = session?.provider_token ?? providerToken
-            providerRefreshToken = session?.provider_refresh_token ?? providerRefreshToken
+            setStatus('error')
+            setErrorMessage(error.message)
+            return
           }
+          session = data.session
+          providerToken = session?.provider_token ?? providerToken
+          providerRefreshToken = session?.provider_refresh_token ?? providerRefreshToken
         }
 
         if (!session) {
@@ -112,7 +106,6 @@ export default function Callback() {
         }
 
         if (!session) {
-          // Direct visits to /callback (without OAuth params) are expected; send users back to start.
           if (!code && !window.location.hash) {
             navigate('/', { replace: true })
             return
@@ -156,12 +149,7 @@ export default function Callback() {
           const error = typeof data.error === 'string' ? data.error : undefined
           const message = typeof data.message === 'string' ? data.message : undefined
           setStatus('error')
-          setErrorMessage(
-            detail ??
-            error ??
-            message ??
-            `Onboarding failed (${res.status}). Please try again.`
-          )
+          setErrorMessage(detail ?? error ?? message ?? `Onboarding failed (${res.status}). Please try again.`)
           return
         }
 
@@ -187,123 +175,66 @@ export default function Callback() {
       }
     }
 
-    onboard()
-    return () => { cancelled = true }
+    void onboard()
+    return () => {
+      cancelled = true
+    }
   }, [navigate])
 
   return (
-    <motion.div
-      className="page"
-      initial={{ opacity: 0 }}
+    <motion.div 
+      className="min-h-screen flex items-center justify-center bg-[#FAFAFA] px-6 font-sans selection:bg-gray-200" 
+      initial={{ opacity: 0 }} 
       animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.3 }}
     >
-      <main className="content">
+      <div className="w-full max-w-md rounded-3xl border border-gray-200/60 bg-white p-8 md:p-10 shadow-sm text-center">
         <AnimatePresence mode="wait">
           {status === 'loading' && (
-            <motion.div
-              key="loading"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.2 }}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
-            >
+            <motion.div key="loading" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <LoadingDots />
-              <motion.h1
-                className="title"
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ ...spring, delay: 0.1 }}
-              >
-                Setting things up...
-              </motion.h1>
-              <motion.p
-                className="subtitle"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ ...spring, delay: 0.2 }}
-              >
-                Verifying you're human...
-              </motion.p>
+              <h1 className="text-2xl font-bold tracking-tight text-gray-900 mb-2">Setting things up</h1>
+              <p className="text-gray-500">Connecting your Google account to Nest.</p>
             </motion.div>
           )}
 
           {status === 'success' && (
-            <motion.div
-              key="success"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
-            >
+            <motion.div key="success" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <AnimatedCheck />
-              <motion.h1
-                className="title success-text"
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ ...spring, delay: 0.3 }}
-              >
-                You're all set
-              </motion.h1>
-              <motion.p
-                className="subtitle"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ ...spring, delay: 0.4 }}
-              >
-                Taking you to your dashboard...
-              </motion.p>
+              <h1 className="text-2xl font-bold tracking-tight text-green-700 mb-2">You are all set</h1>
+              <p className="text-gray-500">Taking you to your dashboard.</p>
             </motion.div>
           )}
 
           {status === 'email_conflict' && (
-            <motion.div
-              key="conflict"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={spring}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
-            >
-              <h1 className="title error-text">Account already exists</h1>
-              <p className="error-detail">{errorMessage}</p>
-              {conflictHint && <p className="subtitle" style={{ marginTop: 8 }}>{conflictHint}</p>}
-              <div style={{ marginTop: 32, width: '100%' }}>
-                <motion.button
-                  className="button"
-                  onClick={() => navigate('/', { replace: true })}
-                  whileTap={{ scale: 0.97 }}
-                >
-                  Try Again
-                </motion.button>
+            <motion.div key="conflict" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+              <h1 className="text-2xl font-bold tracking-tight text-gray-900 mb-4">Account already exists</h1>
+              <div className="text-sm text-gray-600 bg-gray-50 p-4 rounded-xl border border-gray-100 mb-6">
+                <p className="mb-2">{errorMessage}</p>
+                {conflictHint && <p className="text-gray-500">{conflictHint}</p>}
               </div>
+              <button
+                className="w-full rounded-full bg-gray-900 px-6 py-3.5 text-base font-medium text-white shadow-sm hover:bg-black transition-colors"
+                onClick={() => navigate('/', { replace: true })}
+              >
+                Try again
+              </button>
             </motion.div>
           )}
 
           {status === 'error' && (
-            <motion.div
-              key="error"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={spring}
-              style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}
-            >
-              <h1 className="title error-text">Something went wrong</h1>
-              {errorMessage && <p className="error-detail">{errorMessage}</p>}
-              <div style={{ marginTop: 32, width: '100%' }}>
-                <motion.button
-                  className="button"
-                  onClick={() => navigate('/', { replace: true })}
-                  whileTap={{ scale: 0.97 }}
-                >
-                  Try Again
-                </motion.button>
-              </div>
+            <motion.div key="error" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+              <h1 className="text-2xl font-bold tracking-tight text-red-600 mb-4">Something went wrong</h1>
+              {errorMessage && <p className="text-sm text-gray-600 bg-red-50 p-4 rounded-xl border border-red-100 mb-6 w-full">{errorMessage}</p>}
+              <button
+                className="w-full rounded-full bg-gray-900 px-6 py-3.5 text-base font-medium text-white shadow-sm hover:bg-black transition-colors"
+                onClick={() => navigate('/', { replace: true })}
+              >
+                Try again
+              </button>
             </motion.div>
           )}
         </AnimatePresence>
-      </main>
+      </div>
     </motion.div>
   )
 }

@@ -45,6 +45,23 @@ export interface ChatMessage {
   debug?: DebugInfo | null
   timestamp: string
   variantOf?: string
+  highlighted?: boolean
+}
+
+export interface ConversationFeedbackPayload {
+  user_id: string
+  query: string
+  response: string
+  rating: 'good' | 'bad'
+  note?: string
+  debug_json?: DebugInfo | null
+  conversation_json?: {
+    mode: 'conversation'
+    highlighted_messages: ChatMessage[]
+    full_conversation: ChatMessage[]
+    tools_called: string[]
+    config: Record<string, unknown>
+  } | null
 }
 
 export interface Feedback {
@@ -59,6 +76,7 @@ export interface Feedback {
   debug_json: DebugInfo | null
   all_variants?: AgentResponse[] | null
   chosen_variant?: string | null
+  conversation_json?: ConversationFeedbackPayload['conversation_json'] | null
   created_at: string
 }
 
@@ -140,6 +158,14 @@ export async function sendMessage(
   }
 }
 
+export async function sendMessageSingle(
+  userId: string,
+  message: string,
+  onAck?: (text: string) => void,
+): Promise<AgentResponse> {
+  return sendMessage(userId, message, onAck)
+}
+
 const VARIATION_LABELS = ['concise', 'detailed', 'casual', 'formal', 'playful'] as const
 
 export async function sendMessageMulti(
@@ -173,7 +199,7 @@ export async function sendMessageMulti(
 
 export async function saveFeedback(feedback: {
   user_id: string
-  response_id: string | null
+  response_id?: string | null
   query: string
   response: string
   rating: 'good' | 'bad'
@@ -181,17 +207,23 @@ export async function saveFeedback(feedback: {
   debug_json?: DebugInfo | null
   all_variants?: AgentResponse[] | null
   chosen_variant?: string | null
+  conversation_json?: ConversationFeedbackPayload['conversation_json']
 }): Promise<void> {
-  const { error } = await admin.from('qa_feedback').insert({
+  const row: Record<string, unknown> = {
     user_id: feedback.user_id,
-    response_id: feedback.response_id,
+    response_id: feedback.response_id ?? null,
     query: feedback.query,
     response: feedback.response,
     rating: feedback.rating,
     note: feedback.note ?? null,
     debug_json: feedback.debug_json ?? null,
-  })
+  }
 
+  if (feedback.conversation_json) {
+    row.conversation_json = feedback.conversation_json
+  }
+
+  const { error } = await admin.from('qa_feedback').insert(row)
   if (error) throw new Error(`Failed to save feedback: ${error.message}`)
 }
 

@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
-import { useNavigate, Link } from 'react-router-dom'
-import { motion, AnimatePresence } from 'motion/react'
+import { AnimatePresence, motion } from 'motion/react'
+import { ChevronDown, Plus, LogOut, ArrowRight, CheckCircle2, ShieldAlert } from 'lucide-react'
+import { Link, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string
@@ -16,9 +17,6 @@ const SCOPES = [
   'https://www.googleapis.com/auth/contacts.other.readonly',
 ].join(' ')
 
-const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
-const springSnappy = { type: 'spring' as const, stiffness: 500, damping: 35 }
-
 interface GoogleAccount {
   id: string
   google_email: string
@@ -27,46 +25,23 @@ interface GoogleAccount {
   is_primary: boolean
 }
 
+const springSnappy = { type: 'spring' as const, stiffness: 500, damping: 35 }
+
 function TypingIndicator() {
   return (
-    <div className="chat-row chat-row-nest">
-      <img src="/nest-logo.png" alt="" className="chat-avatar" />
-      <div className="typing-pill">
-        {[0, 1, 2].map(i => (
+    <div className="flex items-end gap-2">
+      <img src="/nest-logo.png" alt="" className="h-7 w-7 rounded-[10px] object-cover shadow-sm" />
+      <div className="flex h-10 items-center gap-1.5 rounded-2xl bg-gray-100 px-4">
+        {[0, 1, 2].map((i) => (
           <motion.span
             key={i}
-            className="typing-dot"
+            className="h-1.5 w-1.5 rounded-full bg-gray-400"
             animate={{ y: [0, -4, 0] }}
-            transition={{
-              duration: 0.5,
-              repeat: Infinity,
-              delay: i * 0.12,
-              ease: 'easeInOut',
-            }}
+            transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.15, ease: 'easeInOut' }}
           />
         ))}
       </div>
     </div>
-  )
-}
-
-function StepProgress({ current }: { current: number }) {
-  return (
-    <nav className="step-progress" aria-label="Setup progress">
-      {[1, 2, 3].map((s, i) => (
-        <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <motion.div
-            className={`step-dot ${s === current ? 'step-dot-active' : s < current ? 'step-dot-done' : ''}`}
-            animate={{ scale: s === current ? 1.25 : 1 }}
-            transition={springSnappy}
-            aria-label={`Step ${s}${s === current ? ' (current)' : s < current ? ' (completed)' : ''}`}
-          />
-          {i < 2 && (
-            <div className={`step-line ${s < current ? 'step-line-done' : ''}`} />
-          )}
-        </div>
-      ))}
-    </nav>
   )
 }
 
@@ -78,13 +53,16 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [removing, setRemoving] = useState<string | null>(null)
   const [step, setStep] = useState(1)
-  const [dropdownOpen, setDropdownOpen] = useState(false)
-  const topBarRef = useRef<HTMLDivElement>(null)
   const [chatPhase, setChatPhase] = useState(0)
+  const [dropdownOpen, setDropdownOpen] = useState(false)
+  const dropdownRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     async function init() {
-      const { data: { session } } = await supabase.auth.getSession()
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
+
       if (!session) {
         navigate('/', { replace: true })
         return
@@ -93,27 +71,39 @@ export default function Dashboard() {
       const user = session.user
       setAvatarUrl(user.user_metadata?.avatar_url ?? null)
       setDisplayName(user.user_metadata?.full_name ?? user.email ?? '')
-
       await fetchAccounts(session.access_token)
       setLoading(false)
     }
+
     init()
   }, [navigate])
 
   useEffect(() => {
-    if (step !== 3) return
+    if (step !== 3) {
+      setChatPhase(0)
+      return
+    }
     const timers = [
       setTimeout(() => setChatPhase(1), 500),
       setTimeout(() => setChatPhase(2), 1400),
-      setTimeout(() => setChatPhase(3), 2400),
+      setTimeout(() => setChatPhase(3), 2600),
     ]
     return () => timers.forEach(clearTimeout)
   }, [step])
 
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setDropdownOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [])
+
   async function fetchAccounts(token?: string) {
     const accessToken = token ?? (await supabase.auth.getSession()).data.session?.access_token
     if (!accessToken) return
-
     try {
       const res = await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts`, {
         headers: { Authorization: `Bearer ${accessToken}` },
@@ -121,12 +111,14 @@ export default function Dashboard() {
       const data = await res.json()
       if (data.accounts) setAccounts(data.accounts)
     } catch {
-      // Non-critical
+      // Non-critical.
     }
   }
 
   async function handleAddAccount() {
-    const { data: { session } } = await supabase.auth.getSession()
+    const {
+      data: { session },
+    } = await supabase.auth.getSession()
     if (!session) return
 
     sessionStorage.setItem('nest_original_user_id', session.user.id)
@@ -137,16 +129,15 @@ export default function Dashboard() {
       options: {
         redirectTo: `${window.location.origin}/add-account-callback`,
         scopes: SCOPES,
-        queryParams: {
-          access_type: 'offline',
-          prompt: 'consent',
-        },
+        queryParams: { access_type: 'offline', prompt: 'consent' },
       },
     })
   }
 
   async function handleRemoveAccount(accountId: string) {
-    const { data: { session } } = await supabase.auth.getSession()
+    const {
+      data: { session },
+    } = await supabase.auth.getSession()
     if (!session) return
 
     setRemoving(accountId)
@@ -161,448 +152,364 @@ export default function Dashboard() {
       })
       await fetchAccounts(session.access_token)
     } catch {
-      // Silently fail
+      // Silently fail.
     } finally {
       setRemoving(null)
     }
   }
 
+  const firstName = displayName.split(' ')[0] || 'there'
+  const primaryAccount = accounts.find((account) => account.is_primary)
+  const primaryAvatar = primaryAccount?.google_avatar_url ?? avatarUrl
+
   if (loading) {
     return (
-      <motion.div
-        className="page"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-      >
-        <main className="content" role="status" aria-label="Loading">
-          <div className="loading-dots">
-            {[0, 1, 2].map(i => (
+      <div className="flex min-h-screen items-center justify-center bg-[#FAFAFA]">
+        <div className="flex flex-col items-center">
+          <div className="mb-6 flex gap-2">
+            {[0, 1, 2].map((i) => (
               <motion.div
                 key={i}
-                className="loading-dot"
+                className="h-2 w-2 rounded-full bg-gray-400"
                 animate={{ y: [0, -6, 0] }}
                 transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }}
               />
             ))}
           </div>
-        </main>
-      </motion.div>
+          <h1 className="text-xl font-medium tracking-tight text-gray-900">Loading your setup...</h1>
+        </div>
+      </div>
     )
   }
 
-  const primaryAccount = accounts.find(a => a.is_primary)
-  const primaryAvatar = primaryAccount?.google_avatar_url ?? avatarUrl
-  const firstName = displayName.split(' ')[0]
-
   return (
     <motion.div
-      className="page"
+      className="min-h-screen bg-[#FAFAFA] font-sans pb-20"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.3 }}
     >
-      <header className="top-bar" ref={topBarRef}>
-        <div className="top-bar-left">
-          <motion.img
-            src="/nest-logo.png"
-            alt="Nest"
-            className="top-bar-logo"
-            initial={{ opacity: 0, scale: 0.8 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ ...springSnappy, delay: 0.05 }}
-          />
-          <motion.span
-            className="top-bar-wordmark"
-            initial={{ opacity: 0, x: -8 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ ...spring, delay: 0.1 }}
-          >
-            Nest
-          </motion.span>
+      {/* Header */}
+      <header className="sticky top-0 z-50 bg-[#FAFAFA]/80 backdrop-blur-md border-b border-gray-200/50">
+        <div className="mx-auto max-w-5xl px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <img src="/nest-logo.png" alt="Nest" className="h-8 w-8 rounded-[10px] shadow-sm" />
+            <span className="text-lg font-semibold tracking-tight text-gray-900">Nest Setup</span>
+          </div>
+
+          <div className="relative" ref={dropdownRef}>
+            <button
+              onClick={() => setDropdownOpen((prev) => !prev)}
+              className="flex items-center gap-2 rounded-full border border-gray-200 bg-white px-2 py-1.5 text-sm text-gray-700 shadow-sm hover:shadow transition-all"
+            >
+              {primaryAvatar ? (
+                <img src={primaryAvatar} alt="" className="h-6 w-6 rounded-full" referrerPolicy="no-referrer" />
+              ) : (
+                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-gray-100 text-xs font-semibold">
+                  {firstName.charAt(0).toUpperCase()}
+                </span>
+              )}
+              <ChevronDown
+                className={`h-4 w-4 text-gray-400 transition-transform duration-300 mr-1 ${
+                  dropdownOpen ? 'rotate-180' : ''
+                }`}
+              />
+            </button>
+
+            <AnimatePresence>
+              {dropdownOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                  transition={{ duration: 0.2, ease: 'easeOut' }}
+                  className="absolute right-0 top-12 z-50 w-56 rounded-2xl border border-gray-200 bg-white p-2 shadow-xl"
+                >
+                  <div className="px-3 py-2 mb-2 border-b border-gray-100">
+                    <p className="text-sm font-medium text-gray-900 truncate">{displayName}</p>
+                    <p className="text-xs text-gray-500 truncate">{primaryAccount?.google_email}</p>
+                  </div>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                    onClick={() => {
+                      setDropdownOpen(false)
+                      void handleAddAccount()
+                    }}
+                  >
+                    <Plus className="h-4 w-4" /> Add account
+                  </button>
+                  <Link
+                    to="/privacy"
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                    onClick={() => setDropdownOpen(false)}
+                  >
+                    <ShieldAlert className="h-4 w-4" /> Privacy & Terms
+                  </Link>
+                  <button
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors mt-1"
+                    onClick={async () => {
+                      setDropdownOpen(false)
+                      await supabase.auth.signOut()
+                      navigate('/', { replace: true })
+                    }}
+                  >
+                    <LogOut className="h-4 w-4" /> Log out
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
         </div>
-
-        <motion.button
-          className="avatar-button"
-          onClick={() => setDropdownOpen(prev => !prev)}
-          aria-label="Account menu"
-          aria-expanded={dropdownOpen}
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.3, delay: 0.15 }}
-          whileTap={{ scale: 0.9 }}
-        >
-          {primaryAvatar ? (
-            <img src={primaryAvatar} alt="" referrerPolicy="no-referrer" />
-          ) : (
-            <span className="avatar-placeholder">
-              {displayName.charAt(0).toUpperCase()}
-            </span>
-          )}
-        </motion.button>
-
-        <AnimatePresence>
-          {dropdownOpen && (
-            <>
-              <div className="dropdown-overlay" onClick={() => setDropdownOpen(false)} aria-hidden="true" />
-              <motion.div
-                className="avatar-dropdown"
-                role="menu"
-                initial={{ opacity: 0, y: -6, scale: 0.97 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: -6, scale: 0.97 }}
-                transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-              >
-                <button role="menuitem" className="dropdown-link" onClick={() => { setDropdownOpen(false); handleAddAccount() }}>
-                  Add account
-                </button>
-                <div className="dropdown-divider" role="separator" />
-                <Link to="/privacy" role="menuitem" className="dropdown-link" onClick={() => setDropdownOpen(false)}>
-                  Privacy Policy
-                </Link>
-                <Link to="/terms" role="menuitem" className="dropdown-link" onClick={() => setDropdownOpen(false)}>
-                  Terms of Service
-                </Link>
-                <a href="mailto:nestchatapp123@gmail.com" role="menuitem" className="dropdown-link">
-                  Support
-                </a>
-                <div className="dropdown-divider" role="separator" />
-                <button role="menuitem" className="dropdown-link dropdown-link-danger" onClick={async () => { setDropdownOpen(false); await supabase.auth.signOut(); navigate('/') }}>
-                  Log out
-                </button>
-              </motion.div>
-            </>
-          )}
-        </AnimatePresence>
       </header>
 
-      <StepProgress current={step} />
-
-      <AnimatePresence mode="wait">
-        {/* ── Step 1: Connected Accounts ── */}
-        {step === 1 && (
-          <motion.div
-            key="step-accounts"
-            initial={{ opacity: 0, x: 0 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: -40 }}
-            transition={{ duration: 0.3 }}
-            style={{ display: 'contents' }}
-          >
-            <main className="hero" aria-label="Connected accounts">
-              <motion.div
-                className="checkmark-circle"
-                initial={{ scale: 0 }}
-                animate={{ scale: 1 }}
-                transition={{ type: 'spring', stiffness: 400, damping: 20, delay: 0.1 }}
+      <main className="mx-auto max-w-2xl px-6 pt-12 md:pt-20">
+        {/* Progress Tracker */}
+        <div className="mb-10 flex items-center justify-center">
+          <div className="flex items-center gap-2 rounded-full bg-gray-100 p-1">
+            {[1, 2, 3].map((item) => (
+              <button
+                key={item}
+                onClick={() => setStep(item)}
+                className={`relative flex items-center justify-center px-5 py-2 text-sm font-medium transition-colors ${
+                  step === item ? 'text-gray-900' : 'text-gray-500 hover:text-gray-700'
+                }`}
               >
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <motion.path
-                    d="M20 6L9 17L4 12"
-                    stroke="#4A6340"
-                    strokeWidth="2.5"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    initial={{ pathLength: 0 }}
-                    animate={{ pathLength: 1 }}
-                    transition={{ duration: 0.4, delay: 0.3, ease: 'easeOut' }}
+                {step === item && (
+                  <motion.div
+                    layoutId="activeTab"
+                    className="absolute inset-0 rounded-full bg-white shadow-sm"
+                    transition={{ type: 'spring', bounce: 0.2, duration: 0.6 }}
                   />
-                </svg>
-              </motion.div>
+                )}
+                <span className="relative z-10 flex items-center gap-1.5">
+                  {item < step && <CheckCircle2 className="h-4 w-4 text-green-600" />}
+                  {item === 1 ? 'Accounts' : item === 2 ? 'Contacts' : 'Start Chat'}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
 
-              <div className="hero-title" style={{ fontSize: 'clamp(28px, 8vw, 40px)' }}>
-                {(firstName ? [`Welcome,`, firstName] : ['You\'re', 'in']).map((word, i) => (
-                  <motion.span
-                    key={word + i}
-                    initial={{ opacity: 0, y: 16 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ ...spring, delay: 0.2 + i * 0.06 }}
-                  >
-                    {word}
-                  </motion.span>
-                ))}
-              </div>
-
-              <motion.p
-                className="hero-sub"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ ...spring, delay: 0.4 }}
+        <div className="relative">
+          <AnimatePresence mode="wait">
+            {/* STEP 1: ACCOUNTS */}
+            {step === 1 && (
+              <motion.section
+                key="step-1"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                className="rounded-3xl border border-gray-200/60 bg-white p-8 md:p-10 shadow-sm"
               >
-                Your connected accounts
-              </motion.p>
+                <div className="mb-8 text-center">
+                  <div className="mx-auto mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-600">
+                    <CheckCircle2 className="h-6 w-6" />
+                  </div>
+                  <h1 className="text-3xl font-semibold tracking-tight text-gray-900 mb-2">Welcome, {firstName}</h1>
+                  <p className="text-gray-500">Review your connected Google accounts before continuing.</p>
+                </div>
 
-              <motion.div
-                className="accounts-card"
-                initial={{ opacity: 0, y: 16, scale: 0.97 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                transition={{ ...spring, delay: 0.5 }}
-              >
-                {accounts.map((account, idx) => (
-                  <motion.div
-                    className="accounts-card-row"
-                    key={account.id}
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ ...spring, delay: 0.55 + idx * 0.08 }}
-                  >
-                    <img
-                      className="accounts-card-avatar"
-                      src={account.google_avatar_url ?? ''}
-                      alt=""
-                      referrerPolicy="no-referrer"
-                      onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
-                    />
-                    <div className="accounts-card-info">
-                      <div className="accounts-card-name">
-                        {account.google_name || account.google_email}
+                <div className="space-y-3">
+                  {accounts.map((account) => (
+                    <div
+                      key={account.id}
+                      className="flex items-center justify-between rounded-2xl border border-gray-200 bg-gray-50/50 p-4 transition-all hover:bg-gray-50"
+                    >
+                      <div className="flex items-center gap-4">
+                        {account.google_avatar_url ? (
+                          <img
+                            src={account.google_avatar_url}
+                            alt=""
+                            className="h-10 w-10 rounded-full shadow-sm"
+                            referrerPolicy="no-referrer"
+                          />
+                        ) : (
+                          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white border border-gray-200 text-sm font-semibold text-gray-700 shadow-sm">
+                            {(account.google_name || account.google_email).charAt(0).toUpperCase()}
+                          </div>
+                        )}
+                        <div>
+                          <p className="font-medium text-gray-900">{account.google_name || account.google_email}</p>
+                          <p className="text-sm text-gray-500">{account.google_email}</p>
+                        </div>
                       </div>
-                      <div className="accounts-card-email">{account.google_email}</div>
+
+                      {account.is_primary ? (
+                        <span className="rounded-full bg-blue-50 px-3 py-1 text-xs font-medium text-blue-700">
+                          Primary
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => void handleRemoveAccount(account.id)}
+                          disabled={removing === account.id}
+                          className="rounded-full border border-gray-200 bg-white px-4 py-1.5 text-sm font-medium text-gray-600 hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-colors"
+                        >
+                          {removing === account.id ? 'Removing...' : 'Remove'}
+                        </button>
+                      )}
                     </div>
-                    {!account.is_primary && (
-                      <button
-                        className="accounts-card-remove"
-                        onClick={() => handleRemoveAccount(account.id)}
-                        disabled={removing === account.id}
-                        aria-label={`Remove ${account.google_email}`}
+                  ))}
+                </div>
+
+                <div className="mt-8 flex flex-col sm:flex-row items-center justify-between gap-4 pt-6 border-t border-gray-100">
+                  <button
+                    onClick={() => void handleAddAccount()}
+                    className="flex w-full sm:w-auto items-center justify-center gap-2 rounded-full border border-gray-200 bg-white px-6 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+                  >
+                    <Plus className="h-4 w-4" /> Add another account
+                  </button>
+                  <button
+                    onClick={() => setStep(2)}
+                    className="flex w-full sm:w-auto items-center justify-center gap-2 rounded-full bg-gray-900 px-8 py-2.5 text-sm font-medium text-white shadow-md hover:bg-black transition-colors"
+                  >
+                    Continue <ArrowRight className="h-4 w-4" />
+                  </button>
+                </div>
+              </motion.section>
+            )}
+
+            {/* STEP 2: CONTACTS */}
+            {step === 2 && (
+              <motion.section
+                key="step-2"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                className="rounded-3xl border border-gray-200/60 bg-white p-8 md:p-10 shadow-sm"
+              >
+                <div className="mb-8 text-center">
+                  <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gray-50 border border-gray-100 shadow-sm">
+                    <img src="/nest-logo.png" alt="" className="h-10 w-10 rounded-[10px]" />
+                  </div>
+                  <h2 className="text-3xl font-semibold tracking-tight text-gray-900 mb-2">Add to Contacts</h2>
+                  <p className="text-gray-500 max-w-sm mx-auto">
+                    Save Nest once so you can message naturally in iMessage without seeing a random phone number.
+                  </p>
+                </div>
+
+                <div className="space-y-3 mb-10">
+                  {[
+                    'Tap Add to Contacts below.',
+                    'Choose Create New Contact on the card.',
+                    'Tap Done to save Nest.',
+                  ].map((line, index) => (
+                    <div
+                      key={line}
+                      className="flex items-center gap-4 rounded-2xl border border-gray-100 bg-gray-50/50 p-4"
+                    >
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white text-sm font-semibold text-gray-900 shadow-sm">
+                        {index + 1}
+                      </div>
+                      <p className="text-gray-700">{line}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-4 pt-6 border-t border-gray-100">
+                  <button
+                    onClick={() => setStep(3)}
+                    className="flex w-full sm:w-auto items-center justify-center rounded-full bg-gray-100 px-6 py-3 text-sm font-medium text-gray-700 hover:bg-gray-200 transition-colors"
+                  >
+                    Skip for now
+                  </button>
+                  <a
+                    href="/nest.vcf"
+                    onClick={() => setTimeout(() => setStep(3), 800)}
+                    className="flex w-full sm:w-auto items-center justify-center rounded-full bg-gray-900 px-8 py-3 text-sm font-medium text-white shadow-md hover:bg-black transition-colors"
+                  >
+                    Add to Contacts
+                  </a>
+                </div>
+              </motion.section>
+            )}
+
+            {/* STEP 3: START CHATTING */}
+            {step === 3 && (
+              <motion.section
+                key="step-3"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+                transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                className="rounded-3xl border border-gray-200/60 bg-white p-8 md:p-10 shadow-sm"
+              >
+                <div className="mb-8 text-center">
+                  <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-gray-50 border border-gray-100 shadow-sm overflow-hidden">
+                    <img src="/imessage-icon.png" alt="" className="h-10 w-10 object-cover" />
+                  </div>
+                  <h2 className="text-3xl font-semibold tracking-tight text-gray-900 mb-2">Say hi, {firstName}</h2>
+                  <p className="text-gray-500 max-w-sm mx-auto">
+                    Open iMessage and send your first message to start using Nest.
+                  </p>
+                </div>
+
+                <div className="mb-8 overflow-hidden rounded-[24px] border border-gray-100 bg-[#F8F9FA] shadow-inner p-6 min-h-[220px] flex flex-col justify-end">
+                  <div className="space-y-4">
+                    {chatPhase >= 1 && (
+                      <motion.div
+                        className="flex justify-end"
+                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        transition={springSnappy}
                       >
-                        {removing === account.id ? '...' : 'Remove'}
-                      </button>
+                        <div className="rounded-[20px] rounded-br-[4px] bg-[#007AFF] px-4 py-2.5 text-[15px] text-white shadow-sm">
+                          Hey Nest!
+                        </div>
+                      </motion.div>
                     )}
-                  </motion.div>
-                ))}
 
-                <motion.button
-                  className="accounts-card-add"
-                  onClick={handleAddAccount}
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ ...spring, delay: 0.7 }}
-                  whileTap={{ scale: 0.97 }}
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
-                  Add another account
-                </motion.button>
-              </motion.div>
-            </main>
+                    {chatPhase === 2 && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.9 }}
+                      >
+                        <TypingIndicator />
+                      </motion.div>
+                    )}
 
-            <motion.div
-              className="bottom-cta"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ ...spring, delay: 0.6 }}
-            >
-              <motion.button
-                className="btn-dark"
-                onClick={() => setStep(2)}
-                whileTap={{ scale: 0.97 }}
-                whileHover={{ scale: 1.01 }}
-                transition={springSnappy}
-              >
-                Continue
-              </motion.button>
-            </motion.div>
-          </motion.div>
-        )}
-
-        {/* ── Step 2: Add to Contacts ── */}
-        {step === 2 && (
-          <motion.div
-            key="step-contact"
-            initial={{ opacity: 0, x: 40 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: -40 }}
-            transition={{ duration: 0.3 }}
-            style={{ display: 'contents' }}
-          >
-            <main className="hero" aria-label="Add Nest to contacts">
-              <motion.img
-                src="/nest-logo.png"
-                alt=""
-                className="step-logo"
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ type: 'spring', stiffness: 400, damping: 22, delay: 0.1 }}
-              />
-
-              <div className="hero-title" style={{ fontSize: 'clamp(28px, 8vw, 40px)' }}>
-                {['Add', 'Nest', 'to', 'Contacts'].map((word, i) => (
-                  <motion.span
-                    key={word + i}
-                    initial={{ opacity: 0, y: 16 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ ...spring, delay: 0.15 + i * 0.06 }}
-                  >
-                    {word}
-                  </motion.span>
-                ))}
-              </div>
-
-              <motion.div
-                className="instructions-card"
-                initial={{ opacity: 0, y: 16, scale: 0.97 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                transition={{ ...spring, delay: 0.45 }}
-              >
-                <div className="instruction-row">
-                  <div className="instruction-number">1</div>
-                  <div className="instruction-text">
-                    Tap <strong>Add to Contacts</strong> below
+                    {chatPhase >= 3 && (
+                      <motion.div
+                        className="flex items-end gap-2"
+                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        transition={springSnappy}
+                      >
+                        <img src="/nest-logo.png" alt="" className="h-7 w-7 rounded-[10px] object-cover shadow-sm" />
+                        <div className="rounded-[20px] rounded-bl-[4px] border border-gray-100 bg-white px-4 py-2.5 text-[15px] text-gray-900 shadow-sm">
+                          Hey {firstName}! I'm connected and ready to go. What can I help you with today?
+                        </div>
+                      </motion.div>
+                    )}
                   </div>
                 </div>
-                <div className="instruction-row">
-                  <div className="instruction-number">2</div>
-                  <div className="instruction-text">
-                    Scroll to the bottom of the contact card and tap <strong>Create New Contact</strong>
-                  </div>
+
+                {/* Compliance Text */}
+                <div className="mb-8 rounded-2xl bg-gray-50 p-4 text-center text-xs text-gray-500">
+                  <p className="mb-1">
+                    By starting this chat, you agree to receive messages from Nest.
+                  </p>
+                  <p>
+                    We will send important notifications related to your account status or transactions.
+                    Send <strong>'Unsubscribe'</strong> to manage your message preferences.
+                  </p>
                 </div>
-                <div className="instruction-row">
-                  <div className="instruction-number">3</div>
-                  <div className="instruction-text">
-                    Tap <strong>Done</strong> in the top right
-                  </div>
+
+                <div className="flex justify-center">
+                  <a
+                    href="sms:tlidgett@icloud.com&body=Hey%20Nest!"
+                    className="flex items-center justify-center gap-2 rounded-full bg-[#007AFF] px-10 py-3.5 text-base font-semibold text-white shadow-lg shadow-blue-500/20 hover:bg-blue-600 transition-colors"
+                  >
+                    Open iMessage
+                  </a>
                 </div>
-              </motion.div>
-            </main>
-
-            <motion.div
-              className="bottom-cta"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ ...spring, delay: 0.55 }}
-            >
-              <div className="bottom-cta-stack">
-                <motion.a
-                  className="btn-dark"
-                  href="/nest.vcf"
-                  onClick={() => setTimeout(() => setStep(3), 500)}
-                  style={{ textDecoration: 'none' }}
-                  whileTap={{ scale: 0.97 }}
-                  whileHover={{ scale: 1.01 }}
-                  transition={springSnappy}
-                >
-                  Add to Contacts
-                </motion.a>
-                <motion.button
-                  className="btn-skip"
-                  onClick={() => setStep(3)}
-                  whileTap={{ scale: 0.97 }}
-                >
-                  Skip for now
-                </motion.button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-
-        {/* ── Step 3: Open iMessage ── */}
-        {step === 3 && (
-          <motion.div
-            key="step-imessage"
-            initial={{ opacity: 0, x: 40 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: -40 }}
-            transition={{ duration: 0.3 }}
-            style={{ display: 'contents' }}
-          >
-            <main className="hero" aria-label="Open iMessage">
-              <motion.img
-                src="/nest-logo.png"
-                alt=""
-                className="step-logo"
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ type: 'spring', stiffness: 400, damping: 22, delay: 0.1 }}
-              />
-
-              <div className="hero-title" style={{ fontSize: 'clamp(28px, 8vw, 40px)' }}>
-                {(firstName ? ['Say', 'hi,', firstName] : ['Say', 'hi', 'to', 'Nest']).map((word, i) => (
-                  <motion.span
-                    key={word + i}
-                    initial={{ opacity: 0, y: 16 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ ...spring, delay: 0.15 + i * 0.06 }}
-                  >
-                    {word}
-                  </motion.span>
-                ))}
-              </div>
-
-              <motion.p
-                className="hero-sub"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ ...spring, delay: 0.35 }}
-              >
-                Open iMessage and send your first message — Nest is ready to&nbsp;help.
-              </motion.p>
-
-              <motion.div
-                className="chat-card"
-                initial={{ opacity: 0, y: 16, scale: 0.97 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                transition={{ ...spring, delay: 0.45 }}
-                style={{ marginTop: 32 }}
-              >
-                {chatPhase >= 1 && (
-                  <motion.div
-                    className="chat-row chat-row-user"
-                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    transition={spring}
-                  >
-                    <div className="bubble bubble-user">Hey Nest!</div>
-                  </motion.div>
-                )}
-                {chatPhase === 2 && (
-                  <motion.div
-                    initial={{ opacity: 0, y: 6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={springSnappy}
-                  >
-                    <TypingIndicator />
-                  </motion.div>
-                )}
-                {chatPhase >= 3 && (
-                  <motion.div
-                    className="chat-row chat-row-nest"
-                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    transition={spring}
-                  >
-                    <img src="/nest-logo.png" alt="" className="chat-avatar" />
-                    <div className="bubble bubble-nest">
-                      Hey {firstName || 'there'}! What can I help you with?
-                    </div>
-                  </motion.div>
-                )}
-              </motion.div>
-            </main>
-
-            <motion.div
-              className="bottom-cta"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ ...spring, delay: 0.55 }}
-            >
-              <motion.a
-                className="btn-dark"
-                href="sms:nestchatapp123@gmail.com&body=Hey%20Nest!"
-                style={{ textDecoration: 'none' }}
-                whileTap={{ scale: 0.97 }}
-                whileHover={{ scale: 1.01 }}
-                transition={springSnappy}
-              >
-                Open iMessage
-              </motion.a>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              </motion.section>
+            )}
+          </AnimatePresence>
+        </div>
+      </main>
     </motion.div>
   )
 }

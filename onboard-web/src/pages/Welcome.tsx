@@ -1,7 +1,11 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useSearchParams, useNavigate, Link } from 'react-router-dom'
-import { motion, useReducedMotion } from 'motion/react'
+import { motion } from 'motion/react'
 import { supabase } from '../lib/supabase'
+import { SplitText } from '../components/SplitText'
+import { SpotlightCard } from '../components/SpotlightCard'
+import { AnimatedList } from '../components/AnimatedList'
+import { Calendar, Users, Plane, Sparkles, Bell, Zap, ChevronRight } from 'lucide-react'
 
 const ONBOARD_URL = import.meta.env.VITE_ONBOARD_FUNCTION_URL
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
@@ -17,7 +21,6 @@ const SCOPES = [
   'https://www.googleapis.com/auth/contacts.other.readonly',
 ].join(' ')
 
-const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
 const springSnappy = { type: 'spring' as const, stiffness: 500, damping: 35 }
 
 interface ChatMessage {
@@ -44,90 +47,51 @@ const TIMELINE = [
 
 const FEATURES = [
   {
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
-        <line x1="16" y1="2" x2="16" y2="6" />
-        <line x1="8" y1="2" x2="8" y2="6" />
-        <line x1="3" y1="10" x2="21" y2="10" />
-      </svg>
-    ),
+    icon: <Calendar className="h-6 w-6 text-gray-900" />,
     title: 'Email, Calendar & Contacts',
-    desc: 'Summarises your inbox, schedules meetings, drafts replies, and briefs you before every call — across all your Google accounts.',
+    desc: 'Summarises your inbox, schedules meetings, drafts replies, and briefs you before every call.',
   },
   {
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-        <circle cx="9" cy="7" r="4" />
-        <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-        <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-      </svg>
-    ),
+    icon: <Users className="h-6 w-6 text-gray-900" />,
     title: 'People Intelligence',
-    desc: 'Ask about anyone. Nest pulls their role, company, LinkedIn, and your shared history from emails and meetings.',
+    desc: 'Ask about anyone. Nest pulls their role, company, LinkedIn, and your shared history.',
   },
   {
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="12" r="10" />
-        <path d="M2 12h20" />
-        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
-      </svg>
-    ),
+    icon: <Plane className="h-6 w-6 text-gray-900" />,
     title: 'Travel & Places',
-    desc: 'Finds your flight bookings, calculates when to leave for the airport, and recommends restaurants nearby.',
+    desc: 'Finds your flight bookings, calculates when to leave, and recommends restaurants nearby.',
   },
   {
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-      </svg>
-    ),
+    icon: <Sparkles className="h-6 w-6 text-gray-900" />,
     title: 'Memory & Context',
-    desc: 'Remembers your preferences, past conversations, and meeting transcripts. Learns your style over time.',
+    desc: 'Remembers your preferences, past conversations, and meeting transcripts. Learns your style.',
   },
   {
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M12 20h9" />
-        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-      </svg>
-    ),
+    icon: <Bell className="h-6 w-6 text-gray-900" />,
     title: 'Reminders & To-Dos',
     desc: 'Set one-off or recurring reminders, manage your task list, and get nudged at the right time.',
   },
   {
-    icon: (
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-        <polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
-      </svg>
-    ),
+    icon: <Zap className="h-6 w-6 text-gray-900" />,
     title: 'Takes Action',
-    desc: 'Doesn\'t just answer — drafts and sends emails, books meetings, searches the web, and acts on your behalf.',
+    desc: 'Doesn\'t just answer — drafts and sends emails, books meetings, and searches the web.',
   },
-]
-
-const HOW_STEPS = [
-  { num: '1', title: 'Connect Google', desc: 'Sign in with your Google account to give Nest secure access to your workspace.' },
-  { num: '2', title: 'Add to Contacts', desc: 'Save Nest as a contact so messages arrive cleanly in iMessage.' },
-  { num: '3', title: 'Start Chatting', desc: 'Text Nest anything. Like having a brilliant assistant who knows your world.' },
 ]
 
 function TypingIndicator() {
   return (
-    <div className="chat-row chat-row-nest">
-      <img src="/nest-logo.png" alt="" className="chat-avatar" />
-      <div className="typing-pill">
-        {[0, 1, 2].map(i => (
+    <div className="flex items-end gap-2 w-full">
+      <img src="/nest-logo.png" alt="" className="h-7 w-7 rounded-xl object-cover shadow-sm" />
+      <div className="flex h-[38px] items-center gap-1 rounded-2xl bg-gray-100/80 px-4">
+        {[0, 1, 2].map((i) => (
           <motion.span
             key={i}
-            className="typing-dot"
+            className="h-1.5 w-1.5 rounded-full bg-gray-400"
             animate={{ y: [0, -4, 0] }}
             transition={{
-              duration: 0.5,
+              duration: 0.6,
               repeat: Infinity,
-              delay: i * 0.12,
+              delay: i * 0.15,
               ease: 'easeInOut',
             }}
           />
@@ -144,30 +108,29 @@ export default function Welcome() {
   const [autoLinking, setAutoLinking] = useState(false)
   const [visibleMessages, setVisibleMessages] = useState<number[]>([])
   const [showTyping, setShowTyping] = useState(false)
-  const reducedMotion = useReducedMotion()
-
-  const ease = [0.16, 1, 0.3, 1] as const
-
-  const reveal = (delay = 0) => reducedMotion
-    ? { initial: { opacity: 0 }, whileInView: { opacity: 1 }, transition: { duration: 0.2 } }
-    : { initial: { opacity: 0, y: 32 }, whileInView: { opacity: 1, y: 0 }, transition: { duration: 0.7, ease, delay } }
 
   useEffect(() => {
     if (token) return
     let cancelled = false
     async function restoreSession() {
-      const { data: { session } } = await supabase.auth.getSession()
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
       if (!cancelled && session) navigate('/dashboard', { replace: true })
     }
     restoreSession()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [token, navigate])
 
   useEffect(() => {
     if (!token) return
     let cancelled = false
     async function tryAutoLink() {
-      const { data: { session } } = await supabase.auth.getSession()
+      const {
+        data: { session },
+      } = await supabase.auth.getSession()
       if (!session || cancelled) return
       setAutoLinking(true)
       try {
@@ -186,25 +149,34 @@ export default function Welcome() {
           }),
         })
         const data = await res.json()
-        if (data.success && !cancelled) { navigate('/dashboard', { replace: true }); return }
-      } catch { /* fall through */ }
+        if (data.success && !cancelled) {
+          navigate('/dashboard', { replace: true })
+          return
+        }
+      } catch {
+        /* fall through */
+      }
       if (!cancelled) setAutoLinking(false)
     }
     tryAutoLink()
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+    }
   }, [token, navigate])
 
   useEffect(() => {
     const timers: ReturnType<typeof setTimeout>[] = []
     for (const event of TIMELINE) {
-      timers.push(setTimeout(() => {
-        if (event.action === 'typing') {
-          setShowTyping(true)
-        } else if (event.action === 'msg' && event.msgId !== undefined) {
-          setShowTyping(false)
-          setVisibleMessages(prev => [...prev, event.msgId!])
-        }
-      }, event.at))
+      timers.push(
+        setTimeout(() => {
+          if (event.action === 'typing') {
+            setShowTyping(true)
+          } else if (event.action === 'msg' && event.msgId !== undefined) {
+            setShowTyping(false)
+            setVisibleMessages((prev) => [...prev, event.msgId!])
+          }
+        }, event.at)
+      )
     }
     return () => timers.forEach(clearTimeout)
   }, [])
@@ -223,395 +195,314 @@ export default function Welcome() {
 
   if (autoLinking) {
     return (
-      <motion.div className="page" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-        <main className="content">
-          <div className="loading-dots" role="status" aria-label="Verifying">
-            {[0, 1, 2].map(i => (
-              <motion.div key={i} className="loading-dot" animate={{ y: [0, -6, 0] }}
-                transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }} />
+      <motion.div
+        className="flex min-h-screen items-center justify-center bg-[#FAFAFA]"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+      >
+        <div className="flex flex-col items-center text-center">
+          <div className="mb-6 flex gap-2">
+            {[0, 1, 2].map((i) => (
+              <motion.div
+                key={i}
+                className="h-2 w-2 rounded-full bg-gray-400"
+                animate={{ y: [0, -6, 0] }}
+                transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }}
+              />
             ))}
           </div>
-          <h1 className="title">Verifying...</h1>
-          <p className="subtitle">Just a moment.</p>
-        </main>
+          <h1 className="text-2xl font-medium tracking-tight text-gray-900">Verifying...</h1>
+          <p className="mt-2 text-gray-500">Just a moment.</p>
+        </div>
       </motion.div>
     )
   }
 
-  const HERO_WORDS = ['Your', 'personal', 'chief', 'of', 'staff.']
-
   return (
     <motion.div
-      className="page page-scroll"
+      className="min-h-screen bg-[#FAFAFA] font-sans selection:bg-gray-200"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.4 }}
+      transition={{ duration: 0.5 }}
     >
-      <div className="orb-container" aria-hidden="true">
-        <div className="orb orb-1" />
-        <div className="orb orb-2" />
-        <div className="orb orb-3" />
-      </div>
-
-      {/* ── Nav ── */}
-      <header className="top-bar">
-        <div className="top-bar-left">
+      {/* Navigation */}
+      <header className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-6 py-4 lg:px-12 backdrop-blur-md bg-[#FAFAFA]/80">
+        <div className="flex items-center gap-3">
           <motion.img
-            src="/nest-logo.png" alt="Nest" className="top-bar-logo"
-            initial={{ opacity: 0, scale: 0.85 }}
+            src="/nest-logo.png"
+            alt="Nest"
+            className="h-8 w-8 rounded-[10px] shadow-sm"
+            initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.5, ease, delay: 0.05 }}
+            transition={{ duration: 0.5, delay: 0.1 }}
           />
           <motion.span
-            className="top-bar-wordmark"
-            initial={{ opacity: 0, x: -6 }}
+            className="text-xl font-semibold tracking-tight text-gray-900"
+            initial={{ opacity: 0, x: -10 }}
             animate={{ opacity: 1, x: 0 }}
-            transition={{ duration: 0.5, ease, delay: 0.1 }}
+            transition={{ duration: 0.5, delay: 0.15 }}
           >
             Nest
           </motion.span>
         </div>
         <motion.button
-          className="btn-nav-signup"
           onClick={handleLogin}
+          className="rounded-full bg-gray-900 px-5 py-2 text-sm font-medium text-white shadow-sm hover:bg-black transition-colors"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
-          transition={{ duration: 0.4, delay: 0.15 }}
-          whileTap={{ scale: 0.95 }}
-          aria-label="Sign up with Google"
+          transition={{ duration: 0.5, delay: 0.2 }}
+          whileTap={{ scale: 0.96 }}
         >
           Sign up
         </motion.button>
       </header>
 
-      {/* ── Mobile Hero (simple "Meet Nest" layout) ── */}
-      <section className="hero hero-top mobile-only" aria-label="Introduction">
-        <motion.h1
-          className="title title-mobile-hero"
-          initial={{ opacity: 0, y: 16 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, ease, delay: 0.15 }}
-        >
-          Meet Nest
-        </motion.h1>
-        <motion.p
-          className="subtitle subtitle-mobile-hero"
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5, ease, delay: 0.25 }}
-        >
-          Your personal chief of staff, right in iMessage.
-        </motion.p>
+      <main className="pt-32 pb-24 lg:pt-48">
+        {/* Hero Section */}
+        <section className="mx-auto max-w-7xl px-6 lg:px-12 flex flex-col lg:flex-row items-center gap-16 lg:gap-24">
+          <div className="flex-1 text-center lg:text-left">
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.5, delay: 0.2 }}
+              className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-600 mb-8 shadow-sm"
+            >
+              <img src="/imessage-icon.png" alt="" className="h-4 w-4" />
+              Available on iMessage
+            </motion.div>
 
-        <motion.div
-          className="chat-card chat-card-hero chat-card-full"
-          initial={{ opacity: 0, y: 20, scale: 0.97 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          transition={{ duration: 0.6, ease, delay: 0.4 }}
-        >
-          <div className="chat-card-header">
-            <img src="/nest-logo.png" alt="" className="chat-card-header-avatar" />
-            <div>
-              <div className="chat-card-header-name">Nest</div>
-              <div className="chat-card-header-status">iMessage</div>
-            </div>
-          </div>
-          <div className="chat-card-body">
-            {MESSAGES.filter(m => visibleMessages.includes(m.id)).map(msg => (
-              <motion.div
-                key={msg.id}
-                className={`chat-row chat-row-${msg.type === 'user' ? 'user' : 'nest'}`}
-                initial={{ opacity: 0, scale: 0.95, y: 8 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                transition={{ duration: 0.3, ease }}
+            <SplitText
+              text="Your personal chief of staff."
+              className="text-5xl sm:text-6xl lg:text-7xl font-semibold tracking-tight text-gray-900 leading-[1.1] mb-6"
+              delay={0.3}
+            />
+
+            <motion.p
+              className="text-lg sm:text-xl text-gray-600 leading-relaxed mb-10 max-w-2xl mx-auto lg:mx-0"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.7, delay: 0.7 }}
+            >
+              Nest connects to your email, calendar, and contacts — so you can get things done with a single text. No apps to download.
+            </motion.p>
+
+            <motion.div
+              className="flex flex-col sm:flex-row items-center gap-4 justify-center lg:justify-start"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.7, delay: 0.9 }}
+            >
+              <motion.button
+                onClick={handleLogin}
+                className="flex w-full sm:w-auto items-center justify-center gap-3 rounded-full bg-gray-900 px-8 py-4 text-base font-medium text-white shadow-lg shadow-gray-900/20 hover:bg-black transition-all"
+                whileTap={{ scale: 0.97 }}
+                whileHover={{ scale: 1.02 }}
+                transition={springSnappy}
               >
-                {msg.type === 'nest' && (
-                  <img src="/nest-logo.png" alt="" className="chat-avatar" />
-                )}
-                <div className={`bubble bubble-${msg.type === 'user' ? 'user' : 'nest'}`}>
-                  {msg.text}
+                <img src="/google-icon.png" alt="" className="h-5 w-5 bg-white rounded-full p-0.5" />
+                Continue with Google
+              </motion.button>
+              <motion.a
+                href="#features"
+                className="flex items-center gap-2 rounded-full px-6 py-4 text-base font-medium text-gray-600 hover:text-gray-900 transition-colors"
+                whileTap={{ scale: 0.97 }}
+              >
+                Learn more <ChevronRight className="h-4 w-4" />
+              </motion.a>
+            </motion.div>
+          </div>
+
+          {/* Interactive Chat Demo */}
+          <div className="flex-1 w-full max-w-md lg:max-w-none">
+            <motion.div
+              className="relative mx-auto w-full max-w-[380px] overflow-hidden rounded-[40px] border-[8px] border-gray-900 bg-white shadow-2xl"
+              initial={{ opacity: 0, y: 40, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1], delay: 0.5 }}
+            >
+              {/* Dynamic Island / Top Bar */}
+              <div className="absolute top-0 left-0 right-0 z-10 flex h-14 items-center justify-center bg-white/80 backdrop-blur-md border-b border-gray-100">
+                <div className="flex flex-col items-center">
+                  <div className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest">iMessage</div>
+                  <div className="text-sm font-medium text-gray-900">Nest</div>
                 </div>
-              </motion.div>
-            ))}
-            {showTyping && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.15 }}
-              >
-                <TypingIndicator />
-              </motion.div>
-            )}
-          </div>
-        </motion.div>
-      </section>
-
-      {/* ── Desktop Hero (two-column with word-by-word title) ── */}
-      <section className="welcome-hero desktop-only" aria-label="Introduction">
-        <div className="welcome-hero-left">
-          <motion.div
-            className="hero-badge"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5, ease, delay: 0.2 }}
-          >
-            <img src="/imessage-icon.png" alt="" className="hero-badge-icon" />
-            Available on iMessage
-          </motion.div>
-
-          <h1 className="hero-title">
-            {HERO_WORDS.map((word, i) => (
-              <motion.span
-                key={i}
-                className="hero-word"
-                initial={{ opacity: 0, y: 28 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{
-                  duration: 0.6,
-                  ease,
-                  delay: 0.3 + i * 0.06,
-                }}
-              >
-                {word}
-              </motion.span>
-            ))}
-          </h1>
-
-          <motion.p
-            className="hero-sub"
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.6, ease, delay: 0.65 }}
-          >
-            Your personal chief of staff, right inside iMessage. Nest connects to your email, calendar, and contacts — so you can get things done with a single text.
-          </motion.p>
-
-          <motion.div
-            className="welcome-hero-cta"
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.6, ease, delay: 0.8 }}
-          >
-            <motion.button
-              className="btn-hero-primary"
-              onClick={handleLogin}
-              whileTap={{ scale: 0.97 }}
-              whileHover={{ scale: 1.015 }}
-              transition={springSnappy}
-            >
-              <img src="/google-icon.png" alt="" className="btn-google-icon" />
-              Continue with Google
-            </motion.button>
-            <motion.a
-              className="btn-hero-secondary"
-              href="#how-it-works"
-              whileTap={{ scale: 0.97 }}
-              transition={springSnappy}
-            >
-              Learn more
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="12" y1="5" x2="12" y2="19" />
-                <polyline points="19 12 12 19 5 12" />
-              </svg>
-            </motion.a>
-          </motion.div>
-        </div>
-
-        <div className="welcome-hero-right">
-          <motion.div
-            className="chat-card chat-card-hero"
-            initial={{ opacity: 0, y: 24, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 0.7, ease, delay: 0.5 }}
-          >
-            <div className="chat-card-header">
-              <img src="/nest-logo.png" alt="" className="chat-card-header-avatar" />
-              <div>
-                <div className="chat-card-header-name">Nest</div>
-                <div className="chat-card-header-status">iMessage</div>
               </div>
-            </div>
-            <div className="chat-card-body">
-              {MESSAGES.filter(m => visibleMessages.includes(m.id)).map(msg => (
-                <motion.div
-                  key={msg.id}
-                  className={`chat-row chat-row-${msg.type === 'user' ? 'user' : 'nest'}`}
-                  initial={{ opacity: 0, scale: 0.95, y: 8 }}
-                  animate={{ opacity: 1, scale: 1, y: 0 }}
-                  transition={{ duration: 0.3, ease }}
-                >
-                  {msg.type === 'nest' && (
-                    <img src="/nest-logo.png" alt="" className="chat-avatar" />
+
+              <div className="h-[500px] w-full overflow-y-auto px-4 pt-20 pb-6 bg-[#F8F9FA]">
+                <AnimatedList>
+                  {MESSAGES.filter((m) => visibleMessages.includes(m.id)).map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`flex w-full ${msg.type === 'user' ? 'justify-end' : 'justify-start gap-2 items-end'}`}
+                    >
+                      {msg.type === 'nest' && (
+                        <img src="/nest-logo.png" alt="" className="h-7 w-7 rounded-xl object-cover shadow-sm mb-1" />
+                      )}
+                      <div
+                        className={`relative max-w-[80%] rounded-[20px] px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ${
+                          msg.type === 'user'
+                            ? 'bg-[#007AFF] text-white rounded-br-[4px]'
+                            : 'bg-white border border-gray-100 text-gray-900 rounded-bl-[4px]'
+                        }`}
+                      >
+                        {msg.text}
+                      </div>
+                    </div>
+                  ))}
+                  {showTyping && (
+                    <div key="typing">
+                      <TypingIndicator />
+                    </div>
                   )}
-                  <div className={`bubble bubble-${msg.type === 'user' ? 'user' : 'nest'}`}>
-                    {msg.text}
+                </AnimatedList>
+              </div>
+            </motion.div>
+          </div>
+        </section>
+
+        {/* Features Section */}
+        <section id="features" className="mx-auto max-w-7xl px-6 lg:px-12 mt-32 lg:mt-48">
+          <div className="text-center mb-16 lg:mb-24">
+            <motion.h2
+              className="text-3xl sm:text-4xl lg:text-5xl font-semibold tracking-tight text-gray-900 mb-6"
+              initial={{ opacity: 0, y: 20 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: '-100px' }}
+              transition={{ duration: 0.6 }}
+            >
+              Everything you need,<br className="hidden sm:block" /> one text away.
+            </motion.h2>
+            <motion.p
+              className="text-lg text-gray-600 max-w-2xl mx-auto"
+              initial={{ opacity: 0, y: 20 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: '-100px' }}
+              transition={{ duration: 0.6, delay: 0.1 }}
+            >
+              Nest connects to your Google workspace, learns your world, and handles the rest. No app to open, no interface to learn.
+            </motion.p>
+          </div>
+
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-6 lg:gap-8">
+            {FEATURES.map((feature, i) => (
+              <motion.div
+                key={feature.title}
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: '-50px' }}
+                transition={{ duration: 0.5, delay: i * 0.1 }}
+              >
+                <SpotlightCard className="h-full flex flex-col">
+                  <div className="mb-5 inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-gray-50 border border-gray-100">
+                    {feature.icon}
                   </div>
-                </motion.div>
-              ))}
-              {showTyping && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.15 }}
-                >
-                  <TypingIndicator />
-                </motion.div>
-              )}
-            </div>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-2">{feature.title}</h3>
+                  <p className="text-gray-600 leading-relaxed flex-1">{feature.desc}</p>
+                </SpotlightCard>
+              </motion.div>
+            ))}
+          </div>
+        </section>
+
+        {/* Setup Section */}
+        <section className="mx-auto max-w-5xl px-6 lg:px-12 mt-32 lg:mt-48 text-center">
+          <motion.h2
+            className="text-3xl sm:text-4xl lg:text-5xl font-semibold tracking-tight text-gray-900 mb-16"
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: '-100px' }}
+            transition={{ duration: 0.6 }}
+          >
+            Up and running in 30 seconds.
+          </motion.h2>
+          
+          <div className="grid sm:grid-cols-3 gap-8 text-left relative">
+            <div className="hidden sm:block absolute top-8 left-[15%] right-[15%] h-[2px] bg-gray-100 -z-10" />
+            
+            {[
+              { step: '1', title: 'Connect Google', desc: 'Sign in with your Google account to give Nest secure access.' },
+              { step: '2', title: 'Add to Contacts', desc: 'Save Nest as a contact so messages arrive cleanly.' },
+              { step: '3', title: 'Start Chatting', desc: 'Text Nest anything. Like having a brilliant assistant.' }
+            ].map((s, i) => (
+              <motion.div
+                key={s.step}
+                className="relative bg-white/50 backdrop-blur-sm rounded-3xl p-6 border border-gray-100 shadow-sm"
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, margin: '-50px' }}
+                transition={{ duration: 0.5, delay: i * 0.15 }}
+              >
+                <div className="h-10 w-10 rounded-full bg-gray-900 text-white flex items-center justify-center font-semibold mb-6 shadow-md">
+                  {s.step}
+                </div>
+                <h3 className="text-xl font-semibold text-gray-900 mb-2">{s.title}</h3>
+                <p className="text-gray-600">{s.desc}</p>
+              </motion.div>
+            ))}
+          </div>
+        </section>
+
+        {/* Final CTA */}
+        <section className="mx-auto max-w-4xl px-6 lg:px-12 mt-32 lg:mt-48 mb-20 text-center">
+          <motion.div
+            className="rounded-[40px] bg-gray-900 p-10 sm:p-16 relative overflow-hidden"
+            initial={{ opacity: 0, scale: 0.95 }}
+            whileInView={{ opacity: 1, scale: 1 }}
+            viewport={{ once: true, margin: '-100px' }}
+            transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
+          >
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(255,255,255,0.1),transparent_50%)]" />
+            <h2 className="text-3xl sm:text-4xl lg:text-5xl font-semibold tracking-tight text-white mb-6 relative z-10">
+              Ready to meet your chief of staff?
+            </h2>
+            <p className="text-lg text-gray-300 mb-10 max-w-xl mx-auto relative z-10">
+              Connect your Google account and start chatting in iMessage. It takes less than 30 seconds.
+            </p>
+            <motion.button
+              onClick={handleLogin}
+              className="inline-flex items-center justify-center gap-3 rounded-full bg-white px-8 py-4 text-base font-medium text-gray-900 shadow-xl hover:bg-gray-50 transition-colors relative z-10"
+              whileTap={{ scale: 0.97 }}
+              whileHover={{ scale: 1.02 }}
+              transition={springSnappy}
+            >
+              Get Started Free
+            </motion.button>
           </motion.div>
+        </section>
+      </main>
+
+      {/* Footer & Compliance */}
+      <footer className="border-t border-gray-200 bg-white">
+        <div className="mx-auto max-w-4xl px-6 py-12 lg:py-16 text-center">
+          <div className="flex justify-center items-center gap-2 mb-8">
+            <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-md opacity-80 grayscale" />
+            <span className="text-lg font-semibold text-gray-900 tracking-tight">Nest</span>
+          </div>
+
+          <div className="text-[13px] leading-relaxed text-gray-500 max-w-2xl mx-auto space-y-4 mb-8">
+            <p>
+              Nest operates exclusively through Apple Messages for Business to provide a seamless, secure experience. 
+              Need human help? Text <strong>'agent'</strong>, <strong>'support'</strong>, or <strong>'help'</strong> during business hours to reach a live agent.
+            </p>
+            <p>
+              We will send important notifications related to your account status or transactions. 
+              Manage your preferences easily by texting <strong>'unsubscribe'</strong> or <strong>'menu'</strong> at any time.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap justify-center items-center gap-x-8 gap-y-4 text-sm font-medium text-gray-600">
+            <Link to="/privacy" className="hover:text-gray-900 transition-colors">Privacy Policy</Link>
+            <Link to="/terms" className="hover:text-gray-900 transition-colors">Terms of Service</Link>
+            <a href="mailto:nestchatapp123@gmail.com" className="hover:text-gray-900 transition-colors">Contact Support</a>
+          </div>
+          
+          <div className="mt-8 text-xs text-gray-400">
+            &copy; {new Date().getFullYear()} Nest AI. All rights reserved.
+          </div>
         </div>
-      </section>
-
-      {/* ── Mobile CTA ── */}
-      <motion.div
-        className="bottom-cta bottom-cta-mobile"
-        initial={{ opacity: 0, y: 16 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ ...spring, delay: 0.7 }}
-      >
-        <motion.a
-          className="btn-dark"
-          href="sms:nestchatapp123@gmail.com&body=Hey%20Nest!"
-          style={{ textDecoration: 'none' }}
-          whileTap={{ scale: 0.97 }}
-          transition={springSnappy}
-        >
-          Open in iMessage
-        </motion.a>
-      </motion.div>
-
-      {/* ── Features ── */}
-      <section className="landing-section desktop-only" aria-label="Features">
-        <motion.span className="section-label" {...reveal()} viewport={{ once: true, margin: '-80px' }}>
-          Capabilities
-        </motion.span>
-        <motion.h2 className="section-title" {...reveal(0.05)} viewport={{ once: true, margin: '-80px' }}>
-          Everything you need,{'\n'}one text away.
-        </motion.h2>
-        <motion.p className="section-subtitle" {...reveal(0.1)} viewport={{ once: true, margin: '-80px' }}>
-          Nest connects to your Google workspace, learns your world, and handles the rest. No app to open, no interface to learn — just text.
-        </motion.p>
-
-        <div className="features-grid">
-          {FEATURES.map((feature, i) => (
-            <motion.div
-              key={feature.title}
-              className="feature-card"
-              initial={{ opacity: 0, y: 40 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true, margin: '-40px' }}
-              transition={{ duration: 0.6, ease, delay: 0.1 + i * 0.08 }}
-            >
-              <div className="feature-icon">{feature.icon}</div>
-              <h3 className="feature-title">{feature.title}</h3>
-              <p className="feature-desc">{feature.desc}</p>
-            </motion.div>
-          ))}
-        </div>
-      </section>
-
-      {/* ── How It Works ── */}
-      <section className="landing-section landing-section-alt desktop-only" id="how-it-works" aria-label="How it works">
-        <motion.span className="section-label" {...reveal()} viewport={{ once: true, margin: '-80px' }}>
-          Setup
-        </motion.span>
-        <motion.h2 className="section-title" {...reveal(0.05)} viewport={{ once: true, margin: '-80px' }}>
-          Up and running{'\n'}in 30 seconds.
-        </motion.h2>
-        <motion.p className="section-subtitle" {...reveal(0.1)} viewport={{ once: true, margin: '-80px' }}>
-          No app to download. No new interface to learn. Just iMessage.
-        </motion.p>
-
-        <div className="how-steps">
-          {HOW_STEPS.map((step, i) => (
-            <motion.div
-              key={step.num}
-              className="how-step-card"
-              initial={{ opacity: 0, y: 40 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true, margin: '-40px' }}
-              transition={{ duration: 0.6, ease, delay: 0.1 + i * 0.08 }}
-            >
-              <div className="how-step-number">{step.num}</div>
-              <h3 className="how-step-title">{step.title}</h3>
-              <p className="how-step-desc">{step.desc}</p>
-            </motion.div>
-          ))}
-        </div>
-      </section>
-
-      {/* ── Trust ── */}
-      <motion.div
-        className="trust-strip desktop-only"
-        initial={{ opacity: 0 }}
-        whileInView={{ opacity: 1 }}
-        viewport={{ once: true }}
-        transition={{ duration: 0.6 }}
-        aria-label="Integrations"
-      >
-        <span className="trust-label">Works with</span>
-        <div className="trust-logos">
-          {['Gmail', 'Calendar', 'Contacts', 'iMessage'].map((name) => (
-            <div key={name} className="trust-item">
-              {name === 'iMessage' ? (
-                <img src="/imessage-icon.png" alt="" className="trust-icon-img" />
-              ) : (
-                <svg className="trust-icon-svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                  {name === 'Gmail' && <><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" /><polyline points="22,6 12,13 2,6" /></>}
-                  {name === 'Calendar' && <><rect x="3" y="4" width="18" height="18" rx="2" ry="2" /><line x1="16" y1="2" x2="16" y2="6" /><line x1="8" y1="2" x2="8" y2="6" /><line x1="3" y1="10" x2="21" y2="10" /></>}
-                  {name === 'Contacts' && <><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" /></>}
-                </svg>
-              )}
-              {name}
-            </div>
-          ))}
-        </div>
-      </motion.div>
-
-      {/* ── Final CTA ── */}
-      <motion.section
-        className="final-cta desktop-only"
-        {...reveal()}
-        viewport={{ once: true, margin: '-60px' }}
-        aria-label="Get started"
-      >
-        <h2 className="section-title">Ready to meet your{'\n'}chief of staff?</h2>
-        <p className="section-subtitle">
-          Connect your Google account and start chatting in iMessage.{'\n'}It takes less than 30 seconds.
-        </p>
-        <motion.button
-          className="btn-cta-final"
-          onClick={handleLogin}
-          whileTap={{ scale: 0.97 }}
-          whileHover={{ scale: 1.015 }}
-          transition={springSnappy}
-        >
-          Get Started Free
-        </motion.button>
-      </motion.section>
-
-      {/* ── Footer ── */}
-      <footer className="landing-footer">
-        <Link to="/privacy">Privacy</Link>
-        <span className="landing-footer-dot">·</span>
-        <Link to="/terms">Terms</Link>
-        <span className="landing-footer-dot desktop-only">·</span>
-        <a href="mailto:nestchatapp123@gmail.com" className="desktop-only">Support</a>
       </footer>
-
-      <motion.div
-        className="legal-footer mobile-only"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        transition={{ duration: 0.4, delay: 0.8 }}
-      >
-        <Link to="/privacy">Privacy</Link>
-        <span className="legal-footer-dot">·</span>
-        <Link to="/terms">Terms</Link>
-      </motion.div>
     </motion.div>
   )
 }
