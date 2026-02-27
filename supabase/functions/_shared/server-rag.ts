@@ -21,6 +21,7 @@
 
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getBatchEmbeddings, vectorString } from "./tools.ts";
+import { logApiUsage } from "./cost-tracker.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
@@ -281,7 +282,7 @@ export async function serverSideRAG(
   // 5. Batch-embed all sub-queries in ONE API call + start planner concurrently
   const [, plan] = await Promise.all([
     embedCache.ensureCached(subQueries),
-    planQuery(enrichedQuery),
+    planQuery(enrichedQuery, { userId, supabase }),
   ]);
 
   // 6. Initial parallel search (embeddings already cached — just RPC calls)
@@ -501,7 +502,10 @@ function generateSubQueries(query: string): string[] {
 
 // ── LLM Query Planner ───────────────────────────────────────
 
-async function planQuery(query: string): Promise<QueryPlan | null> {
+async function planQuery(
+  query: string,
+  logCtx?: { userId: string; supabase: SupabaseClient },
+): Promise<QueryPlan | null> {
   try {
     const prompt = `You are a query planning agent for a personal productivity app. The user has notes, meeting transcripts, emails, and calendar events indexed.
 
@@ -515,6 +519,7 @@ Return ONLY valid JSON, no markdown, no explanation.
 
 User question: ${query}`;
 
+    const _t0 = Date.now();
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -535,6 +540,17 @@ User question: ${query}`;
     }
 
     const data = await response.json();
+    if (logCtx && data.usage) {
+      await logApiUsage(logCtx.supabase, {
+        userId: logCtx.userId, model: "gpt-4.1-mini", endpoint: "rag-planner",
+        description:     "RAG query planning (source & intent detection)",
+        tokensIn:        data.usage.prompt_tokens                              ?? 0,
+        tokensOut:       data.usage.completion_tokens                          ?? 0,
+        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
+        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        latencyMs:       Date.now() - _t0,
+      });
+    }
     const text = data.choices?.[0]?.message?.content ?? "";
     return parseQueryPlan(text);
   } catch (e) {

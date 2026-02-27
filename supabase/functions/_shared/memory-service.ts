@@ -14,6 +14,7 @@
 
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import type { IdentityModel } from "./personality-agent.ts";
+import { logApiUsage } from "./cost-tracker.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
@@ -114,6 +115,8 @@ export async function updateMemory(
     existing?.emotionalArc,
     existing?.relationshipNotes,
     existing?.keyMoments,
+    userId,
+    supabase,
   );
   if (!newSummary) return;
 
@@ -184,6 +187,8 @@ async function summariseConversation(
   existingEmotionalArc?: string | null,
   existingRelationshipNotes?: string | null,
   existingKeyMoments?: KeyMoment[] | null,
+  userId?: string,
+  supabase?: SupabaseClient,
 ): Promise<SummaryResult | null> {
   const conversationText = messages
     .map((m) => `${m.role}: ${m.content.slice(0, 300)}`)
@@ -297,6 +302,7 @@ LEARNING EXTRACTION RULES:
 Return ONLY valid JSON, no markdown fences.`;
 
   try {
+    const _t0 = Date.now();
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -320,6 +326,17 @@ Return ONLY valid JSON, no markdown fences.`;
     }
 
     const data = await resp.json();
+    if (userId && supabase && data.usage) {
+      await logApiUsage(supabase, {
+        userId, model: "gpt-4.1-mini", endpoint: "memory-summary",
+        description:     "Rolling conversation summary update",
+        tokensIn:        data.usage.prompt_tokens                              ?? 0,
+        tokensOut:       data.usage.completion_tokens                          ?? 0,
+        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
+        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        latencyMs: Date.now() - _t0,
+      });
+    }
     const raw = data.choices?.[0]?.message?.content ?? "";
     const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     const parsed = JSON.parse(cleaned);
@@ -489,6 +506,7 @@ export async function extractLearnings(
   const today = new Date().toISOString().slice(0, 10);
 
   try {
+    const _t0 = Date.now();
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -512,6 +530,17 @@ export async function extractLearnings(
     }
 
     const data = await resp.json();
+    if (data.usage) {
+      await logApiUsage(supabase, {
+        userId, model: "gpt-4.1-nano", endpoint: "memory-learnings",
+        description:     "User learning & preference extraction",
+        tokensIn:        data.usage.prompt_tokens                              ?? 0,
+        tokensOut:       data.usage.completion_tokens                          ?? 0,
+        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
+        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        latencyMs: Date.now() - _t0,
+      });
+    }
     const raw = data.choices?.[0]?.message?.content ?? "[]";
     const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     const learnings = JSON.parse(cleaned);
@@ -657,6 +686,7 @@ RULES:
 Return ONLY valid JSON, no markdown fences.`;
 
   try {
+    const _t0 = Date.now();
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -680,6 +710,17 @@ Return ONLY valid JSON, no markdown fences.`;
     }
 
     const data = await resp.json();
+    if (data.usage) {
+      await logApiUsage(supabase, {
+        userId, model: "gpt-4.1-mini", endpoint: "memory-identity",
+        description:     "Identity & personality model update",
+        tokensIn:        data.usage.prompt_tokens                              ?? 0,
+        tokensOut:       data.usage.completion_tokens                          ?? 0,
+        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
+        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        latencyMs: Date.now() - _t0,
+      });
+    }
     const raw = data.choices?.[0]?.message?.content ?? "";
     const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     const parsed = JSON.parse(cleaned);

@@ -2331,9 +2331,19 @@ export async function getEmbedding(text: string): Promise<number[]> {
   return embedding;
 }
 
-export async function getBatchEmbeddings(texts: string[]): Promise<number[][]> {
+export interface EmbeddingLogContext {
+  userId: string;
+  supabase: SupabaseClient;
+  endpoint?: string;
+}
+
+export async function getBatchEmbeddings(
+  texts: string[],
+  logCtx?: EmbeddingLogContext,
+): Promise<number[][]> {
   if (texts.length === 0) return [];
 
+  const t0 = Date.now();
   const resp = await retryFetch("https://api.openai.com/v1/embeddings", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -2345,6 +2355,21 @@ export async function getBatchEmbeddings(texts: string[]): Promise<number[][]> {
   }
 
   const data = await resp.json();
+
+  // Await cost logging — ensures DB row lands before caller continues
+  if (logCtx && data.usage) {
+    const { logApiUsage } = await import("./cost-tracker.ts");
+    await logApiUsage(logCtx.supabase, {
+      userId:      logCtx.userId,
+      model:       "text-embedding-3-large",
+      endpoint:    logCtx.endpoint ?? "embeddings",
+      description: `Embedding batch (${texts.length} text${texts.length !== 1 ? "s" : ""})`,
+      tokensIn:    data.usage.prompt_tokens ?? 0,
+      tokensOut:   0,
+      latencyMs:   Date.now() - t0,
+    });
+  }
+
   return (data.data as Array<{ index: number; embedding: number[] }>)
     .sort((a, b) => a.index - b.index)
     .map((d) => d.embedding);

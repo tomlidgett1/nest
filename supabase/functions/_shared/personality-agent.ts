@@ -24,6 +24,7 @@ import {
   type RouteResult,
   type PendingAction,
   type ReactionType,
+  type OpenAILogContext,
 } from "./orchestrator.ts";
 import { executeTool } from "./tools.ts";
 
@@ -1110,43 +1111,52 @@ function buildStyleMirrorBlock(
 
 // ── Conversation History Builder ─────────────────────────────
 
-const HISTORY_TOKEN_BUDGET = 80_000;
+// COST OPTIMISATION: Reduced from 80K. The rolling memory summary already
+// captures older context — that's its job. 15K is enough for ~20 recent
+// messages plus injected context blocks. Saves significant input tokens.
+const HISTORY_TOKEN_BUDGET = 15_000;
 
 function buildConversationHistory(
   currentMessage: string,
   recentChat: Array<{ role: string; content: string; created_at?: string }>,
   ctx: NestContext,
+  contextDepth: "full" | "minimal" = "full",
 ): Array<{ role: string; content: string }> {
   // Use user's local time for sentAt tags so the model sees the correct date
   const userTz = ctx.user.timezone || "UTC";
   const now = new Date().toLocaleString("sv-SE", { timeZone: userTz }).replace(" ", "T");
   const messages: Array<{ role: string; content: string }> = [];
 
-  // 0. Identity model (Layer 3) — WHO they are — shapes all responses
-  const identityBlock = buildIdentityBlock(ctx.memory?.identityModel);
-  if (identityBlock) {
-    messages.push(
-      { role: "user", content: tag("context", identityBlock, now) },
-      { role: "assistant", content: "I know them. This shapes everything I say." },
-    );
+  // ── Merged context injection ──────────────────────────────────
+  // COST OPTIMISATION: All context blocks merged into a SINGLE user/assistant
+  // turn pair. For "minimal" depth (light agent, confirmations), skip heavy
+  // blocks (identity model, learnings, relationship, profile, meeting pitch)
+  // saving ~1,500 tokens. Keep: memory summary, open loops, situational context.
+
+  const isMinimal = contextDepth === "minimal";
+  const contextSections: string[] = [];
+
+  // Identity model (Layer 3) — WHO they are (skip for minimal)
+  if (!isMinimal) {
+    const identityBlock = buildIdentityBlock(ctx.memory?.identityModel);
+    if (identityBlock) {
+      contextSections.push(identityBlock);
+    }
   }
 
-  // 1. Memory summary
+  // Memory summary + emotional arc + writing style (always — needed for continuity)
   if (ctx.memory?.summary) {
-    let mem = ctx.memory.summary;
-    if (ctx.memory.emotionalArc) {
-      mem += `\n\nEmotional arc (mood trend across recent conversations): ${ctx.memory.emotionalArc}`;
+    let mem = `CONVERSATION SUMMARY:\n${ctx.memory.summary}`;
+    if (!isMinimal && ctx.memory.emotionalArc) {
+      mem += `\n\nEmotional arc: ${ctx.memory.emotionalArc}`;
     }
-    if (ctx.memory.writingStyle) {
+    if (!isMinimal && ctx.memory.writingStyle) {
       mem += `\n\nWriting style: ${ctx.memory.writingStyle}`;
     }
-    messages.push(
-      { role: "user", content: tag("summary_of_conversation", mem, now) },
-      { role: "assistant", content: "Got it." },
-    );
+    contextSections.push(mem);
   }
 
-  // 1b. Open loops — unresolved conversation threads
+  // Open loops — unresolved conversation threads (always — relevant to any query)
   if (ctx.memory?.openLoops && ctx.memory.openLoops.length > 0) {
     const activeLoops = ctx.memory.openLoops
       .filter(l => l.status === "open")
@@ -1156,72 +1166,60 @@ function buildConversationHistory(
       const loopText = activeLoops
         .map(l => `- "${l.topic}" (${l.context})`)
         .join("\n");
-      messages.push(
-        { role: "user", content: tag("context", `OPEN THREADS: These are things the user mentioned but haven't resolved yet. You DON'T need to bring these up proactively. But if the conversation naturally touches a related topic, you can reference them like a friend who remembers: "how's the job hunt going?" or "did you ever sort out that invoice?"\n\nOnly reference an open loop when:\n- The user brings up a related topic\n- There's a natural lull in a casual conversation and you have a genuine reason to ask\n- It's been a few days since it was last mentioned and they seem open to chatting\n\nNever reference more than 1 open loop per conversation. Never force it.\n\n${loopText}`, now) },
-        { role: "assistant", content: "Noted, I'll bring these up only when they fit naturally." },
-      );
+      contextSections.push(`OPEN THREADS (reference naturally when relevant, max 1 per conversation, never force it):\n${loopText}`);
     }
   }
 
-  // 1c. Learned knowledge (Layer 1) — persistent preferences, corrections, facts
-  const learnedBlock = buildLearnedKnowledgeBlock(ctx.learnings);
-  if (learnedBlock) {
-    messages.push(
-      { role: "user", content: tag("context", learnedBlock, now) },
-      { role: "assistant", content: "I remember. I'll apply what I've learned." },
-    );
+  // Learned knowledge (Layer 1) — skip for minimal
+  if (!isMinimal) {
+    const learnedBlock = buildLearnedKnowledgeBlock(ctx.learnings);
+    if (learnedBlock) {
+      contextSections.push(learnedBlock);
+    }
   }
 
-  // 1d. Relationship memory (Layer 2) — our shared story
-  const relationshipBlock = buildRelationshipBlock(
-    ctx.memory?.relationshipNotes,
-    ctx.memory?.keyMoments,
-  );
-  if (relationshipBlock) {
-    messages.push(
-      { role: "user", content: tag("context", relationshipBlock, now) },
-      { role: "assistant", content: "I know where we stand. I'll match the vibe." },
+  // Relationship memory (Layer 2) — skip for minimal
+  if (!isMinimal) {
+    const relationshipBlock = buildRelationshipBlock(
+      ctx.memory?.relationshipNotes,
+      ctx.memory?.keyMoments,
     );
+    if (relationshipBlock) {
+      contextSections.push(relationshipBlock);
+    }
   }
 
-  // 1e. Situational context — what's happening in their life right now
+  // Situational context — what's happening in their life right now (always — needed for calendar merging)
   const situationalBlock = buildSituationalBlock(ctx.dailyBriefing, ctx.activeCommitments);
   if (situationalBlock) {
-    messages.push(
-      { role: "user", content: tag("context", situationalBlock, now) },
-      { role: "assistant", content: "I know what's going on. I'll use this naturally." },
-    );
+    contextSections.push(situationalBlock);
   }
 
-  // 1f. Meeting notes pitch — nudge to suggest meeting recording when relevant
-  const meetingPitchBlock = buildMeetingNotesPitchBlock(currentMessage, ctx);
-  if (meetingPitchBlock) {
-    messages.push(
-      { role: "user", content: tag("context", meetingPitchBlock, now) },
-      { role: "assistant", content: "I'll weave this in naturally if the moment is right." },
-    );
+  // Meeting notes pitch — skip for minimal
+  if (!isMinimal) {
+    const meetingPitchBlock = buildMeetingNotesPitchBlock(currentMessage, ctx);
+    if (meetingPitchBlock) {
+      contextSections.push(meetingPitchBlock);
+    }
   }
 
-  // 2. User context
-  const parts: string[] = [];
-  if (ctx.user.name) parts.push(`Name: ${ctx.user.name}`);
-  if (ctx.user.email) parts.push(`Email: ${ctx.user.email}`);
-  if (ctx.user.phone) parts.push(`Phone: ${ctx.user.phone}`);
+  // User context
+  const userParts: string[] = [];
+  if (ctx.user.name) userParts.push(`Name: ${ctx.user.name}`);
+  if (ctx.user.email) userParts.push(`Email: ${ctx.user.email}`);
+  if (ctx.user.phone) userParts.push(`Phone: ${ctx.user.phone}`);
   if (ctx.user.connectedAccounts && ctx.user.connectedAccounts.length > 1) {
-    parts.push(`Connected Google accounts: ${ctx.user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}`).join(", ")}`);
+    userParts.push(`Connected Google accounts: ${ctx.user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}`).join(", ")}`);
   }
   if (ctx.memory?.preferences && Object.keys(ctx.memory.preferences).length > 0) {
-    parts.push(`Preferences: ${JSON.stringify(ctx.memory.preferences)}`);
+    userParts.push(`Preferences: ${JSON.stringify(ctx.memory.preferences)}`);
   }
-  if (parts.length > 0) {
-    messages.push(
-      { role: "user", content: tag("context", parts.join("\n"), now) },
-      { role: "assistant", content: "Got it." },
-    );
+  if (userParts.length > 0) {
+    contextSections.push(userParts.join("\n"));
   }
 
-  // 3. User profile (rich profile from email/calendar/web scanning)
-  if (ctx.userProfile) {
+  // User profile (rich profile from email/calendar/web scanning) — skip for minimal
+  if (!isMinimal && ctx.userProfile) {
     const p = ctx.userProfile as Record<string, any>;
     const profileParts: string[] = [];
 
@@ -1288,55 +1286,29 @@ function buildConversationHistory(
     if (p.interests?.length > 0) profileParts.push(`INTERESTS: ${p.interests.join(", ")}`);
 
     if (profileParts.length > 0) {
-      messages.push(
-        { role: "user", content: tag("context", `USER PROFILE: This is everything you know about the user. You have this information already, use it directly when they ask about themselves, their schedule, their contacts, or anything covered here. Never say you "can't access" this or need to "look it up". If they ask "what do you know about me", answer from this data like a friend who pays attention.\n\nIMPORTANT: Only reference profile facts when they're NATURALLY RELEVANT to what the user is talking about. A friend doesn't randomly bring up your hobbies when you ask about emails. They mention your running habit when you're planning your weekend, or your work frustrations when you're venting about a project. Let the conversation topic guide which facts surface. Never force a callback just to show you know things.\n\n${profileParts.join("\n")}`, now) },
-        { role: "assistant", content: "I know them well. I'll let it come through naturally when it's relevant." },
-      );
+      contextSections.push(`USER PROFILE (use naturally when relevant, don't force callbacks):\n${profileParts.join("\n")}`);
     }
   }
 
-  // 3b. Profile freshly loaded — nudge the model to show off what it knows
-  if (ctx.profileIsNew && ctx.userProfile) {
+  // Profile freshly loaded — nudge to show off (skip for minimal)
+  if (!isMinimal && ctx.profileIsNew && ctx.userProfile) {
+    contextSections.push(`PROFILE JUST LOADED: Subtly show you've been paying attention. Drop 1-2 specific hints per response. Make them think "wait, how does it know that?" Be cheeky, not creepy.`);
+  }
+
+  // PDL welcome context (first message only, if no rich profile yet) — skip for minimal
+  if (!isMinimal && ctx.pdlWelcomeContext?.trim() && !ctx.userProfile) {
+    contextSections.push(`FIRST MESSAGE INTEL REVEAL: Answer their question first, then casually weave in ONE detail from this profile. Cheeky, not creepy. Don't dump their CV.\n\nPROFILE INTEL:\n${ctx.pdlWelcomeContext}`);
+  }
+
+  // Inject ALL context as a single user/assistant turn pair
+  if (contextSections.length > 0) {
     messages.push(
-      { role: "user", content: tag("context", `PROFILE JUST LOADED: You've recently learned a lot about this user from their emails, calendar, and web presence. This is still early in your relationship. Your job now is to subtly SHOW that you've been paying attention. Don't dump facts. Instead, weave in small, specific hints that you know things about them: a project they're working on, a person they interact with, a habit, a frustration. Make them think "wait, how does it know that?" in a good way. Drop 1-2 subtle callbacks per response for the next few exchanges. Be impressed by something specific about them. This is how you build trust and make them feel known.`, now) },
-      { role: "assistant", content: "I've done my homework. Time to show it off, subtly." },
+      { role: "user", content: tag("context", contextSections.join("\n\n───\n\n"), now) },
+      { role: "assistant", content: "I have full context. Ready." },
     );
   }
 
-  // 3c. PDL welcome context (first message only, if no rich profile yet)
-  // This fires on the user's FIRST real question after signup.
-  // The verified welcome message was generic ("you're in, ask me anything").
-  // NOW is when we reveal we know who they are — cheekily, woven into the answer.
-  if (ctx.pdlWelcomeContext?.trim() && !ctx.userProfile) {
-    messages.push(
-      { role: "user", content: tag("context", `FIRST MESSAGE INTEL REVEAL: This is your first real exchange after they signed up. You just sent them a cheeky "you're verified" message. Now they've asked you something.
-
-YOUR MISSION: Answer their question brilliantly AND casually drop that you know who they are. Make them think "wait, how does it know that?" in a good way.
-
-HOW TO DO IT:
-- Answer their actual question first (be genuinely helpful)
-- Then weave in ONE specific detail from the profile below as a side comment
-- Keep it cheeky, not creepy. Light, not intense
-- Don't dump their entire CV. Pick ONE thing and make it land
-
-GOOD examples (adapt to their actual question + profile):
-- They ask about restaurants: "I'd go with [answer]. Also, given you're based in Melbourne I'd check out [specific place]"
-- They ask a general question: "[great answer]. By the way, [their company] must keep you busy, I'll try to make your life easier"
-- They say something casual: "[witty reply]. Not what I expected from someone in [their industry] but I like it"
-- They ask what you can do: "[paint a picture]. And knowing you're in [role/industry], I've got a few ideas already"
-
-BAD examples:
-- "I see you're the Head of Product at Stripe" (too formal, reads like a dossier)
-- "According to my research, you work at..." (creepy, robotic)
-- Listing their full job history (way too much)
-
-PROFILE INTEL:
-${ctx.pdlWelcomeContext}`, now) },
-      { role: "assistant", content: "Got it. I'll answer their question and casually show I've done my homework." },
-    );
-  }
-
-  // 4. Pre-indexed evidence
+  // Pre-indexed evidence (separate block — may or may not be present)
   if (ctx.evidence?.trim()) {
     const isEmpty = ctx.evidence.includes("DATA RETRIEVAL RESULT: EMPTY");
     messages.push(
@@ -1345,7 +1317,7 @@ ${ctx.pdlWelcomeContext}`, now) },
     );
   }
 
-  // 5. Chat history
+  // Chat history
   const chat = recentChat.map((m) => {
     const ts = m.created_at ?? now;
     if (m.role === "user") return { role: "user", content: tag("user", m.content, ts) };
@@ -1372,10 +1344,10 @@ ${ctx.pdlWelcomeContext}`, now) },
     }
   }
 
-  // 6. Current message
+  // Current message
   messages.push({ role: "user", content: tag("user", currentMessage, now) });
 
-  // 7. Truncate
+  // Truncate
   return truncateHistory(messages, HISTORY_TOKEN_BUDGET);
 }
 
@@ -1518,7 +1490,8 @@ async function generateInlineAck(
   messages.push({ role: "user", content: message });
 
   const t0 = Date.now();
-  const resp = await callOpenAI(MODELS.fast, messages, 60, null);
+  const logCtx: OpenAILogContext = { userId: ctx.userId, supabase: ctx.supabase, endpoint: "chat-ack" };
+  const resp = await callOpenAI(MODELS.fast, messages, 60, null, logCtx);
   const raw = formatForIMessage(resp.content ?? "");
   let text = raw.split("\n")[0].trim();
   if (text.length > 0) text = text[0].toUpperCase() + text.slice(1);
@@ -1571,7 +1544,7 @@ export async function handleMessage(
   const executeToolCall = buildToolExecutor(ctx);
 
   // 4. Build conversation history (synchronous), then fire prefetch + RAG + ack in parallel
-  const conversationHistory = buildConversationHistory(message, recentChat, ctx);
+  const conversationHistory = buildConversationHistory(message, recentChat, ctx, routing.contextDepth);
   const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
 
   const shouldAck = routing.path === "agent" && options?.onAck && looksLikeToolQuery(message);
@@ -1616,19 +1589,32 @@ export async function handleMessage(
   const styleMirror = buildStyleMirrorBlock(style, rhythm, persistentStyle, humourLevel);
 
   // 6. Append channel formatting + style mirror + time context + time gap + recency + optional QA variation
-  const timeContextBlock = buildTimeContextBlock(ctx.user.timezone);
-  const timeGapBlock = buildTimeGapBlock(recentChat);
-  const recentlyReferenced = buildRecentlyReferencedBlock(recentChat, ctx.userProfile);
-  let fullSystemPrompt = routing.systemPrompt + "\n\n" + IMESSAGE_RULES + "\n\n" + styleMirror;
+  // COST OPTIMISATION: For minimal contextDepth (light agent, confirmations), skip
+  // IMESSAGE_RULES (~1,500 tokens) and time context blocks (~200 tokens). The compact
+  // prompt already includes intent-specific formatting rules.
+  const isMinimalPrompt = routing.contextDepth === "minimal";
+  let fullSystemPrompt = routing.systemPrompt!;
 
-  fullSystemPrompt += "\n\n" + timeContextBlock;
-
-  if (timeGapBlock) {
-    fullSystemPrompt += "\n\n" + timeGapBlock;
+  if (!isMinimalPrompt) {
+    fullSystemPrompt += "\n\n" + IMESSAGE_RULES;
   }
 
-  if (recentlyReferenced) {
-    fullSystemPrompt += "\n\n" + recentlyReferenced;
+  fullSystemPrompt += "\n\n" + styleMirror;
+
+  if (!isMinimalPrompt) {
+    const timeContextBlock = buildTimeContextBlock(ctx.user.timezone);
+    const timeGapBlock = buildTimeGapBlock(recentChat);
+    const recentlyReferenced = buildRecentlyReferencedBlock(recentChat, ctx.userProfile);
+
+    fullSystemPrompt += "\n\n" + timeContextBlock;
+
+    if (timeGapBlock) {
+      fullSystemPrompt += "\n\n" + timeGapBlock;
+    }
+
+    if (recentlyReferenced) {
+      fullSystemPrompt += "\n\n" + recentlyReferenced;
+    }
   }
 
   const correctionContext = buildCorrectionContextBlock(recentChat);
@@ -1660,6 +1646,7 @@ export async function handleMessage(
       }
     },
     prefetchedEvidence || undefined,
+    { userId: ctx.userId, supabase: ctx.supabase },
   );
 
   // 8. Format

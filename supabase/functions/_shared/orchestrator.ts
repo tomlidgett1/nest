@@ -17,8 +17,9 @@ const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 // ── Models ───────────────────────────────────────────────────
 
 export const MODELS = {
-  fast: "gpt-4.1-nano",        // Nano — casual conversation, ~100-200ms
-  agent: "gpt-4.1",                // GPT-4.1 — fast reasoning + tool use
+  fast: "gpt-4.1-nano",          // Nano — casual conversation, ~100-200ms
+  agent_light: "gpt-4.1-mini",   // Mini — simple single-tool queries (5x cheaper than full)
+  agent: "gpt-4.1",              // GPT-4.1 — complex reasoning + multi-tool
 } as const;
 
 // ── Types ────────────────────────────────────────────────────
@@ -33,6 +34,7 @@ export interface RoutingResult {
   tools: ToolDefinition[] | null;
   staticResponse?: string;       // pre-built response for static path
   prefetch?: PrefetchTask[];     // data to fetch in parallel
+  contextDepth?: "full" | "minimal"; // minimal = skip heavy context blocks (profile, learnings, identity model)
 }
 
 export interface PrefetchTask {
@@ -167,6 +169,61 @@ function hasSubstance(cleaned: string): boolean {
   return SUBSTANCE_SIGNALS.some((k) => cleaned.includes(k));
 }
 
+// ── Light Agent Intent Detection ─────────────────────────────
+// Detects simple queries that need 1-2 tool calls and no complex
+// reasoning. Returns the intent category (used to select a compact
+// system prompt + filtered tool subset) or null for full agent.
+// Conservative: when in doubt, return null → full agent.
+
+type LightAgentIntent = "calendar" | "weather" | "currency" | "reminder" | "todo" | "time" | "places" | "inbox" | null;
+
+function detectLightIntent(message: string): LightAgentIntent {
+  // Calendar READ — schedule lookups and availability checks
+  if (/(?:what(?:'s|\s+is|\s+do\s+i\s+have)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow|this\s+week|next\s+week|monday|tuesday|wednesday|thursday|friday|saturday|sunday))/i.test(message)) return "calendar";
+  if (/(?:my\s+(?:schedule|calendar|meetings?|agenda)\s+(?:for\s+)?(?:today|tomorrow|this\s+week|next\s+week))/i.test(message)) return "calendar";
+  if (/(?:when(?:'s|\s+is)\s+(?:my\s+)?(?:next\s+)?(?:meeting|call|event))/i.test(message)) return "calendar";
+  if (/(?:am\s+i\s+(?:free|busy)\s+(?:today|tomorrow|this\s+afternoon|this\s+morning|on\s+))/i.test(message)) return "calendar";
+  if (/(?:do\s+i\s+have\s+(?:any\s+)?(?:meetings?|calls?|events?)\s+(?:today|tomorrow|this\s+week))/i.test(message)) return "calendar";
+  if (/(?:what(?:'s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow)(?:'s)?\s+(?:schedule|calendar|agenda))/i.test(message)) return "calendar";
+
+  // Weather
+  if (/\b(?:weather|temperature|forecast|rain(?:ing)?|umbrella|humid|cold outside|hot outside)\b/i.test(message)) return "weather";
+
+  // Currency / forex
+  if (/\b(?:exchange rate|forex|\d+\s*(?:aud|usd|gbp|eur|jpy|cad|nzd|sgd|krw|thb|idr|myr|php|vnd|inr|cny|hkd|twd|chf|sek|nok|dkk|pln|czk|huf|mxn|brl|ars|clp|cop|pen|zar|aed|sar|try))\b/i.test(message)) return "currency";
+
+  // Reminder — matches "remind me to...", "can you remind me", "set a reminder", etc.
+  if (/\b(?:remind me\b|set (?:me )?(?:a )?reminder\b|alert me\b|nudge me\b)/i.test(message)) return "reminder";
+
+  // Todo — matches "add X to my list/todos", "put X on my list", "show my todos", etc.
+  // Guard: bail out if the message also mentions email/calendar (complex multi-intent → full agent)
+  if (
+    /\b(?:email|calendar|meeting|schedule|inbox)\b/i.test(message) === false &&
+    (
+      /\badd .{1,60} to (?:my )?(?:to-?do|task|shopping|grocery|groceries|list|todos?)\b/i.test(message) ||
+      /\bput .{1,60} (?:on|in) (?:my )?(?:to-?do|task|shopping|grocery|list|todos?)\b/i.test(message) ||
+      /\bshow (?:me )?(?:my )?(?:to-?do|task|todos?|list)\b/i.test(message) ||
+      /\bwhat(?:'s| is) on (?:my )?(?:to-?do|task|todos?|list)\b/i.test(message) ||
+      /\bmark .{1,40} (?:as )?(?:done|complete|finished)\b/i.test(message) ||
+      /\b(?:complete|tick off|cross off) .{1,40} (?:from|on|off) (?:my )?(?:list|todos?)\b/i.test(message) ||
+      /\bdelete .{1,40} (?:from|off) (?:my )?(?:list|todos?)\b/i.test(message)
+    )
+  ) return "todo";
+
+  // Time in another city
+  if (/\b(?:what(?:'s| is) the time in|time (?:in|at) (?:tokyo|london|new york|paris|singapore|dubai|sydney|la|sf|berlin|amsterdam))\b/i.test(message)) return "time";
+
+  // Places
+  if (/^(?:(?:what(?:'s| is)|where(?:'s| is)) the (?:address|phone|number) (?:of|for))\b/i.test(message)) return "places";
+
+  // Inbox — simple email checks
+  if (/\b(?:(?:any|new|recent|unread)\s+(?:emails?|messages?|mail))\b/i.test(message)) return "inbox";
+  if (/\b(?:what(?:'s|\s+is)\s+in\s+my\s+inbox)\b/i.test(message)) return "inbox";
+  if (/\b(?:check\s+(?:my\s+)?(?:inbox|email|mail))\b/i.test(message)) return "inbox";
+
+  return null;
+}
+
 // ── Prefetch Patterns ────────────────────────────────────────
 // If we can predict what data the agent will need from the message
 // alone, we fetch it in parallel with routing. This saves one full
@@ -229,22 +286,20 @@ function extractTravelCity(message: string): string | null {
 function detectPrefetch(message: string): PrefetchTask[] {
   const tasks: PrefetchTask[] = [];
 
-  // Always-on baseline: every agent-routed message gets today's calendar + recent emails.
-  // This ensures the agent always has situational context regardless of what was asked.
-  tasks.push({ tool: "calendar_lookup", args: { range: "today" } });
-  tasks.push({ tool: "gmail_search", args: { query: "newer_than:1d", max_results: 5 } });
+  // COST OPTIMISATION: No always-on baseline. Only prefetch when the message
+  // actually needs calendar/email data. The agent has tools to fetch on demand.
+  // This avoids injecting ~1,500 tokens of context into every call (and every
+  // subsequent tool round) for messages like "what's the weather?" or "remind
+  // me to call mum".
 
-  // Pattern-matched prefetches add targeted searches on top of the baseline.
+  // Calendar prefetch — only when the message is about schedule/meetings
   if (CALENDAR_PREFETCH_PATTERNS.some((p) => p.test(message))) {
     const range = extractTemporalHint(message) ?? "today";
-    // Only add if the range is different from the baseline "today"
-    if (range !== "today") {
-      tasks.push({ tool: "calendar_lookup", args: { range } });
-    }
+    tasks.push({ tool: "calendar_lookup", args: { range } });
   }
 
+  // Inbox prefetch — only when the message is about emails
   if (INBOX_PREFETCH_PATTERNS.some((p) => p.test(message))) {
-    // Broader inbox search on top of baseline
     tasks.push({ tool: "gmail_search", args: { query: "is:unread OR newer_than:1d", max_results: 10 } });
   }
 
@@ -267,7 +322,6 @@ function detectPrefetch(message: string): PrefetchTask[] {
     }
 
     const range = extractTemporalHint(message) ?? "this_week";
-    // Calendar already has baseline "today", add wider range for travel
     tasks.push({ tool: "calendar_lookup", args: { range } });
   }
 
@@ -895,30 +949,17 @@ function tzToCity(tz: string): string {
 // Core identity + tool guidance only. Channel-specific formatting
 // (iMessage bubbles, <nest-content>, etc.) is appended by the
 // personality agent layer.
+//
+// COST OPTIMISATION — Prompt caching:
+// The static instructions (identical across all users & calls) are placed
+// FIRST so OpenAI can cache the prefix at 50% discount on input tokens.
+// All dynamic data (user name, time, timezone, accounts) is appended at
+// the END in a ── USER CONTEXT ── block. Do NOT add dynamic content
+// above the USER CONTEXT marker.
 
-function buildAgentSystemPrompt(user: NestUser): string {
-  const now = new Date();
-  const tz = user.timezone;
-  const timeStr = now.toLocaleString("en-AU", {
-    weekday: "long", day: "numeric", month: "long", year: "numeric",
-    hour: "2-digit", minute: "2-digit", hour12: true,
-    timeZone: tz,
-  });
-  const tzAbbr = getTimezoneAbbr(now, tz);
+const AGENT_STATIC_PREFIX = `You are Nest. You live in iMessage. You are the user's person.
 
-  const accountsLine = user.connectedAccounts?.length
-    ? `Connected accounts: ${user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}`).join(", ")}`
-    : "";
-
-  return `You are Nest. You live in iMessage. You are ${user.name}'s person.
-
-Current time: ${timeStr} (${tzAbbr})
-User timezone: ${tz}
-Current location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
-IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
-User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
-
-You know ${user.name}. You remember things about them. You use what you know naturally, like a friend who pays attention, not a database running queries.
+You know the user. You remember things about them. You use what you know naturally, like a friend who pays attention, not a database running queries.
 
 ─── SITUATIONAL AWARENESS ───
 
@@ -944,7 +985,7 @@ When to call what:
 - Person info → person_lookup + semantic_search IN PARALLEL
 - Past meeting / past event / "when did we" / "date of" → semantic_search (check evidence first). If thin, follow up with gmail_search using relevant names/topics.
 - Emails → check evidence first, then semantic_search, then gmail_search if insufficient
-- Inbox summary / "summarise my inbox" / "what did I miss" / "overnight" → gmail_search with a TIME-APPROPRIATE query. Use "newer_than:1d" for today, "after:YYYY/MM/DD" for specific ranges. CRITICAL: Check the email dates in results against the current date/time. If the user asks "what did I miss overnight" and it's Wednesday morning, only show emails from Tuesday evening onwards, NOT emails from days ago. Discard any results that don't match the requested timeframe. Present results using <nest-content> structured format with each email as its own block.
+- Inbox summary / "summarise my inbox" / "what did I miss" / "overnight" → gmail_search with a TIME-APPROPRIATE query. Use "newer_than:1d" for today, "after:YYYY/MM/DD" for specific ranges. CRITICAL: Check the email dates in results against the current date/time in USER CONTEXT. If the user asks "what did I miss overnight" and it's Wednesday morning, only show emails from Tuesday evening onwards, NOT emails from days ago. Discard any results that don't match the requested timeframe. Present results using <nest-content> structured format with each email as its own block.
 - Weekly summary → gmail_search + calendar_lookup IN PARALLEL. Summarise by day using <nest-content>.
 - Bills/invoices → gmail_search with "invoice OR payment due OR bill"
 - Draft email → gather context first → send_draft → user confirms → send_email
@@ -959,7 +1000,7 @@ When to call what:
 - External info → web_search
 - Places / restaurants / businesses / "find me a" / "what's the address of" / "is X open" → places_search. For detailed info (reviews, hours), first search, then call again with place_id.
 - Weather → weather_lookup
-- Public transport / "next train" / "next bus" / "next tram" / "how do I get to X by transit" → travel_time with mode "transit" FIRST. This gives real-time departures based on NOW. Only fall back to web_search if travel_time returns ZERO_RESULTS (common in Japan/Asia). When presenting transit times, ALWAYS sanity-check them against the user's current local time. If the times are in the past or clearly from a different day, say so and re-search.
+- Public transport / "next train" / "next bus" / "next tram" / "how do I get to X by transit" → travel_time with mode "transit" FIRST. This gives real-time departures based on NOW. Only fall back to web_search if travel_time returns ZERO_RESULTS (common in Japan/Asia). When presenting transit times, ALWAYS sanity-check them against the user's current local time (from USER CONTEXT). If the times are in the past or clearly from a different day, say so and re-search.
 - Travel time / "when should I leave" / "how long to get to" → travel_time (origin + destination). Combine with calendar_lookup to calculate departure: if flight is at 10pm and travel_time says 45min, recommend leaving by a sensible time with buffer. For international flights, add 2.5-3hr airport buffer; domestic 1.5-2hr.
 - Airport logistics → gmail_search (flight confirmation for terminal/airline) + travel_time (home → airport) IN PARALLEL. Then calculate: flight_time - airport_buffer - travel_duration = recommended_departure.
 - "What do you know about me" / "tell me about myself" → You ALREADY have their full profile in your context. Do NOT call person_lookup for the current user. DO NOT dump everything you know in one message. Instead, TEASE IT OUT. Share ONE or TWO specific, interesting facts: something that makes them go "wait, how do you know that?", then STOP. Let them react. When they ask for more or seem curious, reveal the next layer. Drag this out across multiple exchanges. Think of it like a card game: you're revealing your hand one card at a time. Start with something unexpected (a hobby, a frustration, a specific person they work with), not the obvious stuff (job title, company). Be cocky about it. "oh you want to know what I know? let's just say I've done my homework". Never use headings, bold, or structured formatting. Just talk.
@@ -1023,9 +1064,9 @@ LIVE DATA (MANDATORY web_search):
 - Any specific number that changes daily → web_search.
 RULE: If you are about to state a specific real-time number (a rate, price, score, temperature) and you have NOT looked it up with a tool in THIS conversation, STOP. Call web_search first. Getting it wrong destroys trust instantly. A wrong exchange rate or stock price makes you look unreliable. Always look it up.
 
-TIME-AWARENESS: When presenting any scheduled time (train departures, bus times, flight times, event times), ALWAYS cross-check against the user's current local time (from TIME CONTEXT). If the times you found are in the past, say "those are past, let me find the next one" and re-search. If the times are clearly from a different day (e.g. you found 11:03am but it's 8pm), flag it: "looks like the next one is tomorrow at 11:03am". NEVER present a past time as "the next one".
+TIME-AWARENESS: When presenting any scheduled time (train departures, bus times, flight times, event times), ALWAYS cross-check against the user's current local time (from USER CONTEXT). If the times you found are in the past, say "those are past, let me find the next one" and re-search. If the times are clearly from a different day (e.g. you found 11:03am but it's 8pm), flag it: "looks like the next one is tomorrow at 11:03am". NEVER present a past time as "the next one".
 
-DATE-AWARENESS FOR EMAILS: When the user asks about recent emails ("overnight", "today", "this morning", "what did I miss"), ALWAYS compare email dates against the CURRENT date/time shown above. An email from 4 days ago is NOT "overnight". Calculate the actual time difference. If an email arrived on Feb 22 and today is Feb 26, that's 4 days ago, not overnight. Be precise about when things arrived relative to NOW.
+DATE-AWARENESS FOR EMAILS: When the user asks about recent emails ("overnight", "today", "this morning", "what did I miss"), ALWAYS compare email dates against the CURRENT date/time in USER CONTEXT. An email from 4 days ago is NOT "overnight". Calculate the actual time difference. If an email arrived on Feb 22 and today is Feb 26, that's 4 days ago, not overnight. Be precise about when things arrived relative to NOW.
 
 DRAFTS: Never ask clarifying questions about tone/format. Just draft it. The user can tweak after.
 Always gather context with tools first (calendar for scheduling, semantic_search for references).
@@ -1150,7 +1191,7 @@ If a tool fails, be honest and brief. Example: "Hmm, couldn't send that — look
 Read tools (calendar_lookup, gmail_search, contacts_search, document_search) automatically search ALL connected Google accounts. Results include an "account" field showing which account they came from.
 
 WRITE OPERATIONS (calendar_create, send_draft, send_email, calendar_update, calendar_delete):
-- If the user has MORE THAN ONE connected account, you MUST ask which account to use BEFORE calling the tool. Keep it casual, e.g. "want me to put that on your work calendar (tom@work.com) or personal (tom@gmail.com)?" or "sending from tom@work.com or tom@gmail.com?"
+- If the user has MORE THAN ONE connected account, you MUST ask which account to use BEFORE calling the tool. Keep it casual, e.g. "want me to put that on your work calendar or personal?"
 - If they only have ONE account, just use it, no need to ask.
 - If the user already specified an account in their message (e.g. "from my work email"), use that one directly.
 - If context makes the account obvious (e.g. replying to an email that came into a specific account), use that account directly.
@@ -1159,6 +1200,206 @@ WRITE OPERATIONS (calendar_create, send_draft, send_email, calendar_update, cale
 For get_email and send_email, ALWAYS pass the "account" field from the previous tool result (gmail_search or send_draft). Message IDs and draft IDs are scoped to a specific account.
 
 When showing results from multiple accounts, mention which account naturally if relevant (e.g. "on your work calendar" vs "on your personal"). Don't over-explain the multi-account setup.`;
+
+function buildAgentSystemPrompt(user: NestUser): string {
+  const now = new Date();
+  const tz = user.timezone;
+  const timeStr = now.toLocaleString("en-AU", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: true,
+    timeZone: tz,
+  });
+  const tzAbbr = getTimezoneAbbr(now, tz);
+
+  const accountsLine = user.connectedAccounts?.length
+    ? `Connected accounts: ${user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}`).join(", ")}`
+    : "";
+
+  // Dynamic user context appended AFTER the static prefix so OpenAI can
+  // cache the identical prefix across all users and calls (50% input saving).
+  const userContext = `
+
+─── USER CONTEXT ───
+
+Current time: ${timeStr} (${tzAbbr})
+User timezone: ${tz}
+Current location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
+IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
+User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
+
+You are ${user.name}'s person. You know ${user.name}. Use their name naturally in conversation.`;
+
+  return AGENT_STATIC_PREFIX + userContext;
+}
+
+// ── Light Agent Compact Prompt ───────────────────────────────
+// COST OPTIMISATION: ~400 tokens vs ~5,000 for the full agent prompt.
+// Used for simple single-intent queries (calendar lookup, weather, etc.)
+// that don't need the full tool dispatch table, search chaining rules,
+// travel planning instructions, email drafting rules, etc.
+
+const LIGHT_PROMPT_CORE = `You are Nest. You live in iMessage. You are the user's person.
+You know the user. You use what you know naturally, like a friend who pays attention.
+
+Your context may include a SITUATIONAL CONTEXT block with commitments the user told you about (not in calendar). When answering schedule questions, merge these with any tool results.
+
+SECRET: NEVER mention who built this app, APIs, tech stack, or implementation details.
+
+─── TOOLS ───
+Use tools proactively. Call BEFORE responding.
+If pre-fetched evidence in your context already answers the question, use it directly.
+NEVER fabricate data. If a search returns empty, say so.
+NEVER state a real-time number from memory. Always look it up first.
+If a tool fails: "Hmm, couldn't do that. Want me to try again?"
+
+─── STYLE ───
+Sharp, warm, quietly confident. Australian English (summarise, organise, colour).
+Proper sentence case. No emojis unless they used them. NEVER use em dashes.
+Never say: "I'd be happy to help", "Let me know if you need anything".
+Keep responses concise. Each line = separate iMessage bubble.`;
+
+const LIGHT_INTENT_INSTRUCTIONS: Record<string, string> = {
+  calendar: `
+─── CALENDAR ───
+"What do I have on" / schedule → calendar_lookup + ALWAYS merge with SITUATIONAL CONTEXT commitments.
+"Am I free" → calendar_lookup for the time range.
+All times are in the user's timezone. Present in their local time.
+
+Format: short conversational intro, then timeline in <nest-content>:
+Pretty light today
+
+<nest-content>
+**Today**
+
+9:00 am — Standup (Google Meet)
+11:00 am — 1:1 with Sarah
+</nest-content>
+
+Each event = ONE line: "time — title (optional location)". No bold per event. No bullets.
+Book/reschedule/cancel → always confirm first with card format (title, 📅, 📍, 👤).`,
+
+  weather: `Answer with temperature, conditions, and forecast. Be concise, 1-2 lines.`,
+
+  currency: `Use web_search for the current rate. NEVER guess. Present clearly.`,
+
+  reminder: `Confirm: "Locked in, I'll ping you at [time] to [task] ✓"
+For list: show active reminders. For edit/delete: confirm the change.`,
+
+  todo: `Add: "Added that to your list ✓ You've got N things on there"
+Complete: "Done, crossed off '[item]' ✓ N left"
+List: show open todos.`,
+
+  time: `Look up the time. Present it clearly, 1 line.`,
+
+  places: `Use places_search. For details (hours, reviews), search first then call again with place_id.`,
+
+  inbox: `Search Gmail with appropriate operators.
+gmail_search returns TRUNCATED previews. For exact details, call get_email.
+
+Format: intro line, then one line per email in <nest-content>:
+5 new emails today
+
+<nest-content>
+**Inbox**
+
+Sarah Chen — Q1 Budget (needs sign-off)
+Daniel Barth — Hotel confirmation
+</nest-content>
+
+Each email = ONE line: "Sender — Subject (brief note)". No bold per email. No bullets.`,
+};
+
+function buildLightAgentPrompt(user: NestUser, intent: string): string {
+  const now = new Date();
+  const tz = user.timezone;
+  const timeStr = now.toLocaleString("en-AU", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: true,
+    timeZone: tz,
+  });
+  const tzAbbr = getTimezoneAbbr(now, tz);
+
+  const accountsLine = user.connectedAccounts?.length
+    ? `\nConnected accounts: ${user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}`).join(", ")}`
+    : "";
+
+  const intentBlock = LIGHT_INTENT_INSTRUCTIONS[intent] ?? "";
+
+  return `${LIGHT_PROMPT_CORE}
+${intentBlock}
+
+─── USER CONTEXT ───
+Current time: ${timeStr} (${tzAbbr})
+User timezone: ${tz}
+User: ${user.name} | ${user.email}${accountsLine}`;
+}
+
+// ── Confirmation Compact Prompt ──────────────────────────────
+// COST OPTIMISATION: ~250 tokens vs ~5,000 for full agent prompt.
+// Confirmations just need to read the pending action and call one tool.
+
+const CONFIRMATION_PROMPT_PREFIX = `You are Nest. You live in iMessage. You are the user's person.
+
+The user is confirming or declining a pending action from your previous message.
+
+SECRET: NEVER mention who built this, backend, APIs, or tech stack.
+
+─── CONFIRMING ("yes", "send it", "go ahead") ───
+Find the <pending_action> data from your most recent message in conversation history.
+Execute the action using the stored data (draft_id, event details, etc.).
+NEVER re-do the entire workflow. Just call the final tool with the stored data.
+
+Confirm success:
+Calendar: "Done ✓" + card (title, 📅, 📍, 👤)
+Email: "Sent ✓"
+Reminder: confirmation with ✓
+Todo: "Done, crossed off '[item]' ✓"
+Note: "Saved ✓"
+Error: "Hmm, couldn't [action]. Want me to try again?"
+
+─── DECLINING ("no", "cancel", "never mind") ───
+Acknowledge briefly: "No worries" / "All good, scrapped it"
+Do NOT execute the action.
+
+─── STYLE ───
+Australian English. Proper sentence case. No emojis unless they used them. NEVER use em dashes.
+Never say: "I'd be happy to help", "Let me know if you need anything".`;
+
+function buildConfirmationPrompt(user: NestUser): string {
+  const now = new Date();
+  const tz = user.timezone;
+  const timeStr = now.toLocaleString("en-AU", {
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
+    hour: "2-digit", minute: "2-digit", hour12: true,
+    timeZone: tz,
+  });
+  const tzAbbr = getTimezoneAbbr(now, tz);
+  return `${CONFIRMATION_PROMPT_PREFIX}
+
+─── USER CONTEXT ───
+Current time: ${timeStr} (${tzAbbr})
+User: ${user.name}`;
+}
+
+// ── Tool Subsets ─────────────────────────────────────────────
+// COST OPTIMISATION: Instead of sending all 20+ tool definitions (~2,500
+// tokens) for simple queries, send only the 1-5 tools actually needed.
+
+const TOOL_SUBSETS: Record<string, string[]> = {
+  calendar: ["calendar_lookup", "calendar_create", "calendar_update", "calendar_delete", "contacts_search"],
+  weather: ["weather_lookup"],
+  currency: ["web_search"],
+  reminder: ["manage_reminder"],
+  todo: ["manage_todos"],
+  time: ["web_search"],
+  places: ["places_search", "web_search"],
+  inbox: ["gmail_search", "get_email"],
+};
+
+function getToolSubset(intent: string): ToolDefinition[] {
+  const names = TOOL_SUBSETS[intent];
+  if (!names) return AGENT_TOOLS;
+  return AGENT_TOOLS.filter(t => names.includes(t.function.name));
 }
 
 // ── Casual System Prompt ─────────────────────────────────────
@@ -1415,13 +1656,17 @@ export function routeMessage(message: string, user: NestUser): RoutingResult {
   );
 
   if (startsWithConfirmation) {
-    console.log(`[orchestrator] Confirmation → ${MODELS.agent} (may be approving pending action)`);
+    // COST OPTIMISATION: Confirmations just need to read the pending action from
+    // history and call one tool. Compact prompt (~250 tokens vs 5K) + mini model.
+    // Still gets ALL tools since we don't know which pending action is being confirmed.
+    console.log(`[orchestrator] Confirmation → ${MODELS.agent_light} (approving pending action)`);
     return {
       path: "agent",
-      model: MODELS.agent,
-      maxTokens: 2048,
-      systemPrompt: buildAgentSystemPrompt(user),
+      model: MODELS.agent_light,
+      maxTokens: 1024,
+      systemPrompt: buildConfirmationPrompt(user),
       tools: AGENT_TOOLS,
+      contextDepth: "minimal",
     };
   }
 
@@ -1441,7 +1686,26 @@ export function routeMessage(message: string, user: NestUser): RoutingResult {
     };
   }
 
-  // Tier 3: Agent — everything else
+  // Tier 3: Light agent — simple single-intent queries on gpt-4.1-mini (5x cheaper)
+  // COST OPTIMISATION: Compact prompt (~400 tokens vs 5K) + filtered tool subset
+  // (~300 tokens vs 2.5K) + minimal context depth. Total: ~4,600 tokens vs ~14,000.
+  const lightIntent = detectLightIntent(message);
+  if (lightIntent) {
+    const prefetch = detectPrefetch(message);
+    const tools = getToolSubset(lightIntent);
+    console.log(`[orchestrator] LightAgent(${lightIntent}) → ${MODELS.agent_light} | tools=${tools.map(t => t.function.name).join(",")} | prefetch=${prefetch.map(p => p.tool).join(",") || "none"}`);
+    return {
+      path: "agent",
+      model: MODELS.agent_light,
+      maxTokens: 1024,
+      systemPrompt: buildLightAgentPrompt(user, lightIntent),
+      tools,
+      prefetch: prefetch.length > 0 ? prefetch : undefined,
+      contextDepth: "minimal",
+    };
+  }
+
+  // Tier 4: Full agent — complex reasoning, multi-tool, drafting, travel planning
   const prefetch = detectPrefetch(message);
   console.log(`[orchestrator] Agent → ${MODELS.agent} | prefetch=${prefetch.map(p => p.tool).join(",") || "none"}`);
   return {
@@ -1482,6 +1746,7 @@ export async function executeRoute(
   conversationHistory: Array<{ role: string; content: string }>,
   executeToolCall: (name: string, args: Record<string, unknown>) => Promise<string>,
   prefetchedEvidence?: string,
+  logCtx?: OpenAILogContext,
 ): Promise<RouteResult> {
   // Static path — no API call
   if (routing.path === "static") {
@@ -1510,24 +1775,32 @@ export async function executeRoute(
 
   // Casual path — single call, no tools
   if (routing.path === "casual") {
-    const response = await callOpenAI(routing.model!, messages, routing.maxTokens, null);
+    const response = await callOpenAI(
+      routing.model!, messages, routing.maxTokens, null,
+      logCtx ? { ...logCtx, endpoint: "chat-casual" } : undefined,
+    );
     return { text: response.content ?? "", pendingActions: [] };
   }
 
   // Agent path — tool loop
-  return await agentLoop(routing, messages, executeToolCall);
+  return await agentLoop(routing, messages, executeToolCall, logCtx);
 }
 
 // ── Agent Tool Loop ──────────────────────────────────────────
 
-const MAX_TOOL_ROUNDS = 4;
-const MAX_TOTAL_TOOL_CALLS = 10;
+// COST OPTIMISATION: Reduced from 4/10 to 3/8. Most queries resolve in 1-2
+// rounds (fetch data → respond). 3 rounds still allows multi-step workflows
+// (e.g. search → get_email → draft) while preventing context snowball on
+// runaway chains. Each extra round resends the full growing context at $2/1M.
+const MAX_TOOL_ROUNDS = 3;
+const MAX_TOTAL_TOOL_CALLS = 8;
 const TOOL_TIMEOUT_MS = 15_000;
 
 async function agentLoop(
   routing: RoutingResult,
   messages: Array<Record<string, unknown>>,
   executeToolCall: (name: string, args: Record<string, unknown>) => Promise<string>,
+  logCtx?: OpenAILogContext,
 ): Promise<RouteResult> {
   let rounds = 0;
   let totalToolCalls = 0;
@@ -1542,6 +1815,7 @@ async function agentLoop(
       messages,
       routing.maxTokens,
       isLastRound ? null : routing.tools,
+      logCtx ? { ...logCtx, endpoint: isLastRound ? "chat-agent-final" : "chat-agent" } : undefined,
     );
 
     if (!response.tool_calls || response.tool_calls.length === 0) {
@@ -1629,7 +1903,10 @@ async function agentLoop(
   }
 
   console.warn(`[orchestrator] Hit max tool rounds (${rounds}/${MAX_TOOL_ROUNDS}), total calls: ${totalToolCalls}, forcing response`);
-  const finalResponse = await callOpenAI(routing.model!, messages, routing.maxTokens, null);
+  const finalResponse = await callOpenAI(
+    routing.model!, messages, routing.maxTokens, null,
+    logCtx ? { ...logCtx, endpoint: "chat-agent-final" } : undefined,
+  );
   return { text: finalResponse.content ?? "got a bit tangled up, can you try that again?", pendingActions };
 }
 
@@ -1711,11 +1988,18 @@ interface OpenAIMessage {
   }>;
 }
 
+export interface OpenAILogContext {
+  userId: string;
+  supabase: import("https://esm.sh/@supabase/supabase-js@2").SupabaseClient;
+  endpoint?: string;
+}
+
 async function callOpenAI(
   model: string,
   messages: Array<Record<string, unknown>>,
   maxTokens: number,
   tools: ToolDefinition[] | null,
+  logCtx?: OpenAILogContext,
 ): Promise<OpenAIMessage> {
   const isGpt5 = model.startsWith("gpt-5");
   const body: Record<string, unknown> = {
@@ -1733,6 +2017,7 @@ async function callOpenAI(
 
   const MAX_RETRIES = 2;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const t0 = Date.now();
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -1744,6 +2029,47 @@ async function callOpenAI(
 
     if (response.ok) {
       const data = await response.json();
+
+      // Await cost logging — ensures DB row lands before caller continues
+      if (logCtx && data.usage) {
+        const { logApiUsage } = await import("./cost-tracker.ts");
+
+        // Build a human-readable description from what the model actually did
+        const toolCalls: Array<{ function: { name: string } }> =
+          data.choices?.[0]?.message?.tool_calls ?? [];
+        const toolNames = toolCalls.map((tc: { function: { name: string } }) => tc.function.name);
+
+        let description: string;
+        const ep = logCtx.endpoint ?? "";
+        if (ep === "chat-ack") {
+          description = "Quick acknowledgment";
+        } else if (ep === "chat-casual") {
+          description = "Casual conversation";
+        } else if (toolNames.length > 0) {
+          description = `Agent called: ${toolNames.join(", ")}`;
+        } else if (ep.includes("final")) {
+          description = "Agent final response";
+        } else if (ep.includes("agent")) {
+          description = "Agent reasoning (no tools needed)";
+        } else {
+          description = ep;
+        }
+
+        await logApiUsage(logCtx.supabase, {
+          userId:           logCtx.userId,
+          model,
+          endpoint:         ep || (tools && tools.length > 0 ? "chat-agent" : "chat"),
+          description,
+          tokensIn:         data.usage.prompt_tokens                               ?? 0,
+          tokensOut:        data.usage.completion_tokens                           ?? 0,
+          tokensInCached:   data.usage.prompt_tokens_details?.cached_tokens        ?? 0,
+          tokensReasoning:  data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+          latencyMs:        Date.now() - t0,
+          // Store full tool call names in metadata for drill-down
+          metadata: toolNames.length > 0 ? { tools_called: toolNames } : undefined,
+        });
+      }
+
       return data.choices?.[0]?.message ?? { role: "assistant", content: "something went wrong" };
     }
 
@@ -1767,3 +2093,4 @@ async function callOpenAI(
 // ── Exports ──────────────────────────────────────────────────
 
 export { AGENT_TOOLS, STATIC_RESPONSES, QUICK_EXIT_WORDS, detectPrefetch, decideReaction, callOpenAI };
+export type { OpenAILogContext };
