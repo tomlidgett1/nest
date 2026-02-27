@@ -171,7 +171,7 @@ export default function Welcome() {
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: 'smooth' })
     }
-  }, [mobileMessages, mobileTyping])
+  }, [mobileMessages, mobileTyping, desktopMessages, desktopTyping])
 
   useEffect(() => {
     if (token) return
@@ -336,7 +336,9 @@ export default function Welcome() {
         {/* Chat Messages — auto-scrolling */}
         <div ref={chatScrollRef} className="flex-1 w-full flex flex-col gap-3 px-4 pt-4 pb-4 overflow-y-auto">
           <AnimatePresence mode="popLayout">
-            {MOBILE_MESSAGES.filter((m) => mobileMessages.includes(m.id)).map((msg) => (
+            {(token ? MOBILE_MESSAGES : DESKTOP_MESSAGES)
+              .filter((m) => (token ? mobileMessages : desktopMessages).includes(m.id))
+              .map((msg) => (
               <motion.div
                 key={msg.id}
                 initial={{ opacity: 0, y: 10, scale: 0.95 }}
@@ -358,7 +360,7 @@ export default function Welcome() {
                 </div>
               </motion.div>
             ))}
-            {mobileTyping && (
+            {(token ? mobileTyping : desktopTyping) && (
               <motion.div
                 key="typing"
                 initial={{ opacity: 0, y: 10, scale: 0.95 }}
