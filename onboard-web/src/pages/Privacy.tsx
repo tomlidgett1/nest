@@ -143,7 +143,7 @@ export default function Privacy() {
             <p className="mb-2">
               If you have any questions about this Privacy Policy, please contact us at:
             </p>
-            <p><strong className="text-gray-900 font-medium">nestchatapp123@gmail.com</strong></p>
+            <p><strong className="text-gray-900 font-medium">nest.chat@icloud.com</strong></p>
           </section>
         </div>
       </motion.main>

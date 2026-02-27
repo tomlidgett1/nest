@@ -41,6 +41,8 @@ class IncomingMessage:
     text: str
     sender: str
     timestamp: datetime
+    is_group: bool = False
+    chat_guid: str | None = None
 
 
 def apple_timestamp_to_datetime(nanoseconds: int) -> datetime:
@@ -135,63 +137,57 @@ def fetch_new_messages(
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA query_only=ON")
 
+        # style 43 = group chat, 45 = 1:1 DM
+        base_query = """
+            SELECT m.ROWID,
+                   m.guid,
+                   m.text,
+                   m.attributedBody,
+                   m.date,
+                   h.id AS sender,
+                   c.style,
+                   c.guid AS chat_guid
+            FROM message m
+            JOIN handle h ON m.handle_id = h.ROWID
+            LEFT JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            LEFT JOIN chat c ON c.ROWID = cmj.chat_id
+            WHERE m.is_from_me = 0
+              AND m.ROWID > ?
+        """
+
         if target_phone:
             cursor = conn.execute(
-                """
-                SELECT m.ROWID,
-                       m.guid,
-                       m.text,
-                       m.attributedBody,
-                       m.date,
-                       h.id AS sender
-                FROM message m
-                JOIN handle h ON m.handle_id = h.ROWID
-                WHERE h.id = ?
-                  AND m.is_from_me = 0
-                  AND m.ROWID > ?
-                ORDER BY m.ROWID ASC
-                """,
-                (target_phone, last_rowid),
+                base_query + " AND h.id = ? ORDER BY m.ROWID ASC",
+                (last_rowid, target_phone),
             )
         else:
             cursor = conn.execute(
-                """
-                SELECT m.ROWID,
-                       m.guid,
-                       m.text,
-                       m.attributedBody,
-                       m.date,
-                       h.id AS sender
-                FROM message m
-                JOIN handle h ON m.handle_id = h.ROWID
-                WHERE m.is_from_me = 0
-                  AND m.ROWID > ?
-                ORDER BY m.ROWID ASC
-                """,
+                base_query + " ORDER BY m.ROWID ASC",
                 (last_rowid,),
             )
 
         messages: list[IncomingMessage] = []
-        for rowid, guid, text, attributed_body, date_ns, sender in cursor.fetchall():
-            # Prefer text column; fall back to attributedBody for rich messages
+        for rowid, guid, text, attributed_body, date_ns, sender, chat_style, chat_guid in cursor.fetchall():
             msg_text = text
             if not msg_text and attributed_body:
                 msg_text = extract_text_from_attributed_body(attributed_body)
 
             if not msg_text or not msg_text.strip():
-                continue  # Skip empty messages (tapbacks, reactions, read receipts)
+                continue
 
             cleaned = msg_text.strip()
-            # Skip single-character messages and reaction artifacts
-            if len(cleaned) <= 1:
-                continue
-            # Skip messages that are just punctuation/symbols (tapback artifacts)
-            if all(c in "+\u200d\u200b\u00a0!?.,;:-_=/" for c in cleaned):
-                continue
-            # Skip carrier/system notifications (OTP codes, data alerts, etc.)
+            # Allow "?" / "??" / "???" through — they mean "I don't understand"
+            is_question_marks = cleaned.strip("?") == "" and len(cleaned) >= 1
+            if not is_question_marks:
+                if len(cleaned) <= 1:
+                    continue
+                if all(c in "+\u200d\u200b\u00a0!?.,;:-_=/" for c in cleaned):
+                    continue
             if _is_carrier_notification(cleaned):
                 logger.debug("Skipping carrier notification: %s", cleaned[:60])
                 continue
+
+            is_group = chat_style == 43
 
             messages.append(
                 IncomingMessage(
@@ -200,6 +196,8 @@ def fetch_new_messages(
                     text=msg_text.strip(),
                     sender=sender,
                     timestamp=apple_timestamp_to_datetime(date_ns),
+                    is_group=is_group,
+                    chat_guid=chat_guid,
                 )
             )
 

@@ -13,8 +13,9 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { targetedRAG } from "../_shared/server-rag.ts";
-import { getBatchEmbeddings, vectorString } from "../_shared/tools.ts";
+import { getBatchEmbeddings, vectorString, executeTool } from "../_shared/tools.ts";
 import { appendToConversation } from "../_shared/conversation-store.ts";
+import { getUserMemory } from "../_shared/memory-service.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
@@ -49,6 +50,11 @@ Deno.serve(async (req: Request) => {
       body.fired_event_ids ?? [],
       body.test_window_hours ?? 0
     );
+  }
+
+  // Route to daily briefing regeneration
+  if (body?.action === "check_daily_briefing") {
+    return await handleDailyBriefings();
   }
 
   // Route to cron reminder delivery
@@ -427,6 +433,248 @@ function buildFallbackPrep(
   return msg;
 }
 
+// ── Daily Briefing Generator (Situational Awareness Layer B) ──
+// Pre-computes a situational awareness briefing for each active user.
+// Called by the bridge cron loop (every 60s). Regenerates when stale
+// (date changed or >4 hours old). Zero request-time latency impact.
+
+const BRIEFING_SYSTEM_PROMPT = `You are building a situational awareness briefing for an AI assistant.
+Given the user's calendar, emails, conversation memory, and known commitments,
+write a concise briefing of what's happening in their life RIGHT NOW.
+
+Think about:
+- What are they doing today? Tomorrow?
+- Are they travelling? Where are they? Where are they going next?
+- Any deadlines, appointments, social events coming up?
+- Any open threads from recent conversations that are time-sensitive?
+- What would a personal assistant need to know to be maximally helpful today?
+
+Output a concise briefing (max 200 words). Be specific with dates, locations,
+and names. No fluff. No formatting. Just plain text.`;
+
+async function handleDailyBriefings(): Promise<Response> {
+  try {
+    // Find active users (users with recent messages in last 7 days)
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: activeUsers, error: usersError } = await supabaseAdmin
+      .from("v2_chat_messages")
+      .select("user_id")
+      .gte("created_at", sevenDaysAgo)
+      .eq("role", "user")
+      .limit(100);
+
+    if (usersError || !activeUsers) {
+      console.error("[v2-trigger] Active users query failed:", usersError?.message);
+      return jsonResponse({ error: "failed to query active users" }, 500);
+    }
+
+    // Deduplicate user IDs
+    const userIds = [...new Set(activeUsers.map((r: any) => r.user_id as string))];
+    if (userIds.length === 0) {
+      return jsonResponse({ briefings_updated: 0 }, 200);
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+    let updated = 0;
+
+    for (const userId of userIds) {
+      try {
+        // Check if briefing is stale
+        const { data: existing } = await supabaseAdmin
+          .from("v2_daily_briefing")
+          .select("briefing_date, generated_at")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        const isStale = !existing ||
+          existing.briefing_date < today ||
+          existing.generated_at < fourHoursAgo;
+
+        if (!isStale) continue;
+
+        await regenerateBriefing(userId, today);
+        updated++;
+      } catch (e) {
+        console.error(`[v2-trigger] Briefing failed for ${userId}:`, (e as Error).message);
+      }
+    }
+
+    console.log(`[v2-trigger] Daily briefings: ${updated} updated out of ${userIds.length} active users`);
+    return jsonResponse({ briefings_updated: updated, active_users: userIds.length }, 200);
+  } catch (e) {
+    console.error("[v2-trigger] Daily briefing handler error:", e);
+    return jsonResponse({ error: "briefing_failed" }, 500);
+  }
+}
+
+async function regenerateBriefing(userId: string, _today: string): Promise<void> {
+  const start = Date.now();
+
+  // Resolve user timezone
+  const { data: acct } = await supabaseAdmin
+    .from("user_google_accounts")
+    .select("timezone")
+    .eq("user_id", userId)
+    .eq("is_primary", true)
+    .maybeSingle();
+  const userTz = (acct?.timezone as string) ?? "Australia/Sydney";
+
+  // Compute "today" in the USER's timezone, not UTC
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: userTz }); // "2026-02-27" format
+
+  // Gather all data sources in parallel
+  const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString("en-CA", { timeZone: userTz });
+
+  const twoDaysAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+  const [commitments, recentLearnings, memory, recentMessages, calendarData, gmailData] = await Promise.all([
+    // Active commitments (next 7 days)
+    supabaseAdmin
+      .from("v2_user_learnings")
+      .select("content, target_date, expires_after, context, confidence")
+      .eq("user_id", userId)
+      .eq("category", "commitment")
+      .eq("active", true)
+      .gte("target_date", today)
+      .lte("target_date", nextWeek)
+      .order("target_date", { ascending: true })
+      .limit(15)
+      .then(r => r.data ?? []),
+
+    // Recent learnings (last 48h, all categories except commitment)
+    supabaseAdmin
+      .from("v2_user_learnings")
+      .select("category, content, confidence")
+      .eq("user_id", userId)
+      .eq("active", true)
+      .neq("category", "commitment")
+      .gte("last_observed_at", twoDaysAgo)
+      .order("last_observed_at", { ascending: false })
+      .limit(15)
+      .then(r => r.data ?? []),
+
+    // Memory summary + open loops
+    getUserMemory(userId, supabaseAdmin),
+
+    // Last 5 messages for recent conversation context
+    supabaseAdmin
+      .from("v2_chat_messages")
+      .select("role, content, created_at")
+      .eq("user_id", userId)
+      .in("role", ["user", "assistant"])
+      .order("created_at", { ascending: false })
+      .limit(5)
+      .then(r => (r.data ?? []).reverse()),
+
+    // Calendar events for today/tomorrow via executeTool
+    executeTool("calendar_lookup", { range: "next 2 days" }, userId, supabaseAdmin, userTz)
+      .catch(() => "[]"),
+
+    // Recent emails via executeTool
+    executeTool("gmail_search", { query: "newer_than:1d", max_results: 5 }, userId, supabaseAdmin, userTz)
+      .catch(() => "[]"),
+  ]);
+
+  // Build the briefing input
+  const parts: string[] = [`TODAY: ${today}`];
+
+  if (commitments.length > 0) {
+    parts.push("\nKNOWN COMMITMENTS (user told the assistant about these):");
+    for (const c of commitments) {
+      parts.push(`- ${c.content} (${c.target_date}${c.expires_after ? ` → ${c.expires_after}` : ""})`);
+    }
+  }
+
+  if (recentLearnings.length > 0) {
+    parts.push("\nRECENTLY LEARNED (extracted from recent conversations):");
+    for (const l of recentLearnings) {
+      parts.push(`- [${l.category}] ${l.content}`);
+    }
+  }
+
+  if (memory?.summary) {
+    parts.push(`\nCONVERSATION MEMORY:\n${memory.summary.slice(0, 500)}`);
+  }
+
+  if (memory?.openLoops && memory.openLoops.length > 0) {
+    const active = memory.openLoops.filter(l => l.status === "open").slice(0, 5);
+    if (active.length > 0) {
+      parts.push("\nOPEN THREADS:");
+      for (const l of active) {
+        parts.push(`- ${l.topic}: ${l.context}`);
+      }
+    }
+  }
+
+  if (calendarData && calendarData !== "[]") {
+    // Truncate calendar data to avoid bloating the prompt
+    const calStr = typeof calendarData === "string" ? calendarData : JSON.stringify(calendarData);
+    parts.push(`\nCALENDAR (today + tomorrow):\n${calStr.slice(0, 1500)}`);
+  }
+
+  if (gmailData && gmailData !== "[]") {
+    const gmStr = typeof gmailData === "string" ? gmailData : JSON.stringify(gmailData);
+    parts.push(`\nRECENT EMAILS:\n${gmStr.slice(0, 1000)}`);
+  }
+
+  if (recentMessages.length > 0) {
+    parts.push("\nRECENT CONVERSATION:");
+    for (const m of recentMessages) {
+      parts.push(`${m.role}: ${(m.content as string).slice(0, 150)}`);
+    }
+  }
+
+  // Generate briefing via LLM
+  try {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${openaiApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: BRIEFING_SYSTEM_PROMPT },
+          { role: "user", content: parts.join("\n") },
+        ],
+        max_tokens: 400,
+        temperature: 0.3,
+      }),
+    });
+
+    if (!resp.ok) {
+      console.error("[v2-trigger] Briefing LLM error:", resp.status);
+      return;
+    }
+
+    const data = await resp.json();
+    const briefing = data.choices?.[0]?.message?.content?.trim() ?? "";
+    if (briefing.length < 20) return;
+
+    // Upsert briefing
+    await supabaseAdmin
+      .from("v2_daily_briefing")
+      .upsert({
+        user_id: userId,
+        briefing_date: today,
+        briefing,
+        generated_at: new Date().toISOString(),
+        sources: JSON.stringify({
+          commitments: commitments.length,
+          has_memory: !!memory?.summary,
+          has_calendar: calendarData !== "[]",
+          has_email: gmailData !== "[]",
+        }),
+      }, { onConflict: "user_id" });
+
+    console.log(`[v2-trigger] Briefing regenerated for ${userId} (${briefing.length}c, ${Date.now() - start}ms)`);
+  } catch (e) {
+    console.error("[v2-trigger] Briefing generation failed:", (e as Error).message);
+  }
+}
+
 // ── Cron Reminder Delivery ────────────────────────────────────
 // Queries due cron triggers, generates conversational reminder messages
 // via GPT-4.1-nano, and returns them for iMessage delivery by the bridge.
@@ -447,10 +695,10 @@ RULES:
 - Each line = separate iMessage bubble
 
 EXAMPLES:
-Reminder: "call Sarah" -> "hey quick nudge, you wanted to call sarah\nwant me to find her number?"
-Reminder: "check quarterly report" -> "heads up, you wanted to check the quarterly report"
-Reminder: "pick up dry cleaning" -> "reminder: dry cleaning pickup today"
-Reminder: "follow up with James about proposal" -> "nudge, you wanted to follow up with james about the proposal\nwant me to draft something?"`;
+Reminder: "call Sarah" -> "Hey quick nudge, you wanted to call Sarah\nWant me to find her number?"
+Reminder: "check quarterly report" -> "Heads up, you wanted to check the quarterly report"
+Reminder: "pick up dry cleaning" -> "Reminder: dry cleaning pickup today"
+Reminder: "follow up with James about proposal" -> "Nudge, you wanted to follow up with James about the proposal\nWant me to draft something?"`;
 
 async function handleCronReminders(): Promise<Response> {
   try {
@@ -560,7 +808,7 @@ async function generateReminderMessage(description: string): Promise<string | nu
     // Timeout — fall back to simple message
   }
 
-  return `quick reminder: ${description}`;
+  return `Quick reminder: ${description}`;
 }
 
 function computeNextFire(cronExpression: string, tz = "Australia/Sydney"): string | null {
@@ -568,7 +816,7 @@ function computeNextFire(cronExpression: string, tz = "Australia/Sydney"): strin
     const parts = cronExpression.trim().split(/\s+/);
     if (parts.length < 5) return null;
 
-    const [minuteStr, hourStr, dayStr, monthStr] = parts;
+    const [minuteStr, hourStr, dayStr, monthStr, dowStr] = parts;
 
     // One-shot (specific day/month) — don't reschedule
     if (dayStr !== "*" && monthStr !== "*") return null;
@@ -576,7 +824,32 @@ function computeNextFire(cronExpression: string, tz = "Australia/Sydney"): strin
     const targetHour = hourStr === "*" ? 9 : parseInt(hourStr, 10);
     const targetMinute = minuteStr === "*" ? 0 : parseInt(minuteStr, 10);
 
-    return localTimeToUtc(targetHour, targetMinute, tz).toISOString();
+    let utcFire = localTimeToUtc(targetHour, targetMinute, tz);
+
+    // Handle day-of-week constraints (e.g., "0 9 * * 1" = every Monday)
+    if (dowStr && dowStr !== "*") {
+      const targetDow = parseInt(dowStr, 10); // 0=Sun, 1=Mon, ..., 6=Sat
+      if (!isNaN(targetDow) && targetDow >= 0 && targetDow <= 6) {
+        // Get the day-of-week of the computed fire time in the user's timezone
+        const fireParts = new Intl.DateTimeFormat("en-US", {
+          timeZone: tz,
+          weekday: "short",
+        }).formatToParts(utcFire);
+        const dowMap: Record<string, number> = {
+          Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+        };
+        const fireDow = dowMap[fireParts.find((p) => p.type === "weekday")?.value ?? ""] ?? -1;
+
+        if (fireDow !== targetDow) {
+          // Advance to the next occurrence of the target day
+          let daysAhead = targetDow - fireDow;
+          if (daysAhead <= 0) daysAhead += 7;
+          utcFire = new Date(utcFire.getTime() + daysAhead * 24 * 60 * 60 * 1000);
+        }
+      }
+    }
+
+    return utcFire.toISOString();
   } catch {
     return null;
   }

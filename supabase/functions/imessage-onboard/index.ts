@@ -1,12 +1,10 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { enrichByIdentity, profileToContext } from "../_shared/pdl-enrichment.ts";
+import { enrichByIdentity } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { linkConversationsToUser } from "../_shared/conversation-store.ts";
-import { refreshAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-const openaiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 const admin = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
@@ -279,23 +277,6 @@ async function handlePost(req: Request) {
     );
     console.log(`[onboard] Stored account ${profile.email} in user_google_accounts`);
 
-    // Fetch and store Google Calendar timezone (non-blocking)
-    (async () => {
-      try {
-        const { token: accessToken } = await refreshAccessToken(refreshToken!);
-        const tz = await fetchCalendarTimezone(accessToken);
-        if (tz) {
-          await admin.from("user_google_accounts")
-            .update({ timezone: tz })
-            .eq("user_id", uid)
-            .eq("google_email", profile!.email);
-          console.log(`[onboard] Stored timezone ${tz} for ${profile!.email}`);
-        }
-      } catch (e) {
-        console.warn("[onboard] Timezone fetch failed (non-blocking):", (e as Error).message);
-      }
-    })();
-
     if (imessageRowId && (profile?.name || profile?.email)) {
       const patch: Record<string, string> = { updated_at: new Date().toISOString() };
       if (profile.name) patch.display_name = profile.name;
@@ -432,24 +413,24 @@ async function sendPostSignupWelcome(
     .update(updatePayload)
     .eq("user_id", uid);
 
-  if (!bestProfile) {
-    console.log("[onboard] No PDL job data found, skipping personalised welcome");
-    // Send a more engaging generic welcome
-    // Add 4 second delay before sending
-    await delay(4000);
-    await admin.from("outbound_imessages").insert({
-      phone_number: phoneNumber,
-      content: `you're in.\nno rules, no bullshit - just answers.\nhit me with your first question`,
-    });
-    return;
+  if (bestProfile) {
+    console.log(`[onboard] PDL match: ${bestProfile.full_name} | ${bestProfile.job_title} @ ${bestProfile.job_company_name}`);
+  } else {
+    console.log("[onboard] No PDL job data found (profile cached for later use)");
   }
 
-  const pdlContext = profileToContext(bestProfile);
-  console.log(`[onboard] PDL match: ${bestProfile.full_name} | ${bestProfile.job_title} @ ${bestProfile.job_company_name}`);
-
-  // Generate a personalised welcome message via LLM
-  const welcomeMessage = await generateWelcome(displayName, pdlContext);
-  console.log(`[onboard] Welcome message: ${welcomeMessage.slice(0, 100)}`);
+  // Send a cheeky "verified" message — do NOT reveal PDL intel yet.
+  // The intel reveal happens naturally on their first real question,
+  // when the personality agent weaves it in.
+  const verifiedMessages = [
+    "Well look at that, you’re actually human\nI’m all yours now, go on, ask me anything",
+    "Verified. Welcome to the inner circle\nHit me with something, anything",
+    "Alright you passed the vibe check\nI’m ready when you are, what do you need",
+    "And just like that, you’re in\nGo on then, put me to work",
+    "Confirmed real human. Good start\nNow the fun part, what can I help with",
+  ];
+  const welcomeMessage = verifiedMessages[Math.floor(Math.random() * verifiedMessages.length)];
+  console.log(`[onboard] Welcome message: ${welcomeMessage.slice(0, 80)}`);
 
   // Queue for iMessage delivery after a 4 second delay
   await delay(4000);
@@ -461,70 +442,9 @@ async function sendPostSignupWelcome(
   console.log(`[onboard] Queued welcome iMessage for ${phoneNumber.slice(0, 6)}***`);
 }
 
-async function generateWelcome(name: string, pdlContext: string): Promise<string> {
-  if (!openaiKey) {
-    return `welcome back ${name.split(" ")[0].toLowerCase()}\nnow the real fun starts`;
-  }
-
-  const systemPrompt = `You are Nest, a sharp, witty AI assistant that lives in iMessage. The user just connected their Google account and you're about to send them their first real message.
-
-SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
-
-You have detailed intel on this person (see PROFILE INTEL). Your message should show you've done your homework while they were setting up. Be cheeky, confident, slightly cocky. The goal is to make them think "how does this thing know who I am?"
-
-Rules:
-- 2-3 short lines max (each line becomes a separate iMessage bubble)
-- Each line under 60 characters
-- Reference their SPECIFIC job title, company, industry, or career history
-- Make a light, witty observation about their work. Gentle roast of the role or industry
-- Don't explain how you know. Just drop it like you've always known
-- Don't introduce yourself or say "I'm Nest"
-- Don't ask questions like "want me to show you what I can do?"
-- Don't use emojis
-- End with something that implies you're ready to work, not a sales pitch
-- Australian English (analyse, organise, colour)
-- Never use em dashes
-
-Examples of tone (adapt to their ACTUAL data):
-"well well well. Sarah Chen, Head of Compliance at a Big Four firm. I bet you're fun at parties"
-"ah, James Mitchell. VP of Sales with 47 meetings this week and prep for exactly zero of them"
-"12 years in fintech and still going. that's either dedication or Stockholm syndrome"
-
-PROFILE INTEL:
-${pdlContext}`;
-
-  try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${openaiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        max_tokens: 150,
-        temperature: 0.9,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: "Generate the welcome message." },
-        ],
-      }),
-    });
-
-    if (!resp.ok) {
-      console.error(`[onboard] OpenAI error ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-      return `welcome back ${name.split(" ")[0].toLowerCase()}\nnow the real fun starts`;
-    }
-
-    const data = await resp.json();
-    const text = data.choices?.[0]?.message?.content?.trim();
-    if (text) return text;
-  } catch (e) {
-    console.error("[onboard] Welcome generation failed:", e);
-  }
-
-  return `welcome back ${name.split(" ")[0].toLowerCase()}\nnow the real fun starts`;
-}
+// generateWelcome() removed — post-signup now uses randomised cheeky
+// "verified" messages. PDL intel reveal happens on first real question
+// via the personality agent, not in the welcome message.
 
 async function triggerProfileBuild(userId: string): Promise<void> {
   const url = `${supabaseUrl}/functions/v1/profile-builder`;

@@ -4,6 +4,9 @@ Process 2: catches assistant and system messages pushed to v2_chat_messages
 by the v2-trigger edge function (email notifications, calendar alerts) and
 sends them as iMessages.  Also acts as a fallback if Process 1's fast-path
 send fails.
+
+In multi-user mode, listens for ALL users' messages and resolves the
+correct phone number from imessage_users.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ class RealtimeListener:
         self.state = state
         self._supabase = None
         self._channel = None
+        self._user_phone_cache: dict[str, str] = {}  # user_id -> phone_number
 
     async def start(self) -> None:
         """Connect to Supabase Realtime and subscribe to new messages."""
@@ -51,28 +55,80 @@ class RealtimeListener:
             await self._poll_fallback()
             return
 
+        # Pre-load the user→phone mapping
+        await self._load_user_phones()
+
         # Catch up on any messages missed while offline
         await self._catch_up()
 
         try:
             channel = self._supabase.realtime.channel("imessage-bridge")
-            channel.on_postgres_changes(
-                event="INSERT",
-                schema="public",
-                table="v2_chat_messages",
-                filter=f"user_id=eq.{self.config.user_id}",
-                callback=self._on_insert,
-            )
+
+            if self.config.multi_user:
+                # Multi-user: listen for ALL users' messages (no user_id filter)
+                channel.on_postgres_changes(
+                    event="INSERT",
+                    schema="public",
+                    table="v2_chat_messages",
+                    callback=self._on_insert,
+                )
+                logger.info("Realtime subscription active on v2_chat_messages (all users)")
+            else:
+                # Single-user: filter to just this user
+                channel.on_postgres_changes(
+                    event="INSERT",
+                    schema="public",
+                    table="v2_chat_messages",
+                    filter=f"user_id=eq.{self.config.user_id}",
+                    callback=self._on_insert,
+                )
+                logger.info("Realtime subscription active on v2_chat_messages (user %s)", self.config.user_id[:8])
+
             await channel.subscribe()
             self._channel = channel
-            logger.info("Realtime subscription active on v2_chat_messages")
 
-            # Keep alive
+            # Keep alive — periodically refresh the phone cache
             while True:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(300)  # Refresh every 5 minutes
+                await self._load_user_phones()
         except Exception:
             logger.exception("Realtime subscription failed, falling back to polling")
             await self._poll_fallback()
+
+    async def _load_user_phones(self) -> None:
+        """Load/refresh the user_id→phone_number mapping from imessage_users."""
+        try:
+            http = httpx.AsyncClient(timeout=10.0)
+            resp = await http.get(
+                f"{self.config.supabase_url}/rest/v1/imessage_users",
+                params={
+                    "status": "eq.active",
+                    "select": "user_id,phone_number",
+                },
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "apikey": self.config.supabase_service_role_key,
+                },
+            )
+            await http.aclose()
+            if resp.status_code == 200:
+                for row in resp.json():
+                    uid = row.get("user_id")
+                    phone = row.get("phone_number")
+                    if uid and phone:
+                        self._user_phone_cache[uid] = phone
+                logger.info("Loaded %d user→phone mappings", len(self._user_phone_cache))
+        except Exception:
+            logger.exception("Failed to load user phone mappings")
+
+    def _resolve_phone_for_user(self, user_id: str) -> str | None:
+        """Get the phone number for a user_id from cache."""
+        if user_id in self._user_phone_cache:
+            return self._user_phone_cache[user_id]
+        # Fallback to config target_phone for single-user mode
+        if not self.config.multi_user:
+            return self.config.target_phone
+        return None
 
     def _on_insert(self, payload: dict) -> None:
         """Handle a Realtime INSERT event (called from websocket thread)."""
@@ -86,6 +142,7 @@ class RealtimeListener:
             role = record.get("role", "")
             content = record.get("content", "")
             msg_id = record.get("id", "")
+            user_id = record.get("user_id", "")
 
             # Only forward assistant and system messages
             if role not in ("assistant", "system"):
@@ -98,20 +155,30 @@ class RealtimeListener:
             if msg_id in self.state.sent_message_ids:
                 return
 
+            # Resolve the phone number for this user
+            phone = self._resolve_phone_for_user(user_id)
+            if not phone:
+                logger.warning(
+                    "Realtime: no phone for user %s, skipping message %s",
+                    user_id[:8], msg_id[:8],
+                )
+                return
+
             logger.info(
-                "Realtime: new %s message (%s): %s",
+                "Realtime: new %s message (%s) for user %s: %s",
                 role,
                 msg_id[:8],
+                user_id[:8],
                 content[:80],
             )
 
             # Schedule the send on the event loop
             loop = asyncio.get_event_loop()
-            loop.create_task(self._send_and_track(msg_id, content))
+            loop.create_task(self._send_and_track(msg_id, content, phone))
         except Exception:
             logger.exception("Error in Realtime callback")
 
-    async def _send_and_track(self, msg_id: str, content: str) -> None:
+    async def _send_and_track(self, msg_id: str, content: str, phone: str) -> None:
         """Send an iMessage and mark as sent in state.
 
         Waits briefly before sending so the Processor (Process 1) has time to
@@ -128,7 +195,7 @@ class RealtimeListener:
             )
             return
 
-        sent = await send_imessage(self.config.target_phone, content)
+        sent = await send_imessage(phone, content)
         if sent:
             self.state.sent_message_ids.add(msg_id)
             self.state.save()
@@ -146,15 +213,18 @@ class RealtimeListener:
             return
 
         try:
-            result = (
-                await self._supabase.table("v2_chat_messages")
+            # In multi-user mode, mark recent messages for ALL users as seen
+            query = (
+                self._supabase.table("v2_chat_messages")
                 .select("id")
-                .eq("user_id", self.config.user_id)
                 .in_("role", ["assistant", "system"])
                 .order("created_at", desc=True)
-                .limit(50)
-                .execute()
+                .limit(200)
             )
+            if not self.config.multi_user:
+                query = query.eq("user_id", self.config.user_id)
+
+            result = await query.execute()
 
             for r in result.data or []:
                 self.state.sent_message_ids.add(r["id"])
@@ -178,23 +248,28 @@ class RealtimeListener:
 
         while True:
             try:
+                params: dict[str, str] = {
+                    "role": "in.(assistant,system)",
+                    "order": "created_at.desc",
+                    "limit": "10",
+                }
+                if not self.config.multi_user:
+                    params["user_id"] = f"eq.{self.config.user_id}"
+
                 resp = await http.get(
                     f"{self.config.supabase_url}/rest/v1/v2_chat_messages",
                     headers=headers,
-                    params={
-                        "user_id": f"eq.{self.config.user_id}",
-                        "role": "in.(assistant,system)",
-                        "order": "created_at.desc",
-                        "limit": "10",
-                    },
+                    params=params,
                 )
                 if resp.status_code == 200:
                     for r in reversed(resp.json()):
                         msg_id = r.get("id", "")
                         if msg_id not in self.state.sent_message_ids:
                             content = r.get("content", "")
-                            if content:
-                                await self._send_and_track(msg_id, content)
+                            user_id = r.get("user_id", "")
+                            phone = self._resolve_phone_for_user(user_id)
+                            if content and phone:
+                                await self._send_and_track(msg_id, content, phone)
             except Exception:
                 logger.debug("Poll fallback error", exc_info=True)
 

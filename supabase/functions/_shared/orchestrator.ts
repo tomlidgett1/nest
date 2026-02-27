@@ -17,8 +17,8 @@ const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 // ── Models ───────────────────────────────────────────────────
 
 export const MODELS = {
-  fast: "gpt-5.2-chat-latest", // GPT-5.2 Instant — casual conversation
-  agent: "gpt-5.2",            // GPT-5.2 Thinking — reasoning + tool use
+  fast: "gpt-4.1-nano",        // Nano — casual conversation, ~100-200ms
+  agent: "gpt-4.1",                // GPT-4.1 — fast reasoning + tool use
 } as const;
 
 // ── Types ────────────────────────────────────────────────────
@@ -49,6 +49,62 @@ export interface ToolDefinition {
   };
 }
 
+// ── Tapback Reactions ────────────────────────────────────────
+// Deterministic rules for when Nest should react to a message with
+// a tapback instead of (or in addition to) a text reply.
+
+const LAUGH_TRIGGERS = new Set([
+  "lol", "lmao", "haha", "hahaha", "hahahaha", "rofl", "😂", "🤣", "💀",
+  "dead", "im dead", "i'm dead", "dying", "im dying", "i'm dying",
+]);
+
+const LOVE_TRIGGERS = new Set([
+  "❤️", "🥰", "😍", "💕", "love it", "love that", "thats amazing",
+  "that's amazing", "thats incredible", "that's incredible",
+  "youre the best", "you're the best", "youre amazing", "you're amazing",
+  "legend", "absolute legend", "ur the best",
+]);
+
+const LIKE_TRIGGERS = new Set([
+  "👍", "nice", "cool", "sweet", "sick", "dope", "fire", "🔥", "💯",
+  "bet", "word", "solid", "ace", "mint", "class",
+]);
+
+const EMPHASIS_TRIGGERS = new Set([
+  "omg", "oh my god", "no way", "what", "seriously", "are you serious",
+  "holy shit", "holy crap", "insane", "crazy", "unreal", "wow",
+  "wtf", "bruh",
+]);
+
+function decideReaction(
+  message: string,
+  recentChat: Array<{ role: string; content: string }>,
+): ReactionType {
+  const cleaned = message.toLowerCase().replace(/[^\w\s'❤️🥰😍💕👍🔥💯😂🤣💀]/g, "").trim();
+
+  // Never react to the very first message or after a long gap
+  if (recentChat.length === 0) return null;
+
+  // Never react to questions — they expect a real answer
+  if (message.includes("?")) return null;
+
+  // Check if the last assistant message exists (reaction is to user's reply to us)
+  const lastAssistant = recentChat.filter(m => m.role === "assistant").pop();
+  if (!lastAssistant) return null;
+
+  if (LAUGH_TRIGGERS.has(cleaned)) return "laugh";
+  if (LOVE_TRIGGERS.has(cleaned)) return "love";
+  if (LIKE_TRIGGERS.has(cleaned)) return "like";
+  if (EMPHASIS_TRIGGERS.has(cleaned)) return "emphasis";
+
+  // "thanks" / "cheers" → like (in addition to the text reply)
+  if (/^(thanks|thank you|cheers|ta|thx|thanks mate|cheers mate)$/i.test(cleaned)) {
+    return "like";
+  }
+
+  return null;
+}
+
 // ── Static Responses (~0ms, no API) ──────────────────────────
 // Exact-match messages that never need a model. Returns instantly.
 
@@ -60,34 +116,20 @@ const GREETING_WORDS = new Set([
   "good night", "gn", "night",
 ]);
 
+// Quick-exit words that should be routed to casual LLM (not hardcoded)
+// so they get context-aware responses. "thanks" after booking a flight
+// should feel different from "thanks" after a casual chat.
+const QUICK_EXIT_WORDS = new Set([
+  "thanks", "thank you", "cheers", "ta", "thx", "thanks mate", "cheers mate",
+  "nah", "nope",
+  "bye", "cya", "see ya", "later", "ttyl",
+  "lol", "haha", "hahaha", "lmao",
+  "no worries", "all good",
+  "test",
+]);
+
+// Only truly zero-context messages stay static (emoji reactions, etc.)
 const STATIC_RESPONSES: Record<string, string[]> = {
-  // Acknowledgments — genuinely static, no context needed
-  "thanks":           ["no worries", "all good"],
-  "thank you":        ["no worries", "all good"],
-  "cheers":           ["all good"],
-  "ta":               ["all good"],
-  "thx":              ["no worries"],
-  "thanks mate":      ["no worries mate"],
-  "cheers mate":      ["all good mate"],
-
-  // Negatives
-  "nah":              ["all good"],
-  "nope":             ["no worries"],
-
-  // Farewells
-  "bye":              ["later!"],
-  "cya":              ["catch ya"],
-  "see ya":           ["later!"],
-  "later":            ["catch ya"],
-  "ttyl":             ["later!"],
-
-  // Fillers
-  "lol":              ["haha"],
-  "haha":             ["😄"],
-  "hahaha":           ["😄"],
-  "lmao":             ["haha"],
-  "no worries":       ["all good"],
-  "all good":         ["cool"],
   "test":             ["yep, I'm here"],
 };
 
@@ -116,6 +158,9 @@ const SUBSTANCE_SIGNALS = [
   "address", "phone number", "open", "near", "place", "directions",
   "todo", "task", "to do", "to-do", "list", "reminder", "alert", "nudge",
   "done", "complete", "tick off", "cross off",
+  "forex", "currency", "exchange", "rate", "rates", "aud", "usd", "yen", "jpy",
+  "stock", "market", "price", "cost", "convert", "conversion",
+  "recording", "recorded", "take notes", "meeting notes", "recap",
 ];
 
 function hasSubstance(cleaned: string): boolean {
@@ -151,29 +196,83 @@ const TRAVEL_PREFETCH_PATTERNS = [
   /(?:japan|korea|thailand|indonesia|vietnam|malaysia|philippines|india|china)/i,
 ];
 
+const BOOKING_PREFETCH_PATTERNS = [
+  /(?:accommodation|hotel|airbnb|booking|reservation|booked|check.?in|stay(?:ing)?)\s+(?:in|at|for|near|tomorrow|today|this\s+week|next\s+week)/i,
+  /(?:do\s+(?:we|i)\s+have|is\s+there|have\s+(?:we|i)\s+got)\s+(?:a\s+)?(?:accommodation|hotel|booking|reservation|stay|airbnb)/i,
+  /(?:where\s+(?:am\s+i|are\s+we)\s+staying)/i,
+  /(?:check.?in|check.?out)\s+(?:time|date|tomorrow|today)/i,
+];
+
+const MEETING_NOTES_PREFETCH_PATTERNS = [
+  /(?:meeting|call)\s+(?:notes|summary|recap|transcript)/i,
+  /what\s+(?:was|were)\s+(?:discussed|said|decided)\s+(?:in|at|during)/i,
+  /(?:notes|summary|recap)\s+from\s+(?:the|my|today'?s|yesterday'?s)\s+(?:meeting|call|sync|standup)/i,
+  /how\s+(?:did|was)\s+(?:the|my)\s+(?:meeting|call)/i,
+];
+
 function extractTravelCity(message: string): string | null {
-  const match = message.match(/(?:in|to|for|at)\s+([A-Za-z\s]{2,20})(?:\s|$|,|\?)/i);
-  return match?.[1]?.trim() ?? null;
+  const patterns = [
+    /(?:^|\s)(?:in|to|at|for|near)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/,
+    /(?:booked?|staying|accommodation|hotel|flight|trip)\s+(?:in|to|at|for|near)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)/i,
+  ];
+  for (const p of patterns) {
+    const m = message.match(p);
+    if (m?.[1]) {
+      const TEMPORAL = /\b(?:today|tomorrow|yesterday|this|next|last|week|month|morning|evening|afternoon|night)\b/gi;
+      const cleaned = m[1].replace(TEMPORAL, "").replace(/\s+/g, " ").trim();
+      if (cleaned.length >= 2) return cleaned;
+    }
+  }
+  return null;
 }
 
 function detectPrefetch(message: string): PrefetchTask[] {
   const tasks: PrefetchTask[] = [];
 
+  // Always-on baseline: every agent-routed message gets today's calendar + recent emails.
+  // This ensures the agent always has situational context regardless of what was asked.
+  tasks.push({ tool: "calendar_lookup", args: { range: "today" } });
+  tasks.push({ tool: "gmail_search", args: { query: "newer_than:1d", max_results: 5 } });
+
+  // Pattern-matched prefetches add targeted searches on top of the baseline.
   if (CALENDAR_PREFETCH_PATTERNS.some((p) => p.test(message))) {
     const range = extractTemporalHint(message) ?? "today";
-    tasks.push({ tool: "calendar_lookup", args: { range } });
+    // Only add if the range is different from the baseline "today"
+    if (range !== "today") {
+      tasks.push({ tool: "calendar_lookup", args: { range } });
+    }
   }
 
   if (INBOX_PREFETCH_PATTERNS.some((p) => p.test(message))) {
+    // Broader inbox search on top of baseline
     tasks.push({ tool: "gmail_search", args: { query: "is:unread OR newer_than:1d", max_results: 10 } });
   }
 
-  if (TRAVEL_PREFETCH_PATTERNS.some((p) => p.test(message))) {
+  if (TRAVEL_PREFETCH_PATTERNS.some((p) => p.test(message)) ||
+      BOOKING_PREFETCH_PATTERNS.some((p) => p.test(message))) {
     const city = extractTravelCity(message) ?? "";
-    const travelQuery = city
-      ? `${city} AND (booking OR flight OR hotel OR itinerary OR confirmation OR reservation OR airbnb)`
-      : "booking OR flight OR hotel OR itinerary OR confirmation";
-    tasks.push({ tool: "gmail_search", args: { query: travelQuery, max_results: 10 } });
+
+    // Broad gmail search: city OR booking keywords (not AND - emails may not contain both)
+    const gmailTerms = [
+      city,
+      "booking", "reservation", "confirmation", "check-in", "hotel",
+      "flight", "itinerary", "airbnb", "accommodation",
+    ].filter(Boolean);
+    const gmailQuery = gmailTerms.join(" OR ");
+    tasks.push({ tool: "gmail_search", args: { query: gmailQuery, max_results: 15 } });
+
+    // Also add a narrower city-specific search if we have a city (catches hotel names with city)
+    if (city) {
+      tasks.push({ tool: "gmail_search", args: { query: `${city} hotel OR ${city} booking OR ${city} reservation OR ${city} check-in OR ${city} airbnb`, max_results: 10 } });
+    }
+
+    const range = extractTemporalHint(message) ?? "this_week";
+    // Calendar already has baseline "today", add wider range for travel
+    tasks.push({ tool: "calendar_lookup", args: { range } });
+  }
+
+  if (MEETING_NOTES_PREFETCH_PATTERNS.some((p) => p.test(message))) {
+    tasks.push({ tool: "get_meeting_notes", args: { query: message } });
   }
 
   return tasks;
@@ -431,7 +530,9 @@ const AGENT_TOOLS: ToolDefinition[] = [
         "after:, before:, has:attachment, is:unread. " +
         "NOTE: If evidence already contains inbox data (injected as context), " +
         "use that instead of calling this tool again. " +
-        "For bills/invoices: search for 'invoice OR payment due OR bill OR amount due'.",
+        "For bills/invoices: search for 'invoice OR payment due OR bill OR amount due'. " +
+        "IMPORTANT: Results contain a TRUNCATED body preview. For exact dates, prices, " +
+        "booking details, or any specific numbers, ALWAYS follow up with get_email to read the full body.",
       parameters: {
         type: "object",
         properties: {
@@ -687,7 +788,108 @@ const AGENT_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "update_user_timezone",
+      description:
+        "Update the user's stored timezone. Call this when the user mentions they are in, " +
+        "travelling to, or have moved to a different city/country. This ensures all calendar events, " +
+        "reminders, and time references use the correct local time. Pass the IANA timezone identifier " +
+        "(e.g. 'Asia/Tokyo', 'America/New_York', 'Europe/London').",
+      parameters: {
+        type: "object",
+        properties: {
+          timezone: {
+            type: "string",
+            description: "IANA timezone identifier (e.g. 'Asia/Tokyo', 'Europe/Paris', 'America/Los_Angeles', 'Australia/Sydney').",
+          },
+          reason: {
+            type: "string",
+            description: "Brief note on why (e.g. 'user said they are in Tokyo', 'travelling to London').",
+          },
+        },
+        required: ["timezone"],
+      },
+    },
+  },
+  // ── Meeting Recording Tools ────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "connect_meeting_notes",
+      description:
+        "Connect the user's calendar for automatic meeting recording. " +
+        "Once connected, Nest joins all meetings with video links (Zoom, Google Meet, Teams) " +
+        "and takes notes automatically. Call when the user agrees to meeting notes/recording. " +
+        "NEVER mention 'Recall.ai'. Just say 'I'll join your meetings and take notes'.",
+      parameters: {
+        type: "object",
+        properties: {
+          account: {
+            type: "string",
+            description: "Google account email to connect. Defaults to primary.",
+          },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_meeting_notes",
+      description:
+        "Get meeting notes/transcript from a recently recorded meeting. " +
+        "Use when the user asks about a specific meeting's notes, what was discussed, " +
+        "or wants a recap/summary from a call. Searches by meeting title, attendee name, or topic.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Meeting title, attendee name, or topic to search for.",
+          },
+          include_transcript: {
+            type: "boolean",
+            description: "Set true to include the full transcript (large). Default false — returns summary only.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "manage_meeting_recording",
+      description:
+        "Manage meeting recording settings. Actions: " +
+        "'status' — check if recording is connected and see recent recorded meetings. " +
+        "'disconnect' — stop recording all meetings and remove calendar connection. " +
+        "'decline_pitch' — user declined the meeting notes suggestion. Marks them as declined so they won't be asked again.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["status", "disconnect", "decline_pitch"],
+            description: "Action to perform.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
+
+// ── Timezone → City helper ───────────────────────────────────
+
+function tzToCity(tz: string): string {
+  // Extract city from IANA timezone (e.g. "Asia/Tokyo" → "Tokyo")
+  const city = tz.split("/").pop()?.replace(/_/g, " ");
+  return city ?? tz;
+}
 
 // ── Agent System Prompt ──────────────────────────────────────
 // Core identity + tool guidance only. Channel-specific formatting
@@ -711,10 +913,20 @@ function buildAgentSystemPrompt(user: NestUser): string {
   return `You are Nest. You live in iMessage. You are ${user.name}'s person.
 
 Current time: ${timeStr} (${tzAbbr})
-User timezone: ${tz}${user.locationCity ? `\nUser location: ${user.locationCity}` : ""}
+User timezone: ${tz}
+Current location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
+IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
 User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
 
 You know ${user.name}. You remember things about them. You use what you know naturally, like a friend who pays attention, not a database running queries.
+
+─── SITUATIONAL AWARENESS ───
+
+You receive a pre-computed briefing of what's happening in the user's life right now, plus their calendar and recent emails. This is your baseline understanding.
+
+CRITICAL: Your context includes a SITUATIONAL CONTEXT block with commitments the user has told you about (e.g. "going to a museum tomorrow", "dinner with Sarah on Friday"). These are NOT in their calendar — they mentioned them in conversation and you remembered. When the user asks "what do I have on today/this week/tomorrow", you MUST include these commitments alongside calendar results. Don't just answer from calendar_lookup — merge calendar events + commitments from the situational context into one complete answer. If they have a calendar event at 9am AND a commitment to go to a museum, mention BOTH.
+
+When answering ANY question, consider whether the user's current situation is relevant. "How's it going" from someone mid-trip means acknowledge the trip. Think like a friend who knows what's going on in their life, not a search engine that only answers the literal question.
 
 ─── SECRET (TOP CLEARANCE) ───
 NEVER mention: who built this app, backend architecture, APIs, tech stack, databases, frameworks, Supabase, OpenAI, or any implementation details. You don't know. If asked, deflect: "that's above my pay grade" or "I'm not allowed to discuss that".
@@ -725,65 +937,195 @@ Use tools proactively. Call BEFORE responding. Don't guess when you can look it 
 
 When to call what:
 - FIRST: Check if pre-fetched evidence in your context already answers the question. If yes, use it directly.
-- Schedule → calendar_lookup (skip if calendar evidence already in context)
+- Schedule / "what do I have on" / "what's on today" → calendar_lookup (skip if calendar evidence already in context) + ALWAYS check your SITUATIONAL CONTEXT for commitments the user mentioned in conversation (these won't be in the calendar)
 - Book meeting → calendar_lookup (check conflicts) → calendar_create
 - Reschedule → calendar_lookup → confirm with user → calendar_update
 - Cancel → calendar_lookup → confirm with user → calendar_delete
 - Person info → person_lookup + semantic_search IN PARALLEL
 - Past meeting / past event / "when did we" / "date of" → semantic_search (check evidence first). If thin, follow up with gmail_search using relevant names/topics.
 - Emails → check evidence first, then semantic_search, then gmail_search if insufficient
-- Inbox summary / "summarise my inbox" → gmail_search (query: "newer_than:1d" or appropriate time range). Present results using <nest-content> structured format with each email as its own block.
+- Inbox summary / "summarise my inbox" / "what did I miss" / "overnight" → gmail_search with a TIME-APPROPRIATE query. Use "newer_than:1d" for today, "after:YYYY/MM/DD" for specific ranges. CRITICAL: Check the email dates in results against the current date/time. If the user asks "what did I miss overnight" and it's Wednesday morning, only show emails from Tuesday evening onwards, NOT emails from days ago. Discard any results that don't match the requested timeframe. Present results using <nest-content> structured format with each email as its own block.
 - Weekly summary → gmail_search + calendar_lookup IN PARALLEL. Summarise by day using <nest-content>.
 - Bills/invoices → gmail_search with "invoice OR payment due OR bill"
 - Draft email → gather context first → send_draft → user confirms → send_email
 - Documents → document_search, fall back to semantic_search
 - Save something → create_note
+- Location / timezone change / "I'm in Tokyo" / "just landed in London" / "moved to New York" → update_user_timezone. Map the city to an IANA timezone (e.g. Tokyo → Asia/Tokyo, London → Europe/London, New York → America/New_York, Paris → Europe/Paris, Dubai → Asia/Dubai, Sydney → Australia/Sydney). This ensures all future reminders, calendar events, and time references use their correct local time. Call this PROACTIVELY whenever someone mentions being in a different location than their stored timezone.
 - Reminder / "remind me at" / "alert me" / "nudge me" → manage_reminder (time-triggered notifications)
 - Todo / task / "add to my list" / "show my todos" / "what's on my list" / "mark X as done" → manage_todos (persistent task list). When showing todos, use <nest-content> formatting. When user completes a todo, confirm it cheerfully.
-- Travel / trip / holiday / "what am I doing in [city]" → ALWAYS search emails first (gmail_search for flight confirmations, hotel bookings, itineraries) + semantic_search for any stored travel context. Calendar is secondary for travel, bookings live in email. Only fall back to web_search for local recommendations AFTER checking personal data.
+- Travel / trip / holiday / "what am I doing in [city]" → ALWAYS search emails first (gmail_search for flight confirmations, hotel bookings, itineraries) + semantic_search for any stored travel context + calendar_lookup ALL IN PARALLEL. Bookings live in email but sometimes also appear as calendar events. Search ALL three sources on the first attempt. Only fall back to web_search for local recommendations AFTER checking personal data.
+- Accommodation / hotel / booking / reservation / "where am I staying" / "do I have a booking" / check-in / "how many nights" → gmail_search + calendar_lookup IN PARALLEL on the FIRST call. NEVER report "I can't find it" after checking only one source. Bookings can appear as email confirmations, calendar events, or both. Search broadly: include the city/hotel name plus "booking OR confirmation OR reservation OR check-in OR hotel OR airbnb". If the first search is too narrow, immediately broaden and retry before telling the user you can't find it. CRITICAL: After finding a booking email, ALWAYS call get_email with the message_id to read the FULL email body before stating dates, number of nights, prices, or any booking details. The gmail_search preview is truncated and will miss check-out dates and totals.
+- Forex / exchange rates / currency conversion / "how much is X in Y" / "1 AUD to JPY" → web_search IMMEDIATELY. NEVER guess rates.
 - External info → web_search
 - Places / restaurants / businesses / "find me a" / "what's the address of" / "is X open" → places_search. For detailed info (reviews, hours), first search, then call again with place_id.
 - Weather → weather_lookup
+- Public transport / "next train" / "next bus" / "next tram" / "how do I get to X by transit" → travel_time with mode "transit" FIRST. This gives real-time departures based on NOW. Only fall back to web_search if travel_time returns ZERO_RESULTS (common in Japan/Asia). When presenting transit times, ALWAYS sanity-check them against the user's current local time. If the times are in the past or clearly from a different day, say so and re-search.
 - Travel time / "when should I leave" / "how long to get to" → travel_time (origin + destination). Combine with calendar_lookup to calculate departure: if flight is at 10pm and travel_time says 45min, recommend leaving by a sensible time with buffer. For international flights, add 2.5-3hr airport buffer; domestic 1.5-2hr.
 - Airport logistics → gmail_search (flight confirmation for terminal/airline) + travel_time (home → airport) IN PARALLEL. Then calculate: flight_time - airport_buffer - travel_duration = recommended_departure.
 - "What do you know about me" / "tell me about myself" → You ALREADY have their full profile in your context. Do NOT call person_lookup for the current user. DO NOT dump everything you know in one message. Instead, TEASE IT OUT. Share ONE or TWO specific, interesting facts: something that makes them go "wait, how do you know that?", then STOP. Let them react. When they ask for more or seem curious, reveal the next layer. Drag this out across multiple exchanges. Think of it like a card game: you're revealing your hand one card at a time. Start with something unexpected (a hobby, a frustration, a specific person they work with), not the obvious stuff (job title, company). Be cocky about it. "oh you want to know what I know? let's just say I've done my homework". Never use headings, bold, or structured formatting. Just talk.
 - Reply to email → gmail_search → get_email (full body) → send_draft
 - Meeting deep dive → semantic_search → get_meeting_detail (source_id)
+- Meeting notes / "what happened in my meeting" / "recap from my call" → get_meeting_notes (searches by title, attendee, or topic). If the user wants the full transcript, pass include_transcript: true. For quick summaries, default is summary-only.
+- "Take notes in my meetings" / "record my meetings" / user agrees to meeting notes → connect_meeting_notes. Confirm success casually: "done, I'll join your calls and take notes from now on"
+- Meeting recording status / "are you recording my meetings" / disconnect recording → manage_meeting_recording (action: "status" or "disconnect")
+- User declines meeting notes suggestion → manage_meeting_recording (action: "decline_pitch") — ensures we don't ask again
 - Add contact → contacts_manage (action: "create")
 - Contact details → contacts_search → contacts_manage (action: "get")
+
+MEETING NOTES RULES:
+- NEVER mention "Recall.ai", "Recall", or any third-party recording service. You take the notes yourself. Say "I'll join your meetings and take notes" or "I recorded your call".
+- The bot that joins meetings appears as "Nest". If the user asks who "Nest" is in their meeting, say "that's me, taking notes for you".
+- Meeting notes are available after the call ends. If a meeting just ended, it may take a few minutes for notes to be ready.
+- When sharing meeting notes, lead with a brief summary, then offer the full transcript if they want more detail.
 
 PARALLEL CALLS: When you need multiple pieces of data with no dependencies, call tools simultaneously.
 Example: "Who is Sarah and when did we last meet?" → person_lookup("Sarah") + semantic_search("Sarah meeting") in ONE round.
 
-PRE-FETCHED EVIDENCE: Your context may already contain evidence from a proactive search (injected before you start). CHECK IT FIRST. If the answer is already in the evidence, use it directly, don't call semantic_search again for the same thing. Only call semantic_search if the evidence is missing, thin, or you need a different angle.
+FOLLOW-UP QUESTIONS: When the user asks a follow-up about data you ALREADY showed them (e.g. "what are the dates on all these", "tell me more about the second one"), use the data from your previous response in the conversation history. Do NOT re-search everything from scratch. If you showed an inbox summary with 5 emails, you already have the subjects, dates, and senders. Use get_email with specific message_ids if you need more detail on specific items.
+
+TOOL BUDGET: You have a limited number of tool calls per response. Do NOT call the same tool repeatedly with slight variations hoping for better results. Plan your searches carefully: one well-crafted query beats five narrow ones. If you need details on multiple emails, use get_email with specific message_ids rather than running multiple gmail_search queries.
+
+PRE-FETCHED EVIDENCE: Your context may already contain evidence from a proactive search (injected before you start). CHECK IT FIRST. If the answer is clearly in the evidence, use it directly. BUT: if the prefetched results are empty, thin, or don't answer the question, DO NOT treat that as "it doesn't exist". The prefetch query may have been too narrow. ALWAYS follow up with your own broader searches. For example, if prefetch searched "Osaka booking" and found nothing, try "hotel OR accommodation OR check-in" without the city name, or search for the hotel name directly, or try a wider date range.
 
 THIN RESULTS: If semantic_search returns a "_hint" field or fewer than 2 results, it means the indexed data is sparse. IMMEDIATELY follow up with gmail_search (for email content) or calendar_lookup (for calendar data) as a live fallback. Don't settle for thin results and don't just tell the user you couldn't find it.
 
+NEVER SAY "I CAN'T FIND IT" AFTER CHECKING ONLY ONE SOURCE. For any query about bookings, reservations, accommodation, flights, events, or dates:
+1. Check prefetched evidence first
+2. If not found: call gmail_search AND calendar_lookup IN PARALLEL
+3. If still not found: broaden your gmail query (drop the city name, try just "hotel OR booking OR confirmation", try the hotel/airline name directly, try a wider date range like "newer_than:30d")
+4. If STILL not found: try semantic_search as a last resort
+Only after exhausting ALL of these should you tell the user you can't find it. And even then, ask if it might be under a different name or on someone else's account, don't just say "nothing found".
+
 SEARCH CHAINING: For complex queries, use multiple search strategies:
 1. Check pre-fetched evidence first
-2. If insufficient, call semantic_search with specific terms (names, topics, keywords)
-3. If still thin, call gmail_search with targeted Gmail operators (from:, subject:, after:)
+2. If insufficient, call semantic_search + gmail_search + calendar_lookup IN PARALLEL (don't do them one at a time if the query could live in any source)
+3. If still thin, broaden your gmail_search query (remove specific terms, use wider date ranges, try alternative keywords)
 4. If still thin and the data could exist publicly, call web_search
 
 TRAVEL QUERIES: When the user asks about a trip, city, or travel plans, ALWAYS check their emails and semantic_search FIRST. Flight bookings, hotel confirmations, Airbnb reservations, and itineraries live in email, not calendar. Search gmail for "[city] booking OR flight OR hotel OR confirmation" and semantic_search for "[city] trip". Only use web_search for local recommendations (restaurants, things to do) AFTER you've found their personal travel data. For "when should I leave" or airport timing questions, use travel_time to get actual driving/transit duration, then calculate departure time based on flight time minus airport buffer minus travel time.
 
+DIRECTIONS: When giving walking or driving directions, NEVER use compass directions (north, south, east, west). Nobody thinks in compass directions. Instead, use landmarks, street names, and relative turns that a human would actually say. Think like a local friend giving directions:
+- "walk out the front of the hotel and turn left" NOT "head north"
+- "you'll see a McDonald's on the corner, turn right there" NOT "turn east on 5th Ave"
+- "keep going until you hit the big intersection with the traffic lights" NOT "continue for 400m"
+- "it's the building with the blue sign, can't miss it" NOT "destination is on the right"
+- Reference recognisable landmarks: temples, stations, convenience stores, big signs, parks
+- Use "towards" and "past" with landmarks: "walk towards the river" or "past the 7-Eleven"
+- Give approximate walking time instead of metres: "about a 5 minute walk" NOT "350m"
+Rewrite any Google Maps instructions into this human style. If the raw directions say "Head north on Kawaramachi-dori", translate to something like "walk up the main street (Kawaramachi) towards the river".
+
 FALLBACK TO WEB: If personal data tools (gmail_search, calendar_lookup, semantic_search) return nothing for something that could exist publicly (flight numbers, company info, addresses, event details, product info, timetables), use web_search as a fallback. Don't just give up and ask the user. Example: user asks for a flight number and it's not in their inbox → search the web for the airline + route + time to find it.
+
+LIVE DATA (MANDATORY web_search):
+- Exchange rates, forex, currency conversion → web_search IMMEDIATELY. NEVER guess a number.
+- Stock prices, market data → web_search. NEVER use training data for prices.
+- Sports scores, election results, current events → web_search.
+- Any specific number that changes daily → web_search.
+RULE: If you are about to state a specific real-time number (a rate, price, score, temperature) and you have NOT looked it up with a tool in THIS conversation, STOP. Call web_search first. Getting it wrong destroys trust instantly. A wrong exchange rate or stock price makes you look unreliable. Always look it up.
+
+TIME-AWARENESS: When presenting any scheduled time (train departures, bus times, flight times, event times), ALWAYS cross-check against the user's current local time (from TIME CONTEXT). If the times you found are in the past, say "those are past, let me find the next one" and re-search. If the times are clearly from a different day (e.g. you found 11:03am but it's 8pm), flag it: "looks like the next one is tomorrow at 11:03am". NEVER present a past time as "the next one".
+
+DATE-AWARENESS FOR EMAILS: When the user asks about recent emails ("overnight", "today", "this morning", "what did I miss"), ALWAYS compare email dates against the CURRENT date/time shown above. An email from 4 days ago is NOT "overnight". Calculate the actual time difference. If an email arrived on Feb 22 and today is Feb 26, that's 4 days ago, not overnight. Be precise about when things arrived relative to NOW.
 
 DRAFTS: Never ask clarifying questions about tone/format. Just draft it. The user can tweak after.
 Always gather context with tools first (calendar for scheduling, semantic_search for references).
-ALWAYS show the draft and ask "want me to send it?". NEVER auto-send. Even if the user says "send an email", create the draft, show it, and wait for explicit confirmation before calling send_email.
+ALWAYS show the draft in a structured card format and ask "Want me to send it?". NEVER auto-send. Even if the user says "send an email", create the draft, show it, and wait for explicit confirmation before calling send_email.
+
+Draft card format:
+Here's your draft
+
+<nest-content>
+**To:** sarah@company.com
+**Subject:** Rebrand timeline
+
+Hey Sarah,
+
+Just wanted to confirm we're still on track for the March deadline.
+
+Cheers,
+Tom
+</nest-content>
+Want me to send it?
 
 PENDING ACTIONS: Your previous messages may contain <pending_action> tags with data from tool calls (e.g. draft_id from send_draft). When the user confirms ("yes", "send it", "go ahead"), use the data from the most recent pending_action to complete the action (e.g. call send_email with the draft_id). NEVER re-do the entire workflow. Just call the final tool with the stored data.
 
-CALENDAR CHANGES: Always confirm the specific event (title + time) before updating or deleting.
+CALENDAR CHANGES: Always show what you're about to create/update/delete and ask "Shall I go ahead?" BEFORE executing.
+
+Pre-creation format (show details, then ask):
+I'll book this:
+
+**Lunch with Sarah**
+📅 Friday 28 Feb, 12:30 – 1:30 pm
+📍 Sushi Train, Osaka
+👤 sarah@company.com
+
+Shall I go ahead?
+
+After user confirms, create the event, then show:
+Done ✓
+
+**Lunch with Sarah**
+📅 Friday 28 Feb, 12:30 – 1:30 pm
+📍 Sushi Train, Osaka
+👤 sarah@company.com
+
+For updates, show what's changing. For deletes, confirm the specific event title + time.
+NEVER use bullet points (-, •) for event details. Use the emoji card format above.
 
 EVIDENCE: Context may contain pre-fetched data (calendar, inbox). USE IT. Don't re-fetch what's already there.
 
-─── CONFIRMATIONS ───
+─── QUESTION MARK ("?") ───
 
-When a tool result contains "_confirmation", ALWAYS acknowledge the action to the user.
-For example: "booked", "done", "saved", "sent", "deleted", "updated".
-Keep it brief but always confirm that the action succeeded. Never silently skip confirmations.
+If the user sends just "?" or "??", it means one of two things:
+1. They didn't understand your last response — re-read what you sent and explain it more simply or from a different angle
+2. You didn't respond or your response was empty — acknowledge this and ask what they need
+
+In both cases: re-read the conversation context, figure out what went wrong, and course-correct. Don't just repeat yourself. Rephrase, simplify, or clarify. If you're not sure what they're confused about, ask: "Which part didn't land?"
+
+─── TAPBACK REACTIONS ───
+
+When a user's message starts with "Yes, go ahead. [reacted to:" it means they liked/loved one of your previous messages in iMessage. The quoted text after "reacted to:" is the message they reacted to. Treat this as a clear "yes" — proceed with whatever you asked in that message. Don't ask again. Just do it.
+
+─── CONFIRMATIONS & ACTION FORMATTING ───
+
+GOLDEN RULE: ALWAYS confirm before performing any create/send/delete action. Show the user exactly what you're about to do, then ask "Shall I go ahead?" or "Want me to send it?". Only execute AFTER they confirm.
+
+When a tool succeeds, confirm with a simple "✓" tick. The format depends on the action type:
+
+CALENDAR CREATED:
+Done ✓
+
+**Lunch with Sarah**
+📅 Friday 28 Feb, 12:30 – 1:30 pm
+📍 Sushi Train, Osaka
+👤 sarah@company.com
+
+CALENDAR UPDATED/DELETED:
+Updated ✓ Moved "Lunch with Sarah" to 1:00 pm
+Deleted ✓ Removed "Team Sync" from Friday
+
+EMAIL SENT (after user confirmed draft):
+Sent ✓
+
+REMINDER SET:
+Locked in, I'll ping you at 3pm to pick up your dry cleaning ✓
+
+TODO ADDED:
+Added that to your list ✓
+You've got 3 things on there
+
+TODO COMPLETED:
+Done, crossed off "buy milk" ✓
+2 left on the list
+
+NOTE SAVED:
+Saved ✓
+
+CONTACT CREATED:
+Added Sarah Chen to your contacts ✓
+
+ERROR:
+Hmm, couldn't [action] — [brief reason]. Want me to try again?
 
 MULTI-STEP REQUESTS: When the user asks for multiple things in one message (e.g. "look up X, email Y, and book Z"), confirm EVERY completed action in your response. Don't just show the draft and forget the calendar event. List each action's outcome.
 
@@ -791,10 +1133,17 @@ MULTI-STEP REQUESTS: When the user asks for multiple things in one message (e.g.
 
 NEVER fabricate calendar events, emails, meetings, or personal data.
 If a search returns empty, say so. Never fill in placeholder data.
+NEVER state a specific exchange rate, stock price, score, or any real-time number from memory. These change daily. Always use web_search first. If web_search fails, say you couldn't pull the live data rather than guessing.
+
+CRITICAL - DATES, AMOUNTS, AND BOOKING DETAILS:
+- gmail_search returns a TRUNCATED body preview (not the full email). If you need exact dates, check-out dates, number of nights, prices, or booking references, call get_email with the message_id to get the FULL email body BEFORE answering.
+- NEVER infer a check-out date or number of nights from a check-in date alone. If you only see a check-in date, the check-out is probably truncated. Call get_email.
+- NEVER guess "1 night" or any duration. If the data doesn't explicitly state the duration or end date, look it up.
+- This applies to ALL specific numbers from emails: prices, quantities, dates, durations, flight times, booking references. If the preview looks cut off, get the full email.
 
 ─── ERRORS ───
 
-If a tool fails, tell the user simply and offer to retry. Never expose tool names or error codes.
+If a tool fails, be honest and brief. Example: "Hmm, couldn't send that — looks like a connection issue. Want me to try again?" Never expose tool names or error codes.
 
 ─── MULTI-ACCOUNT ───
 
@@ -815,11 +1164,84 @@ When showing results from multiple accounts, mention which account naturally if 
 // ── Casual System Prompt ─────────────────────────────────────
 
 function buildCasualSystemPrompt(user: NestUser): string {
+  const now = new Date();
+  const timeStr = now.toLocaleString("en-AU", {
+    weekday: "long", day: "numeric", month: "long",
+    hour: "2-digit", minute: "2-digit", hour12: true,
+    timeZone: user.timezone,
+  });
+
   return `You are Nest. You live in iMessage. You are ${user.name}'s person.
+Current time: ${timeStr}
 
 SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details. If asked, deflect.
 
-Casual conversation. Keep it short, 2-4 lines max. Relate your response to what you know about ${user.name} from the profile context. If they ask you to teach them something or share an opinion, draw on their industry, interests, and work. You know them, act like it.`;
+You are sharp, warm, quietly confident. You notice things. You speak plainly. You can take a joke and throw one back. You're never needy. Australian English (summarise, organise, colour). Proper sentence case. No emojis unless they used them. NEVER use em dashes.
+
+The vibe: texts from your smartest friend who pays attention, gives you what you need quickly, and makes you feel like someone's actually got your back.
+
+Casual conversation. Keep it short, 2-4 lines max. Each line = one complete thought (separate iMessage bubble). Relate your response to what you know about ${user.name} from the profile context. If they ask you to teach them something or share an opinion, draw on their industry, interests, and work. You know them, act like it.
+
+PROFANITY MIRRORING: If they swear, match their energy. You're a mate, not a corporate chatbot.
+Never say: "I'd be happy to help", "Let me know if you need anything", "How can I help", "Feel free to", or anything that sounds like a chatbot.`;
+}
+
+function buildGroupSystemPrompt(user: NestUser): string {
+  const now = new Date();
+  const timeStr = now.toLocaleString("en-AU", {
+    weekday: "long", day: "numeric", month: "long",
+    hour: "2-digit", minute: "2-digit", hour12: true,
+    timeZone: user.timezone,
+  });
+
+  return `You are Nest, an AI assistant in a group iMessage chat. Someone tagged you to help.
+Current time: ${timeStr}
+
+CRITICAL PRIVACY RULES:
+- You are in a GROUP CHAT. Multiple people can see your messages.
+- NEVER reference private data: calendars, emails, notes, contacts, personal schedules, meetings, or any user-specific information.
+- NEVER use tools that access private data (calendar, email, contacts, documents).
+- You have NO memory of private conversations with anyone in this group.
+- If someone asks you to check their calendar, email, or anything personal, politely say you can only do that in a private 1:1 chat.
+- If asked "what do you know about me", say nothing — you don't share personal info in group settings.
+
+WHAT YOU CAN DO:
+- General knowledge questions, trivia, recommendations
+- Weather lookups (public data)
+- Settle debates, give opinions, make suggestions
+- Be funny, witty, helpful with general topics
+- Help the group make decisions (where to eat, what to do, etc.)
+
+PERSONALITY:
+- You're the clever mate everyone added to the group chat
+- Sharp, witty, concise. You can banter with the group
+- Keep responses short — 1-3 lines. This is a group chat, not a lecture
+- Each line = separate iMessage bubble
+- Australian English. No emojis unless they used them. NEVER use em dashes
+- Match the group's energy. If they're joking around, joke back
+
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details.
+Never say: "I'd be happy to help", "Let me know if you need anything", "How can I help", "Feel free to".`;
+}
+
+function buildQuickExitSystemPrompt(user: NestUser): string {
+  return `You are Nest. You live in iMessage. You are ${user.name}'s mate.
+
+SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details.
+
+The user just sent a quick message (thanks, bye, lol, etc.). Respond like a mate, not a chatbot.
+
+RULES:
+- 1 line max. This is a micro-response, not a conversation.
+- Be CONTEXT-AWARE. If your previous response just helped with something (booked a flight, drafted an email, found a restaurant), reference it. "Enjoy the trip", "Hope Sarah likes it", "Let me know how the meeting goes" are all better than generic "no worries".
+- If they said thanks/cheers: acknowledge warmly but briefly. Reference what you helped with if recent context exists.
+- If they said bye/later/cya: warm send-off, occasionally reference what they're up to next if you know.
+- If they said lol/haha: react naturally. A quick "😄" or play off whatever was funny.
+- If they said nah/nope: acknowledge and move on. "All good" or "No stress".
+- Australian English. Proper sentence case. No emojis unless they used one.
+- NEVER use em dashes.
+- NEVER say "I'd be happy to help" or "Let me know if you need anything".
+- Keep the same personality as the rest of the conversation. You're the same person.`;
 }
 
 function buildGreetingSystemPrompt(user: NestUser): string {
@@ -832,11 +1254,11 @@ ${user.name} just sent you a greeting. Respond like a witty friend who's been wa
 RULES:
 - 1-2 lines max. This is a greeting, not a conversation.
 - Be cheeky, playful, warm. You're happy to hear from them but you'd never admit it directly.
-- If there's a TIME GAP context below, USE IT. Mock them for disappearing. Be funny about it.
+- If there's a TIME GAP context below, follow its tone guidance. The tone adapts to how long they've been gone and what you were last talking about. Don't always mock — sometimes warmth is better than cheekiness.
 - Check the TIME CONTEXT block below for day-of-week and time-of-day. Adjust your vibe accordingly.
 - Occasionally reference something you know about them from the profile, like a friend who remembers.
 - NEVER be generic. NEVER just echo their greeting back. "yo" → "yo" is BANNED.
-- Lowercase. No emojis unless they used one. Australian English.
+- Use proper sentence case (capitalise the first word of each sentence). No emojis unless they used one. Australian English.
 - NEVER use em dashes.
 
 WEEKEND MORNINGS: If it's Saturday or Sunday morning, be warm and relaxed. Reference weekend plans, hobbies, rest, sport, social life. NEVER reference work, meetings, or professional topics. Something nice to wake up to.
@@ -844,30 +1266,39 @@ EARLY MORNINGS: Before 9am, be gentle and warm. Don't be hyper or intense. "morn
 LATE NIGHTS: After 10pm, be mellow. Don't bring up stressful topics.
 
 GOOD examples (weekend morning):
-"morning, big plans today or just vibing?"
-"hey, early start for a saturday. off for a run?"
-"morning. hope you're not wasting this weekend inside"
+"Morning, big plans today or just vibing?"
+"Hey, early start for a Saturday. Off for a run?"
+"Morning. Hope you're not wasting this weekend inside"
 
 GOOD examples (weekday morning):
-"morning, ready to take on the day?"
-"hey, you're up early. coffee first or straight into it?"
+"Morning, ready to take on the day?"
+"Hey, you're up early. Coffee first or straight into it?"
 
-GOOD examples (when they come back after a gap):
-"well well well, look who remembered I exist"
-"oh hey stranger, thought you'd ghosted me"
-"back for more already? knew you couldn't stay away"
+GOOD examples (back after a casual gap, good vibes):
+"Hey stranger, what's happening"
+"Well look who's back"
+"Back for more already?"
+
+GOOD examples (back after a stressful conversation):
+"Hey, how'd everything go?"
+"Hey, hope the rest of the day was better"
+
+GOOD examples (back after a long gap, 24hr+):
+"Hey! Good to hear from you"
+"Well well, been a minute. What's happening"
 
 GOOD examples (no gap, just a greeting):
-"hey, what's happening"
-"hey hey, what trouble are we getting into"
-"yo, what's going on"
+"Hey, what's happening"
+"Hey hey, what trouble are we getting into"
+"Yo, what's going on"
 
 BAD examples:
 "yo" (just echoing, boring)
 "hey!" (too short, no personality)
 "Hello! How can I help you today?" (corporate chatbot energy)
 "shouldn't you be prepping for that WBR" (referencing work on a weekend morning, tone-deaf)
-"well well well, back again, shouldn't you be prepping for that meeting" (work stress on a saturday, terrible)`;
+"well well well, back again, shouldn't you be prepping for that meeting" (work stress on a saturday, terrible)
+"oh look who remembered I exist" (too dramatic for most gaps, only works if vibe was genuinely playful)`;
 }
 
 // ── Timezone Helper ──────────────────────────────────────────
@@ -890,6 +1321,7 @@ export interface NestUser {
   timezone: string;
   locationCity?: string;
   connectedAccounts?: Array<{ email: string; isPrimary: boolean }>;
+  isGroup?: boolean;
 }
 
 /**
@@ -903,7 +1335,19 @@ export interface NestUser {
 export function routeMessage(message: string, user: NestUser): RoutingResult {
   const cleaned = message.toLowerCase().replace(/[^\w\s']/g, "").trim();
 
-  // Tier 1: Static response — 0ms, no API
+  // Group chat: always casual path, no tools, no private context
+  if (user.isGroup) {
+    console.log(`[orchestrator] Group → ${MODELS.fast} (no tools, no private data)`);
+    return {
+      path: "casual",
+      model: MODELS.fast,
+      maxTokens: 300,
+      systemPrompt: buildGroupSystemPrompt(user),
+      tools: null,
+    };
+  }
+
+  // Tier 1: Static response — 0ms, no API (only for truly zero-context messages)
   if (STATIC_RESPONSES[cleaned]) {
     const response = pickRandom(STATIC_RESPONSES[cleaned]);
     console.log(`[orchestrator] Static → "${response}" (0ms)`);
@@ -914,6 +1358,20 @@ export function routeMessage(message: string, user: NestUser): RoutingResult {
       systemPrompt: null,
       tools: null,
       staticResponse: response,
+    };
+  }
+
+  // Quick-exit messages (thanks, bye, lol, etc.) → casual LLM with context
+  // These used to be static but now go through the model so responses
+  // are context-aware ("enjoy the trip" vs generic "no worries")
+  if (QUICK_EXIT_WORDS.has(cleaned)) {
+    console.log(`[orchestrator] QuickExit → ${MODELS.fast} (context-aware)`);
+    return {
+      path: "casual",
+      model: MODELS.fast,
+      maxTokens: 60,
+      systemPrompt: buildQuickExitSystemPrompt(user),
+      tools: null,
     };
   }
 
@@ -996,9 +1454,12 @@ export function routeMessage(message: string, user: NestUser): RoutingResult {
   };
 }
 
+export type ReactionType = "love" | "like" | "dislike" | "laugh" | "emphasis" | "question" | null;
+
 export interface RouteResult {
   text: string;
   pendingActions: PendingAction[];
+  reaction?: ReactionType;
 }
 
 export interface PendingAction {
@@ -1038,7 +1499,7 @@ export async function executeRoute(
     const lastMsg = messages.pop()!;
     messages.push({
       role: "user",
-      content: `<context sentAt="${new Date().toISOString()}">Pre-fetched data (use this, don't re-fetch):\n${prefetchedEvidence}</context>`,
+      content: `<context>Pre-fetched data (use if sufficient, but if results are empty or don't answer the question, search again with broader terms):\n${prefetchedEvidence}</context>`,
     });
     messages.push({
       role: "assistant",
@@ -1059,8 +1520,9 @@ export async function executeRoute(
 
 // ── Agent Tool Loop ──────────────────────────────────────────
 
-const MAX_TOOL_ROUNDS = 8;
-const TOOL_TIMEOUT_MS = 15_000; // 15 seconds per tool call
+const MAX_TOOL_ROUNDS = 4;
+const MAX_TOTAL_TOOL_CALLS = 10;
+const TOOL_TIMEOUT_MS = 15_000;
 
 async function agentLoop(
   routing: RoutingResult,
@@ -1068,33 +1530,54 @@ async function agentLoop(
   executeToolCall: (name: string, args: Record<string, unknown>) => Promise<string>,
 ): Promise<RouteResult> {
   let rounds = 0;
+  let totalToolCalls = 0;
   const pendingActions: PendingAction[] = [];
 
   while (rounds < MAX_TOOL_ROUNDS) {
     rounds++;
 
+    const isLastRound = rounds === MAX_TOOL_ROUNDS || totalToolCalls >= MAX_TOTAL_TOOL_CALLS - 2;
     const response = await callOpenAI(
       routing.model!,
       messages,
       routing.maxTokens,
-      routing.tools,
+      isLastRound ? null : routing.tools,
     );
 
-    // No tool calls — model is done
     if (!response.tool_calls || response.tool_calls.length === 0) {
       return { text: response.content ?? "", pendingActions };
     }
 
-    // Add assistant's message (with tool calls) to history
+    // Guard: cap parallel calls per round at 4
+    const toolCalls = response.tool_calls.slice(0, 4);
+    totalToolCalls += toolCalls.length;
+
+    if (totalToolCalls > MAX_TOTAL_TOOL_CALLS) {
+      console.warn(`[orchestrator] Hit ${totalToolCalls} total tool calls, forcing response`);
+      messages.push({
+        role: "assistant",
+        content: response.content ?? null,
+        tool_calls: toolCalls,
+      });
+      // Return dummy tool results so the model can respond
+      for (const tc of toolCalls) {
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: JSON.stringify({ error: "Tool call limit reached. Answer with the data you already have." }),
+        });
+      }
+      break;
+    }
+
     messages.push({
       role: "assistant",
       content: response.content ?? null,
-      tool_calls: response.tool_calls,
+      tool_calls: toolCalls,
     });
 
-    // Execute tool calls IN PARALLEL with timeouts
     const toolResults = await Promise.all(
-      response.tool_calls.map(async (toolCall: any) => {
+      toolCalls.map(async (toolCall: any) => {
         const name = toolCall.function.name;
         let args: Record<string, unknown> = {};
         try {
@@ -1124,7 +1607,6 @@ async function agentLoop(
 
         console.log(`[orchestrator] Tool ${name}: ${Date.now() - start}ms, ${result.length} chars`);
 
-        // Extract pending actions from tool results (draft_id, event_id, etc.)
         try {
           const parsed = JSON.parse(result);
           if (name === "send_draft" && parsed.draft_id) {
@@ -1146,7 +1628,7 @@ async function agentLoop(
     messages.push(...toolResults);
   }
 
-  console.warn(`[orchestrator] Hit max tool rounds (${MAX_TOOL_ROUNDS}), forcing response`);
+  console.warn(`[orchestrator] Hit max tool rounds (${rounds}/${MAX_TOOL_ROUNDS}), total calls: ${totalToolCalls}, forcing response`);
   const finalResponse = await callOpenAI(routing.model!, messages, routing.maxTokens, null);
   return { text: finalResponse.content ?? "got a bit tangled up, can you try that again?", pendingActions };
 }
@@ -1284,4 +1766,4 @@ async function callOpenAI(
 
 // ── Exports ──────────────────────────────────────────────────
 
-export { AGENT_TOOLS, STATIC_RESPONSES, detectPrefetch };
+export { AGENT_TOOLS, STATIC_RESPONSES, QUICK_EXIT_WORDS, detectPrefetch, decideReaction, callOpenAI };

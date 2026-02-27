@@ -392,7 +392,7 @@ export async function getGmailMessage(
     subject: allHeaders["Subject"] ?? "",
     date: allHeaders["Date"] ?? "",
     snippet: data.snippet ?? "",
-    bodyPreview: bodyText ? bodyText.slice(0, 800) : (data.snippet ?? ""),
+    bodyPreview: bodyText ? bodyText.slice(0, 2000) : (data.snippet ?? ""),
     labelIds,
     isImportant: labelIds.includes("IMPORTANT"),
     isStarred: labelIds.includes("STARRED"),

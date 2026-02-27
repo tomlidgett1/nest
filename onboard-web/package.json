@@ -13,6 +13,7 @@
     "lucide-react": "^0.575.0",
     "motion": "^12.34.1",
     "react": "^19.0.0",
+    "react-device-mockup": "^1.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.1.0"
   },

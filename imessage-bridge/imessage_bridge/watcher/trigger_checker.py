@@ -1,5 +1,4 @@
-"""Periodic trigger checker — polls v2-trigger for upcoming meeting preps
-and sends onboarding drip messages to pending users.
+"""Periodic trigger checker — polls v2-trigger for meeting preps and cron reminders.
 
 In multi-user mode, fetches all active users and checks triggers for each.
 """
@@ -8,8 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from datetime import datetime, timezone
 
 import httpx
 
@@ -21,14 +18,6 @@ logger = logging.getLogger("imessage_bridge.watcher.trigger_checker")
 CHECK_INTERVAL_SECONDS = 60
 REQUEST_TIMEOUT = 30.0
 
-# Drip sequence: (step, delay_minutes, message_template)
-# {{URL}} is replaced with the user's onboard URL at send time.
-# Single follow-up only — don't spam users who haven't signed up.
-_DRIP_SEQUENCE: list[tuple[int, int, str]] = [
-    (1, 10,
-     "still here when you're ready to verify you're human\n\n{{URL}}"),
-]
-
 
 class TriggerChecker:
     """Periodically checks for meeting triggers and sends prep via iMessage."""
@@ -37,6 +26,7 @@ class TriggerChecker:
         self.config = config
         self._http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
         self._fired_event_ids: dict[str, set[str]] = {}  # user_id -> set of event_ids
+        self._user_phone_cache: dict[str, str] = {}  # user_id -> phone_number
         self._running = True
 
     async def run(self) -> None:
@@ -48,19 +38,15 @@ class TriggerChecker:
             except Exception:
                 logger.exception("Trigger check failed")
 
-            try:
-                await self._check_cron_reminders()
-            except Exception:
-                logger.exception("Cron reminder check failed")
-
-            try:
-                await self._check_onboard_drips()
-            except Exception:
-                logger.exception("Onboard drip check failed")
-
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
     async def _check_triggers(self) -> None:
+        # Fire-and-forget: check if any daily briefings need regeneration
+        await self._check_daily_briefing()
+
+        # Check cron-based reminders (fires due reminders and delivers via Realtime)
+        await self._check_cron_reminders()
+
         # Fetch all active users from imessage_users
         active_users = await self._get_active_users()
 
@@ -75,6 +61,116 @@ class TriggerChecker:
 
             fired = self._fired_event_ids.setdefault(user_id, set())
             await self._check_user_triggers(user_id, phone, fired)
+
+    async def _check_cron_reminders(self) -> None:
+        """Call v2-trigger to fire any due cron reminders and deliver via iMessage.
+
+        The edge function handles querying due reminders, generating messages,
+        inserting into v2_chat_messages, and rescheduling repeating reminders.
+        We then deliver each message via iMessage to the right phone number.
+        """
+        url = f"{self.config.supabase_url}/functions/v1/v2-trigger"
+        try:
+            resp = await self._http.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"action": "check_cron_reminders"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "check_cron_reminders returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+                return
+
+            data = resp.json()
+            messages: list[dict] = data.get("messages", [])
+            if not messages:
+                return
+
+            logger.info("Cron reminders: %d to deliver", len(messages))
+
+            for entry in messages:
+                user_id = entry.get("user_id", "")
+                message = entry.get("message", "")
+                if not user_id or not message or not message.strip():
+                    continue
+
+                phone = await self._resolve_phone(user_id)
+                if not phone:
+                    logger.error(
+                        "No phone number for user %s, cannot deliver reminder",
+                        user_id[:8],
+                    )
+                    continue
+
+                sent = await send_imessage(phone, message)
+                if sent:
+                    logger.info("Reminder sent to %s (user %s)", phone, user_id[:8])
+                else:
+                    logger.error("Failed to send reminder to %s", phone)
+                await asyncio.sleep(1.5)
+
+        except httpx.TimeoutException:
+            logger.warning("check_cron_reminders request timed out")
+        except Exception:
+            logger.exception("check_cron_reminders failed")
+
+    async def _resolve_phone(self, user_id: str) -> str | None:
+        """Look up phone number for a user_id, with caching."""
+        if user_id in self._user_phone_cache:
+            return self._user_phone_cache[user_id]
+
+        try:
+            resp = await self._http.get(
+                f"{self.config.supabase_url}/rest/v1/imessage_users",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "status": "eq.active",
+                    "select": "phone_number",
+                    "limit": "1",
+                },
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "apikey": self.config.supabase_service_role_key,
+                },
+            )
+            if resp.status_code == 200:
+                rows = resp.json()
+                if rows:
+                    phone = rows[0].get("phone_number")
+                    if phone:
+                        self._user_phone_cache[user_id] = phone
+                        return phone
+        except Exception:
+            logger.exception("Failed to resolve phone for user %s", user_id[:8])
+
+        return None
+
+    async def _check_daily_briefing(self) -> None:
+        """Call v2-trigger to regenerate stale daily briefings."""
+        url = f"{self.config.supabase_url}/functions/v1/v2-trigger"
+        try:
+            resp = await self._http.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"action": "check_daily_briefing"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "check_daily_briefing returned %d: %s",
+                    resp.status_code, resp.text[:200],
+                )
+        except httpx.TimeoutException:
+            logger.warning("check_daily_briefing request timed out")
+        except Exception:
+            logger.exception("check_daily_briefing failed")
 
     async def _get_active_users(self) -> list[dict]:
         """Fetch all active users from imessage_users."""
@@ -156,183 +252,6 @@ class TriggerChecker:
             logger.warning("v2-trigger request timed out for user %s", user_id[:8])
         except Exception:
             logger.exception("Trigger check failed for user %s", user_id[:8])
-
-    # ── Cron reminder delivery ─────────────────────────────
-
-    async def _check_cron_reminders(self) -> None:
-        """Poll v2-trigger for due cron reminders and deliver via iMessage."""
-        url = f"{self.config.supabase_url}/functions/v1/v2-trigger"
-
-        try:
-            resp = await self._http.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"action": "check_cron_reminders"},
-            )
-
-            if resp.status_code != 200:
-                logger.warning(
-                    "v2-trigger cron reminders returned %d: %s",
-                    resp.status_code, resp.text[:200],
-                )
-                return
-
-            data = resp.json()
-            messages = data.get("messages", [])
-
-            if not messages:
-                return
-
-            logger.info("Cron reminders: %d message(s) to deliver", len(messages))
-
-            # Look up phone numbers for each user
-            for item in messages:
-                user_id = item.get("user_id")
-                message = item.get("message")
-                if not user_id or not message:
-                    continue
-
-                phone = await self._get_user_phone(user_id)
-                if not phone:
-                    logger.warning("No phone for user %s, skipping reminder", user_id[:8])
-                    continue
-
-                sent = await send_imessage(phone, message)
-                if sent:
-                    logger.info("Reminder sent to %s: %s", phone, message[:60])
-                else:
-                    logger.error("Failed to send reminder to %s", phone)
-                await asyncio.sleep(2.0)
-
-        except httpx.TimeoutException:
-            logger.warning("v2-trigger cron reminder request timed out")
-        except Exception:
-            logger.exception("Cron reminder check failed")
-
-    async def _get_user_phone(self, user_id: str) -> str | None:
-        """Look up a user's phone number from imessage_users."""
-        try:
-            resp = await self._http.get(
-                f"{self.config.supabase_url}/rest/v1/imessage_users",
-                params={
-                    "user_id": f"eq.{user_id}",
-                    "status": "eq.active",
-                    "select": "phone_number",
-                    "limit": "1",
-                },
-                headers={
-                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
-                    "apikey": self.config.supabase_service_role_key,
-                },
-            )
-            if resp.status_code == 200:
-                rows = resp.json()
-                if rows:
-                    return rows[0].get("phone_number")
-        except Exception:
-            logger.exception("Failed to look up phone for user %s", user_id[:8])
-        return None
-
-    # ── Onboarding drip sequence ────────────────────────────
-
-    async def _check_onboard_drips(self) -> None:
-        """Send follow-up messages to pending users who haven't signed up."""
-        pending = await self._get_pending_users()
-        if not pending:
-            return
-
-        now = datetime.now(timezone.utc)
-
-        for user in pending:
-            phone = user.get("phone_number")
-            step = user.get("drip_step") or 0
-            token = user.get("onboarding_token") or ""
-            count = user.get("onboard_count") or 0
-
-            if not phone or not token:
-                continue
-
-            # Only start drips after the user has had at least one conversation exchange
-            if count < 1:
-                continue
-
-            # Already exhausted all drip steps
-            if step >= len(_DRIP_SEQUENCE):
-                continue
-
-            next_step, delay_minutes, template = _DRIP_SEQUENCE[step]
-
-            # Reference time: last_drip_at if drips have started, otherwise updated_at
-            ref_raw = user.get("last_drip_at") or user.get("updated_at")
-            if not ref_raw:
-                continue
-
-            if isinstance(ref_raw, str):
-                ref_time = datetime.fromisoformat(ref_raw.replace("Z", "+00:00"))
-            else:
-                ref_time = ref_raw
-
-            elapsed_minutes = (now - ref_time).total_seconds() / 60.0
-            if elapsed_minutes < delay_minutes:
-                continue
-
-            onboard_url = f"https://nest.expert/?token={token}"
-            message = template.replace("{{URL}}", onboard_url)
-
-            logger.info(
-                "Sending drip step %d to %s (%.0f min since last touch)",
-                next_step, phone, elapsed_minutes,
-            )
-
-            sent = await send_imessage(phone, message)
-            if sent:
-                await self._update_drip_step(phone, next_step)
-                logger.info("Drip step %d sent to %s", next_step, phone)
-            else:
-                logger.error("Failed to send drip step %d to %s", next_step, phone)
-
-    async def _get_pending_users(self) -> list[dict]:
-        """Fetch pending/onboarding users who might need a drip message."""
-        try:
-            resp = await self._http.get(
-                f"{self.config.supabase_url}/rest/v1/imessage_users",
-                params={
-                    "status": "in.(pending,onboarding)",
-                    "drip_step": "lt.1",
-                    "select": "phone_number,onboarding_token,onboard_count,drip_step,last_drip_at,updated_at",
-                },
-                headers={
-                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
-                    "apikey": self.config.supabase_service_role_key,
-                },
-            )
-            if resp.status_code == 200:
-                return resp.json()
-        except Exception:
-            logger.exception("Failed to fetch pending users for drip")
-        return []
-
-    async def _update_drip_step(self, phone: str, step: int) -> None:
-        """Mark the drip step as sent in the DB."""
-        try:
-            await self._http.patch(
-                f"{self.config.supabase_url}/rest/v1/imessage_users",
-                params={"phone_number": f"eq.{phone}"},
-                headers={
-                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
-                    "apikey": self.config.supabase_service_role_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "drip_step": step,
-                    "last_drip_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-        except Exception:
-            logger.exception("Failed to update drip step for %s", phone)
 
     async def close(self) -> None:
         self._running = False

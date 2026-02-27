@@ -221,6 +221,10 @@ async function dispatch(
     case "travel_time":         return travelTime(args);
     case "places_search":       return placesSearch(args);
     case "manage_todos":        return manageTodos(userId, supabase, args);
+    case "update_user_timezone": return updateUserTimezone(userId, supabase, args);
+    case "connect_meeting_notes": return connectMeetingNotes(userId, supabase, args);
+    case "get_meeting_notes":     return getMeetingNotes(userId, supabase, args);
+    case "manage_meeting_recording": return manageMeetingRecording(userId, supabase, args);
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -279,7 +283,7 @@ async function calendarLookup(
         }
         const data = await resp.json();
         return (data.items ?? []).map((e: any) => ({
-          ...formatCalendarEvent(e),
+          ...formatCalendarEvent(e, tz),
           account: acct.email,
         }));
       } catch (e) {
@@ -307,15 +311,21 @@ async function calendarLookup(
   const now = new Date();
   return events
     .map((e: any) => {
-      const start = new Date(e.start);
-      const end = new Date(e.end);
+      const start = new Date(e.start_iso);
+      const end = new Date(e.end_iso);
       let status: string;
-      if (end < now) status = "ALREADY_HAPPENED";
-      else if (start <= now && end >= now) status = "HAPPENING_NOW";
-      else status = "UPCOMING";
+      if (isNaN(end.getTime()) || isNaN(start.getTime())) {
+        status = "UPCOMING";
+      } else if (end < now) {
+        status = "ALREADY_HAPPENED";
+      } else if (start <= now && end >= now) {
+        status = "HAPPENING_NOW";
+      } else {
+        status = "UPCOMING";
+      }
       return { ...e, status };
     })
-    .sort((a: any, b: any) => new Date(a.start).getTime() - new Date(b.start).getTime());
+    .sort((a: any, b: any) => new Date(a.start_iso).getTime() - new Date(b.start_iso).getTime());
 }
 
 /**
@@ -440,19 +450,52 @@ function pad(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-function formatCalendarEvent(e: any): Record<string, unknown> {
+function formatCalendarEvent(e: any, tz?: string): Record<string, unknown> {
+  const startRaw = e.start?.dateTime ?? e.start?.date;
+  const endRaw = e.end?.dateTime ?? e.end?.date;
+  const isAllDay = !!e.start?.date;
+  const eventTz = tz ?? e.start?.timeZone ?? "UTC";
+
+  // Convert to human-readable local time so the model cannot misinterpret the timezone
+  let startLocal = startRaw;
+  let endLocal = endRaw;
+  let dayLabel: string | null = null;
+
+  if (!isAllDay && startRaw) {
+    const sd = new Date(startRaw);
+    const ed = new Date(endRaw);
+    startLocal = sd.toLocaleString("en-AU", {
+      weekday: "short", day: "numeric", month: "short", year: "numeric",
+      hour: "numeric", minute: "2-digit", hour12: true,
+      timeZone: eventTz,
+    });
+    endLocal = ed.toLocaleString("en-AU", {
+      hour: "numeric", minute: "2-digit", hour12: true,
+      timeZone: eventTz,
+    });
+    dayLabel = sd.toLocaleDateString("en-AU", {
+      weekday: "long", day: "numeric", month: "long", year: "numeric",
+      timeZone: eventTz,
+    });
+  }
+
   const result: Record<string, unknown> = {
     event_id: e.id,
     title: e.summary ?? "(no title)",
-    start: e.start?.dateTime ?? e.start?.date,
-    end: e.end?.dateTime ?? e.end?.date,
-    all_day: !!e.start?.date,
+    start: startLocal,
+    end: endLocal,
+    start_iso: startRaw,
+    end_iso: endRaw,
+    all_day: isAllDay,
+    day: dayLabel,
+    timezone: eventTz,
     location: e.location ?? null,
     description: e.description ? e.description.slice(0, 300) : null,
     attendees: (e.attendees ?? []).map((a: any) => a.email),
     organizer: e.organizer?.email ?? null,
     html_link: e.htmlLink ?? null,
     recurring: !!e.recurringEventId,
+    response_status: (e.attendees ?? []).find((a: any) => a.self)?.responseStatus ?? null,
   };
   if (e.conferenceData?.entryPoints) {
     const meet = e.conferenceData.entryPoints.find((ep: any) => ep.entryPointType === "video");
@@ -479,14 +522,13 @@ async function calendarCreate(
   if (args.location) event.location = args.location;
   if (args.attendees) event.attendees = (args.attendees as string[]).map((e) => ({ email: e }));
   if (args.recurrence) event.recurrence = args.recurrence;
-  if (args.add_google_meet) {
-    event.conferenceData = {
-      createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } },
-    };
-  }
+  // Always add Google Meet link to calendar events
+  event.conferenceData = {
+    createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } },
+  };
 
   const qp = new URLSearchParams();
-  if (args.add_google_meet) qp.set("conferenceDataVersion", "1");
+  qp.set("conferenceDataVersion", "1");
   if (args.send_updates) qp.set("sendUpdates", args.send_updates as string);
   const qs = qp.toString();
 
@@ -1136,14 +1178,29 @@ async function gmailSearch(
         const details = await Promise.all(
           messages.map((m: any) => getGmailMessage(acct.accessToken, m.id)),
         );
-        return details.map((d: any) => ({
-          message_id: d.messageId, thread_id: d.threadId,
-          from: d.from, to: d.to, cc: d.cc,
-          subject: d.subject, date: d.date, snippet: d.snippet,
-          body_preview: d.bodyPreview,
-          has_attachments: (d.attachmentCount ?? 0) > 0,
-          account: acct.email,
-        }));
+        const searchTz = (args.time_zone as string) ?? DEFAULT_TZ;
+        return details.map((d: any) => {
+          // Convert email date to user's local timezone for clarity
+          let dateLocal = d.date;
+          try {
+            const parsed = d.internalDate ? new Date(d.internalDate) : new Date(d.date);
+            if (!isNaN(parsed.getTime())) {
+              dateLocal = parsed.toLocaleString("en-AU", {
+                weekday: "short", day: "numeric", month: "short", year: "numeric",
+                hour: "numeric", minute: "2-digit", hour12: true,
+                timeZone: searchTz,
+              });
+            }
+          } catch { /* keep raw date */ }
+          return {
+            message_id: d.messageId, thread_id: d.threadId,
+            from: d.from, to: d.to, cc: d.cc,
+            subject: d.subject, date: dateLocal, snippet: d.snippet,
+            body_preview: d.bodyPreview,
+            has_attachments: (d.attachmentCount ?? 0) > 0,
+            account: acct.email,
+          };
+        });
       } catch (e) {
         console.warn(`[tools] gmail_search error for ${acct.email}: ${(e as Error).message}`);
         return [];
@@ -1217,10 +1274,25 @@ async function getEmail(
     .filter((p: any) => p.filename && p.body?.attachmentId)
     .map((p: any) => ({ filename: p.filename, mime_type: p.mimeType, size: p.body.size }));
 
+  // Convert email date to user's timezone
+  const emailTz = (args.time_zone as string) ?? DEFAULT_TZ;
+  let dateLocal = getHeader("Date") ?? "";
+  try {
+    const internalMs = parseInt(msg.internalDate ?? "0", 10);
+    const parsed = internalMs ? new Date(internalMs) : new Date(dateLocal);
+    if (!isNaN(parsed.getTime())) {
+      dateLocal = parsed.toLocaleString("en-AU", {
+        weekday: "short", day: "numeric", month: "short", year: "numeric",
+        hour: "numeric", minute: "2-digit", hour12: true,
+        timeZone: emailTz,
+      });
+    }
+  } catch { /* keep raw */ }
+
   return {
     message_id: msg.id, thread_id: msg.threadId,
     from: getHeader("From"), to: getHeader("To"), cc: getHeader("Cc"),
-    subject: getHeader("Subject"), date: getHeader("Date"),
+    subject: getHeader("Subject"), date: dateLocal,
     body, attachments, labels: msg.labelIds ?? [],
   };
 }
@@ -1714,7 +1786,8 @@ function parseSchedule(schedule: string, tz = DEFAULT_TZ): { type: string; condi
     };
   }
 
-  // "tomorrow at 3pm" — detect "tomorrow" and offset
+  // One-shot: "tomorrow at 3pm", "at 5pm", "today at noon", etc.
+  // Generate date-specific cron expression so it only fires once.
   const isTomorrow = lower.includes("tomorrow");
   const time = extractTime(lower);
   const utcFire = localTimeToUtc(time.hour, time.minute, tz);
@@ -1722,9 +1795,10 @@ function parseSchedule(schedule: string, tz = DEFAULT_TZ): { type: string; condi
     utcFire.setUTCDate(utcFire.getUTCDate() + 1);
   }
 
+  // Use the UTC fire date for a date-specific cron expression (one-shot)
   return {
     type: "cron",
-    condition: `${time.minute} ${time.hour} * * *`,
+    condition: `${utcFire.getUTCMinutes()} ${utcFire.getUTCHours()} ${utcFire.getUTCDate()} ${utcFire.getUTCMonth() + 1} *`,
     nextFireAt: utcFire.toISOString(),
   };
 }
@@ -1748,7 +1822,7 @@ function computeNextCronFire(cronExpression: string, tz = DEFAULT_TZ): string | 
   try {
     const parts = cronExpression.trim().split(/\s+/);
     if (parts.length < 5) return null;
-    const [minuteStr, hourStr, dayStr, monthStr] = parts;
+    const [minuteStr, hourStr, dayStr, monthStr, dowStr] = parts;
 
     // If day/month are specific (one-shot), compute directly
     if (dayStr !== "*" && monthStr !== "*") {
@@ -1763,7 +1837,29 @@ function computeNextCronFire(cronExpression: string, tz = DEFAULT_TZ): string | 
     // Recurring: compute next occurrence from local time
     const targetHour = hourStr === "*" ? 9 : parseInt(hourStr, 10);
     const targetMinute = minuteStr === "*" ? 0 : parseInt(minuteStr, 10);
-    const utcFire = localTimeToUtc(targetHour, targetMinute, tz);
+    let utcFire = localTimeToUtc(targetHour, targetMinute, tz);
+
+    // Handle day-of-week constraints (e.g., "0 9 * * 1" = every Monday)
+    if (dowStr && dowStr !== "*") {
+      const targetDow = parseInt(dowStr, 10); // 0=Sun, 1=Mon, ..., 6=Sat
+      if (!isNaN(targetDow) && targetDow >= 0 && targetDow <= 6) {
+        const fireParts = new Intl.DateTimeFormat("en-US", {
+          timeZone: tz,
+          weekday: "short",
+        }).formatToParts(utcFire);
+        const dowMap: Record<string, number> = {
+          Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6,
+        };
+        const fireDow = dowMap[fireParts.find(p => p.type === "weekday")?.value ?? ""] ?? -1;
+
+        if (fireDow !== targetDow) {
+          let daysAhead = targetDow - fireDow;
+          if (daysAhead <= 0) daysAhead += 7;
+          utcFire = new Date(utcFire.getTime() + daysAhead * 24 * 60 * 60 * 1000);
+        }
+      }
+    }
+
     return utcFire.toISOString();
   } catch { return null; }
 }
@@ -2005,12 +2101,42 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
       }
     }
 
-    const steps = leg.steps?.slice(0, 5).map((s: any) => ({
-      instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
-      distance: s.distance?.text,
-      duration: s.duration?.text,
-    }));
-    if (steps?.length) result.route_summary = steps;
+    if (mode === "transit") {
+      const transitSteps = (leg.steps ?? [])
+        .filter((s: any) => s.travel_mode === "TRANSIT" || s.travel_mode === "WALKING")
+        .slice(0, 8)
+        .map((s: any) => {
+          const step: Record<string, unknown> = {
+            mode: s.travel_mode?.toLowerCase(),
+            instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
+            distance: s.distance?.text,
+            duration: s.duration?.text,
+          };
+          if (s.transit_details) {
+            const td = s.transit_details;
+            step.line_name = td.line?.short_name || td.line?.name;
+            step.vehicle_type = td.line?.vehicle?.type?.toLowerCase();
+            step.num_stops = td.num_stops;
+            step.departure_stop = td.departure_stop?.name;
+            step.arrival_stop = td.arrival_stop?.name;
+            if (td.departure_time?.text) step.departs_at = td.departure_time.text;
+            if (td.arrival_time?.text) step.arrives_at = td.arrival_time.text;
+            if (td.headsign) step.direction = td.headsign;
+          }
+          return step;
+        });
+      if (transitSteps.length) result.transit_steps = transitSteps;
+
+      if (leg.departure_time?.text) result.depart_at = leg.departure_time.text;
+      if (leg.arrival_time?.text) result.arrive_at = leg.arrival_time.text;
+    } else {
+      const steps = leg.steps?.slice(0, 5).map((s: any) => ({
+        instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
+        distance: s.distance?.text,
+        duration: s.duration?.text,
+      }));
+      if (steps?.length) result.route_summary = steps;
+    }
 
     return result;
   } catch (e) {
@@ -2226,4 +2352,287 @@ export async function getBatchEmbeddings(texts: string[]): Promise<number[][]> {
 
 export function vectorString(values: number[]): string {
   return "[" + values.map((v) => v.toFixed(8)).join(",") + "]";
+}
+
+// ── Update User Timezone ─────────────────────────────────────
+
+async function updateUserTimezone(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const timezone = (args.timezone as string)?.trim();
+  const reason = (args.reason as string) ?? "";
+
+  if (!timezone) {
+    return { error: "timezone is required (IANA format, e.g. 'Asia/Tokyo')" };
+  }
+
+  // Basic IANA timezone validation (must contain a slash)
+  if (!timezone.includes("/")) {
+    return { error: `Invalid timezone format: "${timezone}". Use IANA format like "Asia/Tokyo", "Europe/London", "America/New_York".` };
+  }
+
+  // Validate the timezone is real by trying to use it
+  try {
+    new Date().toLocaleString("en-US", { timeZone: timezone });
+  } catch {
+    return { error: `Unknown timezone: "${timezone}". Use a valid IANA timezone like "Asia/Tokyo", "Europe/London".` };
+  }
+
+  // Update ALL of the user's Google accounts to this timezone
+  const { error } = await supabase
+    .from("user_google_accounts")
+    .update({ timezone, updated_at: new Date().toISOString() })
+    .eq("user_id", userId);
+
+  if (error) {
+    console.error("[update_user_timezone] DB error:", error);
+    return { error: "Failed to update timezone" };
+  }
+
+  // Format the current time in the new timezone for confirmation
+  const nowInTz = new Date().toLocaleString("en-AU", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+    timeZone: timezone,
+  });
+
+  console.log(`[update_user_timezone] ${userId} → ${timezone} (${reason})`);
+
+  return {
+    _confirmation: true,
+    timezone,
+    current_local_time: nowInTz,
+    message: `Timezone updated to ${timezone}. Current local time: ${nowInTz}.`,
+  };
+}
+
+// ══════════════════════════════════════════════════════════════
+// MEETING RECORDING (Recall.ai integration)
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Connect user's calendar for automatic meeting recording.
+ * Uses their existing Google refresh token — no extra OAuth needed.
+ */
+async function connectMeetingNotes(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+    const resp = await fetchWithTimeout(
+      `${supabaseUrl}/functions/v1/recall-connect`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${serviceRoleKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          user_id: userId,
+          account_email: (args.account as string) || undefined,
+        }),
+      },
+      10_000,
+    );
+
+    const data = await resp.json();
+
+    if (data.already_connected) {
+      return {
+        already_connected: true,
+        _confirmation: "Your meeting recording is already set up. I'm joining all your meetings with video links.",
+      };
+    }
+
+    if (data.success) {
+      return {
+        success: true,
+        email: data.email,
+        _confirmation: `Done! I've connected your calendar (${data.email}). I'll start joining your meetings with video links and taking notes. You'll get a quick summary after each meeting.`,
+      };
+    }
+
+    return {
+      error: data.error || "connection_failed",
+      hint: data.hint || "Something went wrong connecting your calendar. Try again or connect a Google account first.",
+    };
+  } catch (e) {
+    console.error("[connect_meeting_notes] Error:", (e as Error).message);
+    return {
+      error: "connection_failed",
+      hint: "Something went wrong. Make sure you have a Google account connected.",
+    };
+  }
+}
+
+/**
+ * Get meeting notes/transcript from recorded meetings.
+ * Searches by title, attendee name, or date.
+ */
+async function getMeetingNotes(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const query = (args.query as string) ?? "";
+  const includeTranscript = (args.include_transcript as boolean) ?? false;
+
+  // Build query
+  let dbQuery = supabase
+    .from("recall_meetings")
+    .select("id, event_title, event_start, event_end, attendees, summary_text, transcript_text, bot_status, transcript_status")
+    .eq("user_id", userId)
+    .eq("transcript_status", "ready")
+    .order("event_start", { ascending: false })
+    .limit(5);
+
+  if (query) {
+    // Search by title or attendee name
+    dbQuery = dbQuery.or(`event_title.ilike.%${query}%`);
+  }
+
+  const { data: meetings, error } = await dbQuery;
+
+  if (error) {
+    console.error("[get_meeting_notes] DB error:", error);
+    return { error: "Failed to fetch meeting notes" };
+  }
+
+  if (!meetings || meetings.length === 0) {
+    // Try a broader search in case the query didn't match title
+    const { data: broader } = await supabase
+      .from("recall_meetings")
+      .select("id, event_title, event_start, attendees, summary_text, transcript_status")
+      .eq("user_id", userId)
+      .eq("transcript_status", "ready")
+      .order("event_start", { ascending: false })
+      .limit(5);
+
+    if (broader && broader.length > 0) {
+      // Filter by attendee name or content match
+      const filtered = broader.filter((m) => {
+        const attendeeStr = JSON.stringify(m.attendees ?? []).toLowerCase();
+        const titleStr = (m.event_title ?? "").toLowerCase();
+        const q = query.toLowerCase();
+        return attendeeStr.includes(q) || titleStr.includes(q) || (m.summary_text ?? "").toLowerCase().includes(q);
+      });
+
+      if (filtered.length > 0) {
+        return {
+          results: filtered.map((m) => ({
+            title: m.event_title,
+            date: m.event_start,
+            attendees: m.attendees,
+            summary: m.summary_text,
+          })),
+        };
+      }
+    }
+
+    return {
+      results: [],
+      hint: "No recorded meeting notes found matching that query. I only have notes from meetings I've recorded.",
+    };
+  }
+
+  return {
+    results: meetings.map((m) => ({
+      title: m.event_title,
+      date: m.event_start,
+      end: m.event_end,
+      attendees: m.attendees,
+      summary: m.summary_text,
+      transcript: includeTranscript ? m.transcript_text : undefined,
+      has_transcript: !!m.transcript_text,
+    })),
+  };
+}
+
+/**
+ * Manage meeting recording settings: check status, disconnect.
+ */
+async function manageMeetingRecording(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const action = (args.action as string) ?? "status";
+
+  if (action === "status") {
+    const { data: calendars } = await supabase
+      .from("recall_calendars")
+      .select("id, calendar_email, platform, status, created_at")
+      .eq("user_id", userId);
+
+    const { data: recentMeetings } = await supabase
+      .from("recall_meetings")
+      .select("event_title, event_start, bot_status, transcript_status")
+      .eq("user_id", userId)
+      .order("event_start", { ascending: false })
+      .limit(5);
+
+    return {
+      connected: (calendars ?? []).length > 0,
+      calendars: calendars ?? [],
+      recent_meetings: recentMeetings ?? [],
+    };
+  }
+
+  if (action === "disconnect") {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+    // Get the user's JWT or use service role
+    const { data: cal } = await supabase
+      .from("recall_calendars")
+      .select("recall_calendar_id")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (!cal) {
+      return { error: "No calendar connected to disconnect." };
+    }
+
+    try {
+      const resp = await fetchWithTimeout(
+        `${supabaseUrl}/functions/v1/recall-connect?calendar_id=${cal.recall_calendar_id}`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${serviceRoleKey}`,
+            "Content-Type": "application/json",
+          },
+        },
+        10_000,
+      );
+
+      const data = await resp.json();
+      if (data.success) {
+        return { _confirmation: "I've disconnected your calendar. I won't join your meetings anymore." };
+      }
+      return { error: data.error || "disconnect_failed" };
+    } catch (e) {
+      return { error: "Failed to disconnect: " + (e as Error).message };
+    }
+  }
+
+  if (action === "decline_pitch") {
+    await supabase.from("v2_user_memory").update({
+      recall_pitch_status: "declined",
+      recall_pitched_at: new Date().toISOString(),
+    }).eq("user_id", userId);
+    return { success: true, _note: "Pitch declined. Won't suggest meeting notes again." };
+  }
+
+  return { error: `Unknown action: ${action}. Use "status", "disconnect", or "decline_pitch".` };
 }

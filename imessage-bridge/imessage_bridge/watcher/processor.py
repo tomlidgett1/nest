@@ -1,10 +1,4 @@
-"""Process new iMessages: check user status, onboard new users, forward to V2 agent.
-
-v2 — Concurrent per-user processing. Each user's messages are handled in
-their own asyncio Task so 50 users messaging simultaneously don't queue
-behind each other. Per-user locks prevent reply interleaving within a
-single conversation.
-"""
+"""Process new iMessages: check user status, onboard new users, forward to V2 agent."""
 
 from __future__ import annotations
 
@@ -14,43 +8,70 @@ import logging
 import random
 import re
 import time
-from collections import defaultdict
 
 import httpx
 
 from ..config import Config
-from ..sender.imessage import send_imessage
+from ..sender.imessage import send_imessage, send_reaction
 from ..state import BridgeState
 from .chat_db import IncomingMessage, fetch_new_messages
 
 logger = logging.getLogger("imessage_bridge.watcher.processor")
 _debug_logger = logging.getLogger("imessage_bridge.debug")
 
-_DEBUG_PHONE = "+61414187820"
+_MAX_BACKOFF = 30.0
+_backoff = 0.0
 
-MAX_CONCURRENT_AGENTS = 20
-USER_QUEUE_TIMEOUT = 300.0
+# Phone number to enable deep debug logging for
+_DEBUG_PHONE = "+61414187820"
 
 
 def _dbg(phone: str, msg: str, *args: object) -> None:
+    """Print rich debug output only for the target phone number."""
     if phone != _DEBUG_PHONE:
         return
     formatted = msg % args if args else msg
     _debug_logger.info("🔍 %s", formatted)
 
+_SEND_COOLDOWN_SECONDS = 0.1
+_INTER_MESSAGE_DELAY = 1.0
 
 _JUNK_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"^https?://\S+$"),
     re.compile(r"missed a call", re.IGNORECASE),
     re.compile(r"didn't leave a message", re.IGNORECASE),
-    re.compile(r"^Liked\s+\"", re.IGNORECASE),
-    re.compile(r"^Loved\s+\"", re.IGNORECASE),
+    # Liked / Loved are handled by _transform_tapback() — NOT junk
     re.compile(r"^Laughed at\s+\"", re.IGNORECASE),
     re.compile(r"^Emphasised\s+\"", re.IGNORECASE),
     re.compile(r"^Emphasized\s+\"", re.IGNORECASE),
     re.compile(r"^Disliked\s+\"", re.IGNORECASE),
     re.compile(r"^Questioned\s+\"", re.IGNORECASE),
 ]
+
+# Tapback reactions that signal agreement / confirmation.
+# iMessage sends them as: Liked "original message text"
+_TAPBACK_CONFIRM_RE = re.compile(
+    r"^(?:Liked|Loved)\s+\"(.+?)\"$", re.IGNORECASE | re.DOTALL
+)
+
+
+def _transform_tapback(text: str) -> str | None:
+    """Convert a Liked/Loved tapback into a real message for the agent.
+
+    If the quoted (reacted-to) message contains a question, treat the
+    tapback as a confirmation: "Yes, go ahead".
+    If it doesn't contain a question, return None (ignore it — it's
+    just an acknowledgment, not actionable).
+    """
+    m = _TAPBACK_CONFIRM_RE.match(text.strip())
+    if not m:
+        return None
+    quoted = m.group(1).strip()
+    # The quoted text is from Nest's message. If it contained a question
+    # the user is saying "yes" by liking it.
+    if "?" in quoted:
+        return f"Yes, go ahead. [reacted to: \"{quoted}\"]"
+    return None
 
 _CASUAL_WORDS = {
     "hey", "hi", "hello", "yo", "sup", "hiya", "g'day",
@@ -63,9 +84,13 @@ _CASUAL_WORDS = {
     "how are you", "how's it going", "what's up", "whats up",
 }
 
+# These look casual but are often confirmations for pending actions
+# (e.g. "yes" after "want me to send it?"). Route through agent so
+# the model can see conversation history and act on them.
 _NEVER_CASUAL = {
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "kk",
     "do it", "go ahead", "send", "send it", "go for it", "confirm",
+    "?", "??", "???",
 }
 
 _ACK_FALLBACKS = [
@@ -76,13 +101,59 @@ _ACK_FALLBACKS = [
     "Looking into it.",
 ]
 
+# Patterns that indicate the user is talking to Nest in a group chat.
+# Case-insensitive. Checked against the start of the message.
+_NEST_MENTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"^@?nest\b[,:]?\s*", re.IGNORECASE),
+    re.compile(r"^hey nest\b[,:]?\s*", re.IGNORECASE),
+    re.compile(r"^yo nest\b[,:]?\s*", re.IGNORECASE),
+]
+
+
+def _extract_nest_mention(text: str) -> str | None:
+    """If the message is addressed to Nest, return the text with the mention stripped.
+
+    Returns None if Nest is not mentioned (message should be ignored in group chats).
+    """
+    for pattern in _NEST_MENTION_PATTERNS:
+        m = pattern.match(text)
+        if m:
+            remainder = text[m.end():].strip()
+            return remainder if remainder else text.strip()
+    return None
+
 
 def _is_junk_message(text: str) -> bool:
     return any(p.search(text) for p in _JUNK_PATTERNS)
 
 
+_VALID_SENDER_RE = re.compile(r"^\+?\d[\d\s\-()]{6,}$")
+
+def _is_blocked_sender(sender: str) -> bool:
+    """Block Apple Business Chat, short codes, and non-mobile identifiers."""
+    if not sender:
+        return True
+    if sender.startswith("urn:biz:"):
+        return True
+    if sender.startswith("mailto:"):
+        return True
+    s = sender.strip()
+    if s.startswith("+") or s[0].isdigit():
+        digits = re.sub(r"\D", "", s)
+        if len(digits) < 7:
+            return True
+        return False
+    if "@" in s:
+        return False
+    return True
+
+
 def _is_casual(text: str) -> bool:
-    cleaned = text.lower().strip().rstrip("!?.").strip()
+    raw = text.lower().strip()
+    # "?" messages mean "I don't understand" — always route through full agent
+    if raw in ("?", "??", "???"):
+        return False
+    cleaned = raw.rstrip("!?.").strip()
     if cleaned in _NEVER_CASUAL:
         return False
     if cleaned in _CASUAL_WORDS:
@@ -101,9 +172,11 @@ def _pick_fallback_ack() -> str:
     return random.choice(_ACK_FALLBACKS)
 
 
-# ── User status cache ─────────────────────────────────────────
+# ── User status cache (avoids hitting Supabase on every message) ──
 
 class _UserCache:
+    """In-memory cache of imessage_users lookups. TTL-based."""
+
     def __init__(self, ttl: float = 60.0) -> None:
         self._cache: dict[str, dict] = {}
         self._timestamps: dict[str, float] = {}
@@ -128,131 +201,206 @@ class _UserCache:
         self._timestamps.pop(phone, None)
 
 
-# ── Processor ─────────────────────────────────────────────────
+_GROUP_BUFFER_MAX = 30
+_GROUP_BUFFER_TTL = 3600.0  # 1 hour
+
+
+class _GroupChatBuffer:
+    """In-memory rolling buffer of recent messages per group chat."""
+
+    def __init__(self, max_messages: int = _GROUP_BUFFER_MAX, ttl: float = _GROUP_BUFFER_TTL) -> None:
+        self._buffers: dict[str, list[dict]] = {}
+        self._last_activity: dict[str, float] = {}
+        self._max = max_messages
+        self._ttl = ttl
+
+    def append(self, chat_guid: str, role: str, content: str, sender_name: str | None = None) -> None:
+        self._evict_stale()
+        if chat_guid not in self._buffers:
+            self._buffers[chat_guid] = []
+        entry: dict = {"role": role, "content": content}
+        if sender_name:
+            entry["name"] = sender_name
+        self._buffers[chat_guid].append(entry)
+        if len(self._buffers[chat_guid]) > self._max:
+            self._buffers[chat_guid] = self._buffers[chat_guid][-self._max:]
+        self._last_activity[chat_guid] = time.monotonic()
+
+    def get_context(self, chat_guid: str) -> list[dict]:
+        self._evict_stale()
+        return list(self._buffers.get(chat_guid, []))
+
+    def _evict_stale(self) -> None:
+        now = time.monotonic()
+        stale = [k for k, t in self._last_activity.items() if now - t > self._ttl]
+        for k in stale:
+            self._buffers.pop(k, None)
+            self._last_activity.pop(k, None)
+
 
 class MessageProcessor:
-    """Concurrent per-user message processor.
-
-    Architecture:
-      - on_chat_db_changed() reads new messages, groups by sender, and
-        dispatches each sender's batch as a separate asyncio.Task.
-      - Per-user asyncio.Lock ensures messages from the same sender are
-        processed sequentially (preserving conversation order).
-      - A global Semaphore caps concurrent agent HTTP calls.
-      - State (last_rowid, processed_guids) is protected by an asyncio.Lock.
-    """
+    """Watches for new iMessages and routes them based on user status."""
 
     def __init__(self, config: Config, state: BridgeState) -> None:
         self.config = config
         self.state = state
         self._http = httpx.AsyncClient(timeout=180.0)
+        self._processing = False
+        self._last_send_time: float = 0.0
+        self._group_buffer = _GroupChatBuffer()
         self._user_cache = _UserCache(ttl=15.0)
 
-        self._user_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._agent_semaphore = asyncio.Semaphore(MAX_CONCURRENT_AGENTS)
-        self._state_lock = asyncio.Lock()
-        self._active_tasks: set[asyncio.Task] = set()
-        self._last_response_ids: dict[str, str | None] = {}
-        self._fetching = False
-
     async def on_chat_db_changed(self) -> None:
-        if self._fetching:
+        global _backoff
+
+        if self._processing:
+            logger.debug("Already processing, skipping overlapping trigger")
             return
-        self._fetching = True
+
+        elapsed = time.monotonic() - self._last_send_time
+        if elapsed < _SEND_COOLDOWN_SECONDS:
+            logger.debug("Cooldown active (%.1fs ago), skipping FS event", elapsed)
+            return
+
+        self._processing = True
         try:
+            # Multi-user mode: fetch from all senders (target_phone=None)
             messages = fetch_new_messages(
                 chat_db_path=self.config.chat_db_path,
                 target_phone=None,
                 last_rowid=self.state.last_rowid,
             )
 
-            to_process: list[IncomingMessage] = []
-            for msg in messages:
+            for i, msg in enumerate(messages):
                 if msg.guid in self.state.processed_guids:
-                    async with self._state_lock:
-                        self.state.last_rowid = max(self.state.last_rowid, msg.rowid)
+                    self.state.last_rowid = max(self.state.last_rowid, msg.rowid)
+                    continue
+
+                # Tapback reactions: Liked/Loved on a question → confirmation
+                tapback_result = _transform_tapback(msg.text)
+                if tapback_result is not None:
+                    logger.info("Tapback confirmation [ROWID %d]: %s → %s", msg.rowid, msg.text[:80], tapback_result)
+                    msg = IncomingMessage(
+                        rowid=msg.rowid, guid=msg.guid, text=tapback_result,
+                        sender=msg.sender, timestamp=msg.timestamp,
+                        is_group=msg.is_group, chat_guid=msg.chat_guid,
+                    )
+                elif _TAPBACK_CONFIRM_RE.match(msg.text.strip()):
+                    # Liked/Loved on a non-question — just an acknowledgment, skip it
+                    logger.debug("Skipping non-question tapback [ROWID %d]: %s", msg.rowid, msg.text[:80])
+                    self.state.last_rowid = msg.rowid
+                    self.state.processed_guids.add(msg.guid)
+                    self.state.save()
                     continue
 
                 if _is_junk_message(msg.text):
                     logger.debug("Skipping junk [ROWID %d]: %s", msg.rowid, msg.text[:80])
-                    async with self._state_lock:
-                        self.state.last_rowid = msg.rowid
-                        self.state.processed_guids.add(msg.guid)
-                        self.state.save()
-                    continue
-
-                async with self._state_lock:
                     self.state.last_rowid = msg.rowid
                     self.state.processed_guids.add(msg.guid)
                     self.state.save()
+                    continue
 
-                to_process.append(msg)
+                if _is_blocked_sender(msg.sender):
+                    logger.debug("Blocked sender [ROWID %d]: %s", msg.rowid, msg.sender)
+                    self.state.last_rowid = msg.rowid
+                    self.state.processed_guids.add(msg.guid)
+                    self.state.save()
+                    continue
 
-            if not to_process:
-                return
-
-            by_sender: dict[str, list[IncomingMessage]] = defaultdict(list)
-            for msg in to_process:
-                by_sender[msg.sender].append(msg)
-
-            logger.info(
-                "Dispatching %d message(s) from %d user(s) concurrently",
-                len(to_process), len(by_sender),
-            )
-
-            for sender, sender_msgs in by_sender.items():
-                task = asyncio.create_task(
-                    self._process_user_batch(sender, sender_msgs),
-                    name=f"user:{sender}",
-                )
-                self._active_tasks.add(task)
-                task.add_done_callback(self._active_tasks.discard)
-
-        finally:
-            self._fetching = False
-
-    async def _process_user_batch(self, sender: str, messages: list[IncomingMessage]) -> None:
-        """Process a batch of messages from a single sender, sequentially and under lock."""
-        async with self._user_locks[sender]:
-            for msg in messages:
                 logger.info(
-                    "New iMessage [ROWID %d] from %s: %s",
-                    msg.rowid, msg.sender, msg.text[:120],
+                    "New iMessage [ROWID %d] from %s%s: %s",
+                    msg.rowid, msg.sender,
+                    " (GROUP)" if msg.is_group else "",
+                    msg.text[:120],
                 )
                 _dbg(msg.sender, "=" * 70)
                 _dbg(msg.sender, "📨 INCOMING MESSAGE")
                 _dbg(msg.sender, "  ROWID: %d | GUID: %s", msg.rowid, msg.guid)
                 _dbg(msg.sender, "  From:  %s", msg.sender)
+                _dbg(msg.sender, "  Group: %s (chat_guid=%s)", msg.is_group, msg.chat_guid or "N/A")
                 _dbg(msg.sender, "  Text:  %s", msg.text)
                 _dbg(msg.sender, "-" * 70)
 
+                # Group chat: always buffer the message for context,
+                # but only respond if Nest is mentioned
+                if msg.is_group:
+                    if msg.chat_guid:
+                        sender_label = msg.sender
+                        cached = self._user_cache.get(msg.sender)
+                        if cached and cached.get("display_name"):
+                            sender_label = cached["display_name"]
+                        self._group_buffer.append(msg.chat_guid, "user", msg.text, sender_name=sender_label)
+
+                    stripped = _extract_nest_mention(msg.text)
+                    if stripped is None:
+                        _dbg(msg.sender, "💤 Group message without @nest mention, buffered for context")
+                        self.state.last_rowid = msg.rowid
+                        self.state.processed_guids.add(msg.guid)
+                        self.state.save()
+                        continue
+                    _dbg(msg.sender, "🏷️ Nest mentioned in group, stripped text: %s", stripped[:100])
+                    msg = IncomingMessage(
+                        rowid=msg.rowid,
+                        guid=msg.guid,
+                        text=stripped,
+                        sender=msg.sender,
+                        timestamp=msg.timestamp,
+                        is_group=msg.is_group,
+                        chat_guid=msg.chat_guid,
+                    )
+
+                if i > 0:
+                    await asyncio.sleep(_INTER_MESSAGE_DELAY)
+
                 try:
-                    await self._route_message(msg)
+                    # Look up user status for this sender
+                    user_info = await self._get_user_info(msg.sender)
+
+                    _dbg(msg.sender, "👤 USER LOOKUP: %s",
+                         f"status={user_info['status']}, user_id={user_info.get('user_id', 'N/A')}, name={user_info.get('display_name', 'N/A')}"
+                         if user_info else "NOT FOUND (new user)")
+
+                    if msg.is_group:
+                        # Group chats: respond to anyone who mentions Nest,
+                        # regardless of whether they have a Nest account.
+                        # Use their user_id if they're active, otherwise a
+                        # placeholder — the edge function skips all private
+                        # context for group messages anyway.
+                        group_user_id = (user_info or {}).get("user_id") or "group-anonymous"
+                        group_display = (user_info or {}).get("display_name") or msg.sender
+                        group_info = {"user_id": group_user_id, "display_name": group_display}
+                        _dbg(msg.sender, "👥 Group route → _process_active_user() (user_id=%s)", group_user_id)
+                        await self._process_active_user(msg, group_info)
+                    elif user_info is None:
+                        _dbg(msg.sender, "🆕 Routing → _onboard_new_user()")
+                        await self._onboard_new_user(msg)
+                    elif user_info["status"] == "pending" or user_info["status"] == "onboarding":
+                        _dbg(msg.sender, "📋 Routing → _continue_onboarding()")
+                        await self._continue_onboarding(msg, user_info)
+                    elif user_info["status"] == "active":
+                        _dbg(msg.sender, "✅ Routing → _process_active_user()")
+                        await self._process_active_user(msg, user_info)
+                    else:
+                        logger.warning("Unknown user status: %s", user_info["status"])
+
+                    _backoff = 0.0
                 except Exception:
-                    logger.exception("Failed to process message %s from %s", msg.guid, sender)
+                    logger.exception("Failed to process message %s", msg.guid)
+                    _backoff = min(_backoff * 2 or 1.0, _MAX_BACKOFF)
+                    logger.info("Backing off %.1fs before next attempt", _backoff)
+                    await asyncio.sleep(_backoff)
+                    continue
 
-    async def _route_message(self, msg: IncomingMessage) -> None:
-        user_info = await self._get_user_info(msg.sender)
-
-        _dbg(msg.sender, "👤 USER LOOKUP: %s",
-             f"status={user_info['status']}, user_id={user_info.get('user_id', 'N/A')}, name={user_info.get('display_name', 'N/A')}"
-             if user_info else "NOT FOUND (new user)")
-
-        if user_info is None:
-            _dbg(msg.sender, "🆕 Routing → _onboard_new_user()")
-            await self._onboard_new_user(msg)
-        elif user_info["status"] in ("pending", "onboarding"):
-            _dbg(msg.sender, "📋 Routing → _continue_onboarding()")
-            await self._continue_onboarding(msg, user_info)
-        elif user_info["status"] == "active":
-            _dbg(msg.sender, "✅ Routing → _process_active_user()")
-            await self._process_active_user(msg, user_info)
-        else:
-            logger.warning("Unknown user status: %s", user_info["status"])
+                self.state.last_rowid = msg.rowid
+                self.state.processed_guids.add(msg.guid)
+                self.state.save()
+        finally:
+            self._processing = False
 
     # ── User Lookup ───────────────────────────────────────────
 
     async def _get_user_info(self, phone: str) -> dict | None:
+        """Look up a phone number in imessage_users. Returns None if not found."""
         cached = self._user_cache.get(phone)
         if cached is not None:
             return cached if cached.get("_exists") else None
@@ -278,6 +426,7 @@ class MessageProcessor:
                     self._user_cache.set(phone, user)
                     return user
 
+            # Not found
             self._user_cache.set(phone, {"_exists": False})
             return None
         except Exception:
@@ -287,6 +436,7 @@ class MessageProcessor:
     # ── New User Onboarding ───────────────────────────────────
 
     async def _onboard_new_user(self, msg: IncomingMessage) -> None:
+        """Create a new imessage_users entry and start the conversational onboarding."""
         logger.info("New user detected: %s", msg.sender)
 
         try:
@@ -337,6 +487,7 @@ class MessageProcessor:
     # ── Continue Onboarding Conversation ─────────────────────
 
     async def _continue_onboarding(self, msg: IncomingMessage, user_info: dict) -> None:
+        """Continue the pre-signup conversation, or route to active if they signed up."""
         self._user_cache.invalidate(msg.sender)
         fresh_info = await self._get_user_info(msg.sender)
         if fresh_info and fresh_info.get("status") == "active" and fresh_info.get("user_id"):
@@ -357,6 +508,7 @@ class MessageProcessor:
 
     @staticmethod
     def _build_pdl_context(pdl_profile: dict | None) -> str | None:
+        """Convert a cached PDL profile dict into a context string for the LLM."""
         if not pdl_profile or not isinstance(pdl_profile, dict):
             return None
         lines: list[str] = []
@@ -433,6 +585,7 @@ class MessageProcessor:
         onboard_url: str,
         pdl_context: str | None = None,
     ) -> None:
+        """Call v2-onboard-chat and send the response."""
         try:
             payload: dict = {
                 "phone": msg.sender,
@@ -458,6 +611,7 @@ class MessageProcessor:
             if resp.status_code != 200:
                 logger.error("v2-onboard-chat returned %d: %s", resp.status_code, resp.text[:300])
                 await send_imessage(msg.sender, "Hey, something went wrong on my end. Text me again in a sec.")
+                self._last_send_time = time.monotonic()
                 return
 
             data = resp.json()
@@ -468,36 +622,82 @@ class MessageProcessor:
 
             logger.info("Onboard chat response (%d chars, count=%d): %s", len(response_text), message_count, response_text[:120])
             await send_imessage(msg.sender, response_text)
+            self._last_send_time = time.monotonic()
 
         except Exception:
             logger.exception("Failed to call v2-onboard-chat for %s", msg.sender)
             await send_imessage(msg.sender, "Hey, something went wrong on my end. Text me again in a sec.")
+            self._last_send_time = time.monotonic()
+
+    # ── Contextual Acknowledgments ──────────────────────────────
+
+    async def _generate_contextual_ack(self, message: str) -> str | None:
+        """Call v2-ack edge function for a contextual acknowledgment.
+        Returns None if the message is conversational and no ack is needed."""
+        try:
+            resp = await self._http.post(
+                self.config.v2_ack_url,
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"message": message},
+                timeout=4.0,
+            )
+
+            if resp.status_code == 200:
+                ack = resp.json().get("ack")
+                if ack and isinstance(ack, str) and len(ack) < 100:
+                    return ack.strip()
+                return None
+        except httpx.TimeoutException:
+            logger.debug("Ack edge function timed out")
+        except Exception:
+            logger.debug("Ack edge function failed", exc_info=True)
+
+        return None
 
     # ── Active User Processing ────────────────────────────────
 
     async def _process_active_user(self, msg: IncomingMessage, user_info: dict) -> None:
+        """Process a message from an active (authenticated) user."""
         user_id = user_info.get("user_id")
         if not user_id:
             logger.error("Active user %s has no user_id", msg.sender)
-            await send_imessage(msg.sender, "Something's off with your account. Try signing in again.")
+            if not msg.is_group:
+                await send_imessage(msg.sender, "Something's off with your account. Try signing in again.")
             return
 
         display_name = user_info.get("display_name")
+        is_casual = _is_casual(msg.text)
         _dbg(msg.sender, "⚙️  PROCESSING ACTIVE USER")
         _dbg(msg.sender, "  user_id:      %s", user_id)
         _dbg(msg.sender, "  display_name: %s", display_name or "(none)")
+        _dbg(msg.sender, "  is_casual:    %s", is_casual)
+        _dbg(msg.sender, "  is_group:     %s", msg.is_group)
 
         agent_start = time.monotonic()
 
-        async with self._agent_semaphore:
-            _dbg(msg.sender, "💬 Calling agent (streaming)")
-            response_text = await self._forward_to_agent_streaming(msg, user_id, display_name)
+        _dbg(msg.sender, "💬 Calling agent (streaming)")
+        response_text, reaction = await self._forward_to_agent_streaming(msg, user_id, display_name)
 
         agent_elapsed = time.monotonic() - agent_start
         _dbg(msg.sender, "⏱ Agent round-trip: %.1fs", agent_elapsed)
 
+        # Tapback reactions — disabled for now, re-enable when ready
+        # if reaction:
+        #     _dbg(msg.sender, "👍 Sending tapback: %s", reaction)
+        #     reacted = await send_reaction(msg.sender, reaction)
+        #     if reacted:
+        #         _dbg(msg.sender, "✅ Tapback sent: %s", reaction)
+        #         await asyncio.sleep(random.uniform(0.8, 1.5))
+        #     else:
+        #         _dbg(msg.sender, "⚠️ Tapback failed (non-blocking): %s", reaction)
+        if reaction:
+            _dbg(msg.sender, "👍 Tapback decided: %s (disabled)", reaction)
+
         if response_text:
-            resp_id = self._last_response_ids.get(msg.sender)
+            resp_id = self._last_response_id
             if resp_id:
                 self.state.sent_message_ids.add(resp_id)
 
@@ -506,32 +706,46 @@ class MessageProcessor:
             if len(response_text) > 500:
                 _dbg(msg.sender, "  ... (%d more chars)", len(response_text) - 500)
 
-            sent = await send_imessage(msg.sender, response_text)
+            # Group chats: reply to the group, not the individual
+            reply_chat_guid = msg.chat_guid if msg.is_group else None
+            sent = await send_imessage(msg.sender, response_text, chat_guid=reply_chat_guid)
+            self._last_send_time = time.monotonic()
+
+            # Record Nest's reply in group buffer
+            if msg.is_group and msg.chat_guid:
+                self._group_buffer.append(msg.chat_guid, "assistant", response_text)
 
             if sent:
-                logger.info("Reply sent to %s via iMessage", msg.sender)
+                target = f"group {msg.chat_guid}" if msg.is_group else msg.sender
+                logger.info("Reply sent to %s via iMessage", target)
                 _dbg(msg.sender, "✅ Reply sent successfully")
             else:
                 logger.error("Failed to send iMessage reply to %s", msg.sender)
                 _dbg(msg.sender, "❌ FAILED to send iMessage reply")
-        else:
+        elif not reaction:
             logger.debug("Agent returned empty response")
             _dbg(msg.sender, "⚠️ Agent returned empty response")
 
         _dbg(msg.sender, "=" * 70)
 
-    # ── Agent Communication ───────────────────────────────────
-
     async def _forward_to_agent(
         self, msg: IncomingMessage, user_id: str, display_name: str | None = None
     ) -> str | None:
-        self._last_response_ids[msg.sender] = None
+        """POST the message to the v2-chat-service edge function."""
+        self._last_response_id: str | None = None
 
-        body: dict = {"user_id": user_id, "message": msg.text}
+        body: dict = {
+            "user_id": user_id,
+            "message": msg.text,
+        }
         if display_name:
             body["user_name"] = display_name
 
         _dbg(msg.sender, "🌐 CALLING v2-chat-service")
+        _dbg(msg.sender, "  URL:     %s", self.config.v2_chat_service_url)
+        _dbg(msg.sender, "  Payload: user_id=%s, message='%s', user_name=%s",
+             user_id, msg.text[:100], display_name or "(none)")
+
         req_start = time.monotonic()
 
         resp = await self._http.post(
@@ -546,8 +760,12 @@ class MessageProcessor:
         req_elapsed = time.monotonic() - req_start
 
         if resp.status_code != 200:
-            logger.error("Edge function returned %d: %s", resp.status_code, resp.text[:500])
+            logger.error(
+                "Edge function returned %d: %s",
+                resp.status_code, resp.text[:500],
+            )
             _dbg(msg.sender, "❌ Edge function returned HTTP %d (%.1fs)", resp.status_code, req_elapsed)
+            _dbg(msg.sender, "  Body: %s", resp.text[:500])
             raise RuntimeError(f"v2-chat-service error: {resp.status_code}")
 
         _dbg(msg.sender, "🌐 RESPONSE received (HTTP %d, %.1fs)", resp.status_code, req_elapsed)
@@ -568,23 +786,25 @@ class MessageProcessor:
                     ack_text = event.get("text", "")
                     if ack_text:
                         _dbg(msg.sender, "⚡ ACK (legacy path): \"%s\"", ack_text)
-                        await send_imessage(msg.sender, ack_text)
+                        ack_guid = msg.chat_guid if msg.is_group else None
+                        await send_imessage(msg.sender, ack_text, chat_guid=ack_guid)
                 elif event.get("type") == "response":
                     response_text = event.get("response", "")
-                    self._last_response_ids[msg.sender] = event.get("response_id")
+                    self._last_response_id = event.get("response_id")
                     debug_info = event.get("_debug")
                     if debug_info:
                         self._log_debug_info(msg.sender, debug_info)
         else:
             data = resp.json()
             response_text = data.get("response", "")
-            self._last_response_ids[msg.sender] = data.get("response_id")
+            self._last_response_id = data.get("response_id")
             debug_info = data.get("_debug")
             if debug_info:
                 self._log_debug_info(msg.sender, debug_info)
 
         if not response_text:
             logger.debug("Empty response from agent")
+            _dbg(msg.sender, "⚠️ Empty response text from agent")
             return None
 
         logger.info("Agent response (%d chars): %s", len(response_text), response_text[:120])
@@ -592,25 +812,34 @@ class MessageProcessor:
 
     async def _forward_to_agent_streaming(
         self, msg: IncomingMessage, user_id: str, display_name: str | None = None
-    ) -> str | None:
+    ) -> tuple[str | None, str | None]:
         """POST to v2-chat-service and handle NDJSON streaming.
 
-        Streams ack immediately, returns full response text.
-        Falls back to standard JSON if the response isn't NDJSON.
+        Returns (response_text, reaction) where reaction is a tapback type
+        like "love", "like", "laugh", etc. or None.
         """
-        self._last_response_ids[msg.sender] = None
+        self._last_response_id = None
 
         body: dict = {"user_id": user_id, "message": msg.text}
         if display_name:
             body["user_name"] = display_name
+        if msg.is_group:
+            body["is_group"] = True
+            if msg.chat_guid:
+                group_ctx = self._group_buffer.get_context(msg.chat_guid)
+                if group_ctx:
+                    body["group_context"] = group_ctx
 
         _dbg(msg.sender, "🌐 CALLING v2-chat-service (streaming)")
         _dbg(msg.sender, "  URL:     %s", self.config.v2_chat_service_url)
-        _dbg(msg.sender, "  Payload: user_id=%s, message='%s', user_name=%s",
-             user_id, msg.text[:100], display_name or "(none)")
+        _dbg(msg.sender, "  Payload: user_id=%s, message='%s', user_name=%s, is_group=%s, group_ctx=%d msgs",
+             user_id, msg.text[:100], display_name or "(none)", msg.is_group,
+             len(body.get("group_context", [])))
 
         req_start = time.monotonic()
+
         response_text: str | None = None
+        reaction: str | None = None
 
         try:
             async with self._http.stream(
@@ -627,6 +856,7 @@ class MessageProcessor:
                     async for chunk in stream.aiter_text():
                         body_text += chunk
                     _dbg(msg.sender, "❌ Edge function returned HTTP %d (%.1fs)", stream.status_code, time.monotonic() - req_start)
+                    _dbg(msg.sender, "  Body: %s", body_text[:500])
                     raise RuntimeError(f"v2-chat-service error: {stream.status_code}")
 
                 content_type = stream.headers.get("content-type", "")
@@ -653,11 +883,14 @@ class MessageProcessor:
                                 ack_text = event.get("text", "")
                                 if ack_text:
                                     _dbg(msg.sender, "⚡ ACK received: \"%s\" (%.1fs)", ack_text, time.monotonic() - req_start)
-                                    await send_imessage(msg.sender, ack_text)
+                                    ack_guid = msg.chat_guid if msg.is_group else None
+                                    await send_imessage(msg.sender, ack_text, chat_guid=ack_guid)
+                                    self._last_send_time = time.monotonic()
 
                             elif event_type == "response":
                                 response_text = event.get("response", "")
-                                self._last_response_ids[msg.sender] = event.get("response_id")
+                                reaction = event.get("reaction")
+                                self._last_response_id = event.get("response_id")
                                 debug_info = event.get("_debug")
                                 if debug_info:
                                     self._log_debug_info(msg.sender, debug_info)
@@ -670,7 +903,8 @@ class MessageProcessor:
                         full_body += chunk
                     data = json.loads(full_body)
                     response_text = data.get("response", "")
-                    self._last_response_ids[msg.sender] = data.get("response_id")
+                    reaction = data.get("reaction")
+                    self._last_response_id = data.get("response_id")
                     debug_info = data.get("_debug")
                     if debug_info:
                         self._log_debug_info(msg.sender, debug_info)
@@ -683,14 +917,17 @@ class MessageProcessor:
         req_elapsed = time.monotonic() - req_start
         _dbg(msg.sender, "🌐 RESPONSE complete (%.1fs)", req_elapsed)
 
-        if not response_text:
+        if not response_text and not reaction:
             logger.debug("Empty response from agent")
-            return None
+            _dbg(msg.sender, "⚠️ Empty response text from agent")
+            return None, None
 
-        logger.info("Agent response (%d chars): %s", len(response_text), response_text[:120])
-        return response_text
+        logger.info("Agent response (%d chars, reaction=%s): %s",
+                     len(response_text or ""), reaction, (response_text or "")[:120])
+        return response_text, reaction
 
     def _log_debug_info(self, phone: str, debug_info: dict) -> None:
+        """Log orchestration debug info."""
         _dbg(phone, "-" * 50)
         _dbg(phone, "🧠 ORCHESTRATION DEBUG:")
         _dbg(phone, "  Source:  %s", debug_info.get("source"))
@@ -712,8 +949,4 @@ class MessageProcessor:
         _dbg(phone, "-" * 50)
 
     async def close(self) -> None:
-        for task in self._active_tasks:
-            task.cancel()
-        if self._active_tasks:
-            await asyncio.gather(*self._active_tasks, return_exceptions=True)
         await self._http.aclose()

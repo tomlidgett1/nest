@@ -16,7 +16,7 @@ from .imessage import send_imessage
 
 logger = logging.getLogger("imessage_bridge.sender.outbound_poller")
 
-POLL_INTERVAL_SECONDS = 1
+POLL_INTERVAL_SECONDS = 3
 
 
 class OutboundPoller:

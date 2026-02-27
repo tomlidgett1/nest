@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
+import shutil
 
 logger = logging.getLogger("imessage_bridge.sender.imessage")
+
+VALID_REACTIONS = {"love", "like", "dislike", "laugh", "emphasis", "question"}
+
+_IMSG_BIN: str | None = shutil.which("imsg")
+
+_chat_id_cache: dict[str, int | None] = {}
 
 MAX_MESSAGE_LENGTH = 2000
 MAX_RETRIES = 3
@@ -15,8 +23,8 @@ RETRY_DELAY = 2.0
 OSASCRIPT_TIMEOUT = 15.0  # seconds — kill if Messages.app hangs
 
 # Delay range (seconds) between conversational messages to feel human
-MIN_INTER_MSG_DELAY = 1.8
-MAX_INTER_MSG_DELAY = 2.5
+MIN_INTER_MSG_DELAY = 2.5
+MAX_INTER_MSG_DELAY = 3.5
 
 
 _BOLD_UPPER = {chr(c): chr(0x1D5D4 + (c - ord("A"))) for c in range(ord("A"), ord("Z") + 1)}
@@ -140,26 +148,37 @@ def _escape_applescript(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-async def send_imessage(phone: str, text: str) -> bool:
-    """Send *text* as one or more iMessages to *phone*.  Returns True on success."""
+async def send_imessage(phone: str, text: str, *, chat_guid: str | None = None) -> bool:
+    """Send *text* as one or more iMessages.
+
+    If *chat_guid* is provided (e.g. for group chats), sends to that chat
+    directly via ``chat id``. Otherwise sends to *phone* as a buddy (1:1 DM).
+    """
     clean = strip_markdown(text)
     if not clean:
         logger.warning("Empty message after markdown stripping, skipping")
         return False
 
     chunks = _split_conversational(clean)
+    target_label = f"chat {chat_guid}" if chat_guid else phone
     logger.info(
         "Sending %d message(s) to %s (total %d chars)",
-        len(chunks), phone, len(clean),
+        len(chunks), target_label, len(clean),
     )
 
     for i, chunk in enumerate(chunks):
         escaped = _escape_applescript(chunk)
-        script = (
-            f'tell application "Messages" to send "{escaped}" '
-            f'to buddy "{phone}" of '
-            f"(1st account whose service type = iMessage)"
-        )
+        if chat_guid:
+            script = (
+                f'tell application "Messages" to send "{escaped}" '
+                f'to chat id "{chat_guid}"'
+            )
+        else:
+            script = (
+                f'tell application "Messages" to send "{escaped}" '
+                f'to buddy "{phone}" of '
+                f"(1st account whose service type = iMessage)"
+            )
 
         success = False
         for attempt in range(1, MAX_RETRIES + 1):
@@ -206,8 +225,94 @@ async def send_imessage(phone: str, text: str) -> bool:
 
         # Natural-feeling delay between conversational messages
         if len(chunks) > 1 and i < len(chunks) - 1:
-            delay = random.uniform(MIN_INTER_MSG_DELAY, MAX_INTER_MSG_DELAY)
+            word_count = len(chunk.split())
+            if word_count > 18:
+                delay = max(4.0, random.uniform(4.0, 4.8))
+            else:
+                delay = random.uniform(MIN_INTER_MSG_DELAY, MAX_INTER_MSG_DELAY)
             await asyncio.sleep(delay)
 
-    logger.info("Sent %d iMessage(s) to %s", len(chunks), phone)
+    logger.info("Sent %d iMessage(s) to %s", len(chunks), target_label)
     return True
+
+
+async def _resolve_chat_id(phone: str) -> int | None:
+    """Look up the imsg chat row ID for a phone number. Cached per session."""
+    if phone in _chat_id_cache:
+        return _chat_id_cache[phone]
+
+    if not _IMSG_BIN:
+        logger.warning("imsg binary not found, cannot resolve chat ID")
+        _chat_id_cache[phone] = None
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _IMSG_BIN, "chats", "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        for line in stdout.decode().strip().splitlines():
+            try:
+                chat = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if chat.get("identifier") == phone:
+                chat_id = int(chat["id"])
+                _chat_id_cache[phone] = chat_id
+                logger.info("Resolved chat ID %d for %s", chat_id, phone)
+                return chat_id
+    except Exception:
+        logger.debug("Failed to resolve chat ID for %s", phone, exc_info=True)
+
+    _chat_id_cache[phone] = None
+    return None
+
+
+async def send_reaction(phone: str, reaction: str) -> bool:
+    """Send a tapback reaction to the most recent message in a chat.
+
+    Uses `imsg react` which sends a tapback via UI automation.
+    Valid reactions: love, like, dislike, laugh, emphasis, question.
+    """
+    if reaction not in VALID_REACTIONS:
+        logger.warning("Invalid reaction type '%s', skipping", reaction)
+        return False
+
+    if not _IMSG_BIN:
+        logger.warning("imsg not installed, cannot send reaction")
+        return False
+
+    chat_id = await _resolve_chat_id(phone)
+    if chat_id is None:
+        logger.warning("Could not resolve chat ID for %s, skipping reaction", phone)
+        return False
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _IMSG_BIN, "react",
+            "--chat-id", str(chat_id),
+            "--reaction", reaction,
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+
+        if proc.returncode == 0:
+            logger.info("Sent %s reaction to %s (chat %d)", reaction, phone, chat_id)
+            return True
+
+        logger.warning(
+            "imsg react failed (rc=%d): %s",
+            proc.returncode, stderr.decode().strip()[:200],
+        )
+        return False
+
+    except asyncio.TimeoutError:
+        logger.warning("imsg react timed out for %s", phone)
+        return False
+    except Exception:
+        logger.debug("Failed to send reaction to %s", phone, exc_info=True)
+        return False
