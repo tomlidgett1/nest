@@ -390,3 +390,30 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.imessage-onboard]
 verify_jwt = false
+
+[functions.manage-google-accounts]
+verify_jwt = false
+
+[functions.profile-builder]
+verify_jwt = false
+
+[functions.ai-proxy]
+verify_jwt = false
+
+[functions.deepgram-token]
+verify_jwt = false
+
+[functions.delete-account]
+verify_jwt = false
+
+[functions.google-token-broker]
+verify_jwt = false
+
+[functions.recall-connect]
+verify_jwt = false
+
+[functions.v2-chat]
+verify_jwt = false
+
+[functions.v2-chat-service]
+verify_jwt = false

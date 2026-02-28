@@ -270,8 +270,13 @@ export default function Welcome() {
       provider: 'google',
       options: {
         redirectTo: `${window.location.origin}/callback`,
-        scopes: SCOPES,
-        queryParams: { access_type: 'offline', prompt: 'consent' },
+        // New users from iMessage need full API scopes for Google Workspace access.
+        // Returning users (no token) only need basic login scopes — their
+        // Google API tokens are already stored from original onboarding.
+        scopes: token ? SCOPES : 'email profile',
+        queryParams: token
+          ? { access_type: 'offline', prompt: 'consent' }
+          : {},
       },
     })
   }, [token])
@@ -456,6 +461,12 @@ export default function Welcome() {
               >
                 Open in iMessage
               </a>
+              <button
+                onClick={handleLogin}
+                className="mt-3 text-[13px] text-gray-400 hover:text-gray-600 transition-colors"
+              >
+                Already have an account? Sign in
+              </button>
             </>
           )}
         </div>

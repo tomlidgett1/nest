@@ -5,6 +5,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 
 const SCOPES = [
   'email',
@@ -59,14 +60,23 @@ export default function Dashboard() {
 
   useEffect(() => {
     async function init() {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession()
+      console.log('[nest-dash] init started')
+      // refreshSession() forces a token refresh so we always have a valid JWT
+      // getSession() returns cached tokens which may be expired (1hr default)
+      let session = (await supabase.auth.refreshSession()).data.session
+      console.log('[nest-dash] refreshSession:', session ? 'ok' : 'null')
+      if (!session) {
+        session = (await supabase.auth.getSession()).data.session
+        console.log('[nest-dash] getSession fallback:', session ? 'ok' : 'null')
+      }
 
       if (!session) {
+        console.log('[nest-dash] No session, redirecting to /')
         navigate('/', { replace: true })
         return
       }
+
+      console.log('[nest-dash] User:', session.user?.email, 'ID:', session.user?.id)
 
       const user = session.user
       setAvatarUrl(user.user_metadata?.avatar_url ?? null)
@@ -103,15 +113,40 @@ export default function Dashboard() {
 
   async function fetchAccounts(token?: string) {
     const accessToken = token ?? (await supabase.auth.getSession()).data.session?.access_token
-    if (!accessToken) return
+    if (!accessToken) {
+      console.warn('[nest-dash] fetchAccounts: no access token')
+      return
+    }
     try {
+      console.log('[nest-dash] fetchAccounts: calling manage-google-accounts...')
       const res = await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts`, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+        headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken}` },
       })
+      console.log('[nest-dash] fetchAccounts status:', res.status)
+      if (res.status === 401) {
+        console.log('[nest-dash] fetchAccounts: 401, refreshing session...')
+        const { data: { session } } = await supabase.auth.refreshSession()
+        if (session) {
+          const retry = await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts`, {
+            headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
+          })
+          console.log('[nest-dash] fetchAccounts retry status:', retry.status)
+          const retryData = await retry.json()
+          console.log('[nest-dash] fetchAccounts retry data:', JSON.stringify(retryData).slice(0, 200))
+          if (retryData.accounts) setAccounts(retryData.accounts)
+        }
+        return
+      }
       const data = await res.json()
-      if (data.accounts) setAccounts(data.accounts)
-    } catch {
-      // Non-critical.
+      console.log('[nest-dash] fetchAccounts data:', JSON.stringify(data).slice(0, 200))
+      if (data.accounts) {
+        console.log('[nest-dash] Setting', data.accounts.length, 'accounts')
+        setAccounts(data.accounts)
+      } else {
+        console.warn('[nest-dash] No accounts key in response')
+      }
+    } catch (e) {
+      console.error('[nest-dash] fetchAccounts error:', e)
     }
   }
 
@@ -145,6 +180,7 @@ export default function Dashboard() {
       await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts`, {
         method: 'DELETE',
         headers: {
+          apikey: SUPABASE_ANON_KEY,
           Authorization: `Bearer ${session.access_token}`,
           'Content-Type': 'application/json',
         },

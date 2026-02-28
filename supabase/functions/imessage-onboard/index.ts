@@ -232,7 +232,7 @@ async function handlePost(req: Request) {
       }
     }
 
-    // Resolve refresh token: POST body → legacy google_oauth_tokens table
+    // Resolve refresh token: POST body → legacy table → existing user_google_accounts
     let refreshToken = provider_refresh_token;
     if (!refreshToken) {
       const { data: legacy } = await admin
@@ -243,6 +243,22 @@ async function handlePost(req: Request) {
       if (legacy?.refresh_token) {
         refreshToken = legacy.refresh_token;
         console.log(`[onboard] Using refresh token from legacy table for ${uid}`);
+      }
+    }
+
+    // Fallback: check user_google_accounts for existing refresh token (returning user)
+    if (!refreshToken) {
+      const { data: existingAccount } = await admin
+        .from("user_google_accounts")
+        .select("refresh_token")
+        .eq("user_id", uid)
+        .not("refresh_token", "is", null)
+        .neq("refresh_token", "")
+        .limit(1)
+        .maybeSingle();
+      if (existingAccount?.refresh_token) {
+        refreshToken = existingAccount.refresh_token;
+        console.log(`[onboard] Using existing refresh token from user_google_accounts for ${uid}`);
       }
     }
 
