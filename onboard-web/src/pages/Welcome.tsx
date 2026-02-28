@@ -386,8 +386,8 @@ export default function Welcome() {
           </AnimatePresence>
         </div>
 
-        {/* Bottom CTA */}
-        <div className="shrink-0 border-t border-gray-200/60 bg-[#FAFAFA] px-6 pb-10 pt-5 touch-none">
+        {/* Bottom CTA — pinned to bottom */}
+        <div className="shrink-0 border-t border-gray-200/60 bg-[#FAFAFA] px-6 pb-[max(env(safe-area-inset-bottom,0px),12px)] pt-4 touch-none">
           {token ? (
             <AnimatePresence mode="wait">
               {!contactAdded ? (
@@ -398,17 +398,17 @@ export default function Welcome() {
                   exit={{ opacity: 0, y: -10 }}
                   transition={{ duration: 0.3 }}
                 >
-                  <p className="text-[13px] font-medium text-gray-400 uppercase tracking-wide mb-3">Step 1</p>
-                  <h1 className="text-[24px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-1.5">
+                  <p className="text-[13px] font-medium text-gray-400 uppercase tracking-wide mb-2">Step 1</p>
+                  <h1 className="text-[24px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-1">
                     Save Nest to your contacts
                   </h1>
-                  <p className="text-[15px] text-gray-500 mb-5">Make sure you click "Create New Contact" so I'm easy to find in your messages</p>
+                  <p className="text-[15px] text-gray-500 mb-4">Make sure you click "Create New Contact" so I'm easy to find in your messages</p>
                   <a
                     href="/nest.vcf"
                     onClick={() => {
                       setTimeout(() => setContactAdded(true), 2000)
                     }}
-                    className="flex items-center justify-center w-full bg-[#007AFF] text-white rounded-full py-4 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
+                    className="flex items-center justify-center w-full bg-[#007AFF] text-white rounded-full py-3.5 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
                   >
                     Add to Contacts
                   </a>
@@ -420,14 +420,14 @@ export default function Welcome() {
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
                 >
-                  <p className="text-[13px] font-medium text-gray-400 uppercase tracking-wide mb-3">Step 2</p>
-                  <h1 className="text-[24px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-1.5">
+                  <p className="text-[13px] font-medium text-gray-400 uppercase tracking-wide mb-2">Step 2</p>
+                  <h1 className="text-[24px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-1">
                     Verify you're human
                   </h1>
-                  <p className="text-[15px] text-gray-500 mb-5">Quick Google sign-in so Nest can access your calendar, emails, and contacts.</p>
+                  <p className="text-[15px] text-gray-500 mb-4">Quick Google sign-in so Nest can access your calendar, emails, and contacts.</p>
                   <button
                     onClick={handleLogin}
-                    className="flex items-center justify-center gap-2.5 w-full bg-[#007AFF] text-white rounded-full py-4 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
+                    className="flex items-center justify-center gap-2.5 w-full bg-[#007AFF] text-white rounded-full py-3.5 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
                   >
                     Verify
                   </button>
@@ -436,7 +436,7 @@ export default function Welcome() {
             </AnimatePresence>
           ) : (
             <>
-              <h1 className="text-[30px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-5">
+              <h1 className="text-[28px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-4">
                 <span className="flex items-baseline gap-x-[0.3em] flex-wrap">
                   <span>Your</span>
                   <RotatingText
@@ -457,13 +457,13 @@ export default function Welcome() {
 
               <a
                 href="imessage:tlidgett@icloud.com&body=Hey%20Nest!%20What%20can%20you%20help%20me%20with%3F"
-                className="flex items-center justify-center w-full bg-[#007AFF] text-white rounded-full py-4 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
+                className="flex items-center justify-center w-full bg-[#007AFF] text-white rounded-full py-3.5 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
               >
                 Open in iMessage
               </a>
               <button
                 onClick={handleLogin}
-                className="mt-3 text-[13px] text-gray-400 hover:text-gray-600 transition-colors"
+                className="mt-2 w-full text-[13px] text-gray-400 hover:text-gray-600 transition-colors"
               >
                 Already have an account? Sign in
               </button>
