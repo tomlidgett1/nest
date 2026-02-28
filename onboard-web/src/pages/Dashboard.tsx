@@ -26,33 +26,99 @@ interface GoogleAccount {
   is_primary: boolean
 }
 
-/* ── Showcase messages for step 3 auto-scrolling feed ── */
-interface ShowcaseMsg {
+/* ── Category conversations for step 3 pill showcase ── */
+interface CatMessage {
   type: 'user' | 'nest'
   text: string
 }
 
-const SHOWCASE_MESSAGES: ShowcaseMsg[] = [
-  { type: 'user', text: 'When should I leave for the airport?' },
-  { type: 'nest', text: "Your flight's at 10pm. Leave by 6:30 — 45 min drive with Friday traffic." },
-  { type: 'user', text: 'Brief me on my 2pm with Tom Chen' },
-  { type: 'nest', text: "VP Product at Notion. You last emailed 3 weeks ago about an API integration." },
-  { type: 'user', text: 'Any important emails today?' },
-  { type: 'nest', text: '3 need attention: a contract from Sarah, a reschedule from James, and an invoice.' },
-  { type: 'user', text: "What's the meaning behind Kafka's Metamorphosis?" },
-  { type: 'nest', text: "It's widely read as an allegory for alienation — the crushing weight of modern work and family obligation." },
-  { type: 'user', text: 'Summarise my meeting notes from today' },
-  { type: 'nest', text: "Covered Q2 roadmap, agreed on May 15 launch. Tom's handling the press release." },
-  { type: 'user', text: 'Do I need an umbrella today?' },
-  { type: 'nest', text: "Nope — sunny and 24\u00b0 all day. Rain's not until Thursday." },
-  { type: 'user', text: "What's a good restaurant near the office?" },
-  { type: 'nest', text: "Luca's — 4 min walk, 4.7\u2605, great pasta. Want me to book a table?" },
-  { type: 'user', text: 'Remind me to call mum at 5' },
-  { type: 'nest', text: "Done — I'll ping you at 5pm sharp." },
-  { type: 'user', text: 'Send Sarah a birthday message' },
-  { type: 'nest', text: "Sent! \"Happy birthday Sarah! Hope you have an amazing day. Let's catch up soon!\"" },
-  { type: 'user', text: "Draft a reply to Tom's proposal" },
-  { type: 'nest', text: 'Sent: "Hi Tom, thanks for the update. I\'ll review and circle back by EOD."' },
+interface Category {
+  label: string
+  emoji: string
+  messages: CatMessage[]
+}
+
+const CATEGORIES: Category[] = [
+  {
+    label: 'Travel',
+    emoji: '\u2708\uFE0F',
+    messages: [
+      { type: 'user', text: 'When should I leave for the airport?' },
+      { type: 'nest', text: "Your flight's at 10pm. 45 min drive with traffic — leave by 6:30 to be safe." },
+      { type: 'user', text: 'Book me an Uber for 6:15' },
+      { type: 'nest', text: "Done — UberX booked for 6:15pm to Sydney Airport. Driver arrives in 8 min." },
+    ],
+  },
+  {
+    label: 'Meetings',
+    emoji: '\uD83D\uDC65',
+    messages: [
+      { type: 'user', text: "Who's Tom Chen? I have a call with him at 2" },
+      { type: 'nest', text: "VP Product at Notion. You last spoke 3 weeks ago about an API integration. He's based in SF." },
+      { type: 'user', text: 'What should I prep?' },
+      { type: 'nest', text: "Review the API proposal he sent March 12. He also mentioned pricing concerns — might come up." },
+    ],
+  },
+  {
+    label: 'Email',
+    emoji: '\uD83D\uDCE7',
+    messages: [
+      { type: 'user', text: 'Any important emails today?' },
+      { type: 'nest', text: '3 need attention: a contract from Sarah, a reschedule from James, and your flight confirmation.' },
+      { type: 'user', text: 'Reply to Sarah saying I\'ll review tonight' },
+      { type: 'nest', text: "Sent: \"Hi Sarah, I'll review the contract this evening and get back to you. Thanks!\"" },
+    ],
+  },
+  {
+    label: 'Knowledge',
+    emoji: '\uD83E\uDDE0',
+    messages: [
+      { type: 'user', text: "What's the meaning behind Kafka's Metamorphosis?" },
+      { type: 'nest', text: "It's widely read as an allegory for alienation — the crushing weight of modern work and family obligation." },
+      { type: 'user', text: 'How does that connect to existentialism?' },
+      { type: 'nest', text: "Kafka predates Sartre, but both explore the absurdity of existence. Gregor's transformation is meaningless — that's the point." },
+    ],
+  },
+  {
+    label: 'Notes',
+    emoji: '\uD83D\uDCDD',
+    messages: [
+      { type: 'user', text: 'Summarise my meeting notes from today' },
+      { type: 'nest', text: "Covered Q2 roadmap, agreed on May 15 launch. Tom's handling the press release, you own the demo." },
+      { type: 'user', text: 'Send the summary to the team' },
+      { type: 'nest', text: "Sent to #product-team on Slack with action items and owners." },
+    ],
+  },
+  {
+    label: 'Weather',
+    emoji: '\u2600\uFE0F',
+    messages: [
+      { type: 'user', text: 'Do I need an umbrella today?' },
+      { type: 'nest', text: "Nope — sunny and 24\u00b0 all day. Rain's not until Thursday." },
+      { type: 'user', text: "What about this weekend?" },
+      { type: 'nest', text: "Saturday looks perfect — 22\u00b0 and clear. Sunday has light showers in the afternoon." },
+    ],
+  },
+  {
+    label: 'Reminders',
+    emoji: '\u23F0',
+    messages: [
+      { type: 'user', text: 'Remind me to call mum at 5' },
+      { type: 'nest', text: "Done — I'll ping you at 5pm sharp." },
+      { type: 'user', text: 'Also remind me to buy flowers on the way home' },
+      { type: 'nest', text: "Set. I'll remind you when you leave the office. There's a florist 2 min from your route." },
+    ],
+  },
+  {
+    label: 'Actions',
+    emoji: '\u26A1',
+    messages: [
+      { type: 'user', text: 'Send Sarah a birthday message' },
+      { type: 'nest', text: "Sent! \"Happy birthday Sarah! Hope you have an amazing day. Let's catch up soon!\"" },
+      { type: 'user', text: "What's a good restaurant near the office for dinner?" },
+      { type: 'nest', text: "Luca's Trattoria — 4 min walk, 4.7\u2605, great pasta. Want me to book a table?" },
+    ],
+  },
 ]
 
 export default function Dashboard() {
@@ -65,8 +131,9 @@ export default function Dashboard() {
   const [step, setStep] = useState(1)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const scrollTrackRef = useRef<HTMLDivElement>(null)
-  const [scrollHeight, setScrollHeight] = useState(0)
+  const [activeCat, setActiveCat] = useState(0)
+  const [visibleCount, setVisibleCount] = useState(0)
+  const [isTyping, setIsTyping] = useState(false)
 
   useEffect(() => {
     async function init() {
@@ -97,12 +164,38 @@ export default function Dashboard() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  /* ── Measure scroll track height for seamless loop ── */
+  /* ── Stagger messages in when category changes ── */
   useEffect(() => {
-    if (step !== 3 || !scrollTrackRef.current) return
-    const h = scrollTrackRef.current.scrollHeight / 2
-    setScrollHeight(h)
-  }, [step])
+    if (step !== 3) return
+    const msgs = CATEGORIES[activeCat].messages
+    let cancelled = false
+    const timeouts: ReturnType<typeof setTimeout>[] = []
+
+    setVisibleCount(0)
+    setIsTyping(false)
+
+    // Stagger: for each message, show typing (if nest), then reveal
+    let delay = 300
+    for (let i = 0; i < msgs.length; i++) {
+      const msg = msgs[i]
+      if (msg.type === 'nest') {
+        // Show typing indicator before nest messages
+        timeouts.push(setTimeout(() => { if (!cancelled) setIsTyping(true) }, delay))
+        delay += 1000
+        timeouts.push(setTimeout(() => {
+          if (!cancelled) { setIsTyping(false); setVisibleCount(i + 1) }
+        }, delay))
+        delay += 400
+      } else {
+        timeouts.push(setTimeout(() => {
+          if (!cancelled) setVisibleCount(i + 1)
+        }, delay))
+        delay += 600
+      }
+    }
+
+    return () => { cancelled = true; timeouts.forEach(clearTimeout) }
+  }, [step, activeCat])
 
   async function fetchAccounts(token?: string) {
     const accessToken = token ?? (await supabase.auth.getSession()).data.session?.access_token
@@ -414,7 +507,7 @@ export default function Dashboard() {
             </motion.section>
           )}
 
-          {/* ── STEP 3: AUTO-SCROLLING SHOWCASE ── */}
+          {/* ── STEP 3: PILL CAROUSEL + CONVERSATION ── */}
           {step === 3 && (
             <motion.section
               key="chat"
@@ -422,12 +515,12 @@ export default function Dashboard() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -20 }}
               transition={{ duration: 0.35, ease: [0.25, 0.1, 0.25, 1] }}
-              className="flex-1 flex flex-col items-center w-full max-w-sm"
+              className="flex-1 flex flex-col w-full max-w-sm"
             >
               {/* Heading */}
-              <div className="shrink-0 pt-4 pb-3 text-center">
+              <div className="shrink-0 pt-3 pb-2 text-center">
                 <motion.h1
-                  className="text-[28px] font-bold tracking-tight text-gray-900"
+                  className="text-[26px] font-bold tracking-tight text-gray-900"
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ duration: 0.5, delay: 0.1 }}
@@ -435,61 +528,105 @@ export default function Dashboard() {
                   You're all set
                 </motion.h1>
                 <motion.p
-                  className="text-[15px] text-gray-400 mt-1"
+                  className="text-[14px] text-gray-400 mt-0.5"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   transition={{ duration: 0.5, delay: 0.2 }}
                 >
-                  Here's what Nest can do for you.
+                  Tap to explore what Nest can do.
                 </motion.p>
               </div>
 
-              {/* Scrolling chat feed with fade edges */}
-              <div
-                className="flex-1 w-full min-h-0 overflow-hidden relative"
-                style={{
-                  WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
-                  maskImage: 'linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
-                }}
+              {/* Pill carousel */}
+              <motion.div
+                className="shrink-0 -mx-6 px-5 pb-3 pt-1"
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.4, delay: 0.25 }}
               >
-                <div
-                  ref={scrollTrackRef}
-                  className="flex flex-col gap-2.5 will-change-transform"
-                  style={{
-                    animation: scrollHeight > 0 ? `showcaseScroll ${scrollHeight / 18}s linear infinite` : 'none',
-                  }}
-                >
-                  {/* Render messages twice for seamless loop */}
-                  {[...SHOWCASE_MESSAGES, ...SHOWCASE_MESSAGES].map((msg, i) => (
-                    <div
-                      key={i}
-                      className={`flex w-full ${msg.type === 'user' ? 'justify-end' : 'items-end gap-2'}`}
+                <div className="flex gap-2 overflow-x-auto no-scrollbar">
+                  {CATEGORIES.map((cat, i) => (
+                    <button
+                      key={cat.label}
+                      onClick={() => setActiveCat(i)}
+                      className={`shrink-0 flex items-center gap-1.5 rounded-full px-3.5 py-2 text-[13px] font-medium transition-all duration-200 ${
+                        activeCat === i
+                          ? 'bg-gray-900 text-white shadow-sm'
+                          : 'bg-white text-gray-600 border border-gray-200/80 hover:bg-gray-50'
+                      }`}
                     >
-                      {msg.type === 'nest' && (
-                        <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
-                      )}
-                      <div
-                        className={`max-w-[82%] rounded-[20px] px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ${
-                          msg.type === 'user'
-                            ? 'bg-[#007AFF] text-white rounded-br-[4px]'
-                            : 'bg-[#E9E9EB] text-[#000000] rounded-bl-[4px]'
-                        }`}
-                      >
-                        {msg.text}
-                      </div>
-                    </div>
+                      <span className="text-[14px]">{cat.emoji}</span>
+                      {cat.label}
+                    </button>
                   ))}
                 </div>
-                <style>{`
-                  @keyframes showcaseScroll {
-                    0% { transform: translateY(0); }
-                    100% { transform: translateY(-50%); }
-                  }
-                `}</style>
+                <style>{`.no-scrollbar::-webkit-scrollbar { display: none; } .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }`}</style>
+              </motion.div>
+
+              {/* Conversation area */}
+              <div className="flex-1 min-h-0 w-full overflow-y-auto px-1">
+                <AnimatePresence mode="wait">
+                  <motion.div
+                    key={activeCat}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.25, ease: 'easeOut' }}
+                    className="flex flex-col gap-2.5 py-2"
+                  >
+                    {CATEGORIES[activeCat].messages.slice(0, visibleCount).map((msg, i) => (
+                      <motion.div
+                        key={`${activeCat}-${i}`}
+                        initial={{ opacity: 0, y: 12, scale: 0.96 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
+                        className={`flex w-full ${msg.type === 'user' ? 'justify-end' : 'items-end gap-2'}`}
+                      >
+                        {msg.type === 'nest' && (
+                          <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
+                        )}
+                        <div
+                          className={`max-w-[82%] rounded-[20px] px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ${
+                            msg.type === 'user'
+                              ? 'bg-[#007AFF] text-white rounded-br-[4px]'
+                              : 'bg-[#E9E9EB] text-[#000000] rounded-bl-[4px]'
+                          }`}
+                        >
+                          {msg.text}
+                        </div>
+                      </motion.div>
+                    ))}
+
+                    {/* Typing indicator */}
+                    {isTyping && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
+                        className="flex items-end gap-2"
+                      >
+                        <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
+                        <div className="rounded-[20px] rounded-bl-[4px] bg-[#E9E9EB] px-5 py-3.5 shadow-sm">
+                          <div className="flex gap-1.5 items-center">
+                            {[0, 1, 2].map((d) => (
+                              <motion.div
+                                key={d}
+                                className="w-[7px] h-[7px] rounded-full bg-[#8E8E93]"
+                                animate={{ y: [0, -4, 0] }}
+                                transition={{ duration: 0.6, repeat: Infinity, delay: d * 0.15, ease: 'easeInOut' }}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </motion.div>
+                </AnimatePresence>
               </div>
 
               {/* Pinned CTA */}
-              <div className="shrink-0 w-full pb-10 pt-2">
+              <div className="shrink-0 w-full pb-10 pt-3">
                 <a
                   href="sms:tlidgett@icloud.com&body=Hey%20Nest!"
                   className="block w-full rounded-full bg-[#007AFF] py-3.5 text-center text-[15px] font-semibold text-white shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:bg-[#0071E3] transition-colors"
