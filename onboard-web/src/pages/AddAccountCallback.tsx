@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'motion/react'
 import { supabase } from '../lib/supabase'
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 
 const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
 
@@ -73,29 +74,43 @@ export default function AddAccountCallback() {
           return
         }
 
-        let newSession = null
+        let providerToken = ''
+        let providerRefreshToken = ''
 
-        if (code) {
+        // Implicit flow: tokens arrive in URL hash
+        if (window.location.hash) {
+          const hashParams = Object.fromEntries(new URLSearchParams(window.location.hash.slice(1)))
+          const at = hashParams.access_token
+          const rt = hashParams.refresh_token
+          providerToken = hashParams.provider_token ?? ''
+          providerRefreshToken = hashParams.provider_refresh_token ?? ''
+
+          if (at && rt) {
+            // Temporarily set session to extract tokens
+            await supabase.auth.setSession({ access_token: at, refresh_token: rt })
+          }
+        }
+
+        // PKCE fallback: code in query params
+        if (!providerToken && code) {
           const { data, error } = await supabase.auth.exchangeCodeForSession(code)
           if (error) {
-            if (error.message.includes('PKCE code verifier not found')) {
-              setStatus('error')
-              setErrorMessage('Account linking session expired. Please start again from the dashboard in the same browser tab.')
-              return
-            }
             setStatus('error')
             setErrorMessage(error.message)
             return
           }
-          newSession = data.session
+          providerToken = data.session?.provider_token ?? ''
+          providerRefreshToken = data.session?.provider_refresh_token ?? ''
         }
 
-        if (!newSession) {
+        // Last resort: check current session
+        if (!providerToken) {
           const { data } = await supabase.auth.getSession()
-          newSession = data.session
+          providerToken = data.session?.provider_token ?? ''
+          providerRefreshToken = data.session?.provider_refresh_token ?? ''
         }
 
-        if (!newSession?.provider_token) {
+        if (!providerToken) {
           setStatus('error')
           setErrorMessage('Could not get Google account tokens. Please try again.')
           return
@@ -107,11 +122,12 @@ export default function AddAccountCallback() {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            apikey: SUPABASE_ANON_KEY,
           },
           body: JSON.stringify({
             original_user_id: originalUserId,
-            provider_token: newSession.provider_token,
-            provider_refresh_token: newSession.provider_refresh_token ?? '',
+            provider_token: providerToken,
+            provider_refresh_token: providerRefreshToken,
           }),
         })
 
