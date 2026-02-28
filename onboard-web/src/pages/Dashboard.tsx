@@ -26,6 +26,48 @@ interface GoogleAccount {
   is_primary: boolean
 }
 
+/* ── Showcase conversations for step 3 ── */
+interface ShowcaseConversation {
+  category: string
+  userMessage: string
+  nestMessage: string
+}
+
+const SHOWCASE: ShowcaseConversation[] = [
+  {
+    category: 'Travel',
+    userMessage: 'When should I leave for the airport?',
+    nestMessage: "Your flight's at 10pm. Leave by 6:30 — 45 min drive with Friday traffic.",
+  },
+  {
+    category: 'Meetings',
+    userMessage: 'Brief me on my 2pm with Tom Chen',
+    nestMessage: "VP Product at Notion. You last emailed 3 weeks ago about an API integration.",
+  },
+  {
+    category: 'Email',
+    userMessage: 'Any important emails today?',
+    nestMessage: '3 need attention: a contract from Sarah, a reschedule from James, and an invoice.',
+  },
+  {
+    category: 'Weather',
+    userMessage: 'Do I need an umbrella today?',
+    nestMessage: "Nope — sunny and 24\u00b0 all day. Rain's not until Thursday.",
+  },
+  {
+    category: 'Reminders',
+    userMessage: 'Remind me to call mum at 5',
+    nestMessage: "Done — I'll ping you at 5pm sharp.",
+  },
+  {
+    category: 'Actions',
+    userMessage: "Draft a reply to Tom's email",
+    nestMessage: 'Sent: "Hi Tom, thanks for the update. I\'ll review and circle back by EOD."',
+  },
+]
+
+type ShowcasePhase = 'user-in' | 'typing' | 'nest-in' | 'hold' | 'fade-out'
+
 export default function Dashboard() {
   const navigate = useNavigate()
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null)
@@ -36,6 +78,8 @@ export default function Dashboard() {
   const [step, setStep] = useState(1)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
+  const [showcaseIndex, setShowcaseIndex] = useState(0)
+  const [showcasePhase, setShowcasePhase] = useState<ShowcasePhase>('user-in')
 
   useEffect(() => {
     async function init() {
@@ -65,6 +109,42 @@ export default function Dashboard() {
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
+
+  /* ── Showcase animation cycle for step 3 ── */
+  useEffect(() => {
+    if (step !== 3) return
+    let cancelled = false
+    const timeouts: ReturnType<typeof setTimeout>[] = []
+
+    function runCycle(index: number) {
+      if (cancelled) return
+
+      setShowcaseIndex(index)
+      setShowcasePhase('user-in')
+
+      timeouts.push(setTimeout(() => {
+        if (!cancelled) setShowcasePhase('typing')
+      }, 1200))
+
+      timeouts.push(setTimeout(() => {
+        if (!cancelled) setShowcasePhase('nest-in')
+      }, 2800))
+
+      timeouts.push(setTimeout(() => {
+        if (!cancelled) setShowcasePhase('fade-out')
+      }, 5600))
+
+      timeouts.push(setTimeout(() => {
+        if (!cancelled) runCycle((index + 1) % SHOWCASE.length)
+      }, 6100))
+    }
+
+    runCycle(0)
+    return () => {
+      cancelled = true
+      timeouts.forEach(clearTimeout)
+    }
+  }, [step])
 
   async function fetchAccounts(token?: string) {
     const accessToken = token ?? (await supabase.auth.getSession()).data.session?.access_token
@@ -376,7 +456,7 @@ export default function Dashboard() {
             </motion.section>
           )}
 
-          {/* ── STEP 3: START CHAT ── */}
+          {/* ── STEP 3: ANIMATED SHOWCASE ── */}
           {step === 3 && (
             <motion.section
               key="chat"
@@ -386,22 +466,103 @@ export default function Dashboard() {
               transition={{ duration: 0.35, ease: [0.25, 0.1, 0.25, 1] }}
               className="flex-1 flex flex-col items-center w-full max-w-sm"
             >
-              {/* Centered content */}
-              <div className="flex-1 flex flex-col items-center justify-center">
-                <motion.img
-                  src="/imessage-icon.png"
-                  alt=""
-                  className="h-16 w-16 rounded-2xl mb-6"
-                  initial={{ opacity: 0, scale: 0.8 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: 0.4, delay: 0.1 }}
-                />
-                <h1 className="text-[32px] sm:text-4xl font-bold tracking-tight text-gray-900 text-center">
+              {/* Heading + rotating category */}
+              <div className="shrink-0 pt-4 pb-2 text-center">
+                <motion.h1
+                  className="text-[28px] font-bold tracking-tight text-gray-900"
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.5, delay: 0.1 }}
+                >
                   You're all set
-                </h1>
-                <p className="text-[15px] text-gray-400 mt-2 text-center">
-                  Open iMessage and say hey.
-                </p>
+                </motion.h1>
+                <div className="h-6 mt-1.5 flex items-center justify-center overflow-hidden">
+                  <AnimatePresence mode="wait">
+                    <motion.p
+                      key={SHOWCASE[showcaseIndex].category}
+                      className="text-[13px] font-medium tracking-widest uppercase text-[#007AFF]"
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: -8 }}
+                      transition={{ duration: 0.25, ease: 'easeOut' }}
+                    >
+                      {SHOWCASE[showcaseIndex].category}
+                    </motion.p>
+                  </AnimatePresence>
+                </div>
+              </div>
+
+              {/* Chat showcase area */}
+              <div className="flex-1 flex flex-col justify-center w-full gap-3 min-h-0">
+                <AnimatePresence mode="wait">
+                  {showcasePhase !== 'fade-out' && (
+                    <motion.div
+                      key={`convo-${showcaseIndex}`}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0, y: -8, transition: { duration: 0.3 } }}
+                      transition={{ duration: 0.2 }}
+                      className="flex flex-col gap-3"
+                    >
+                      {/* User bubble */}
+                      <motion.div
+                        className="flex w-full justify-end"
+                        initial={{ opacity: 0, y: 12, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                      >
+                        <div className="max-w-[85%] rounded-[20px] rounded-br-[4px] bg-[#007AFF] px-4 py-2.5 text-[15px] leading-relaxed text-white shadow-sm">
+                          {SHOWCASE[showcaseIndex].userMessage}
+                        </div>
+                      </motion.div>
+
+                      {/* Typing indicator */}
+                      <AnimatePresence>
+                        {showcasePhase === 'typing' && (
+                          <motion.div
+                            key="typing"
+                            className="flex items-end gap-2"
+                            initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                            animate={{ opacity: 1, y: 0, scale: 1 }}
+                            exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.15 } }}
+                            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                          >
+                            <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm" />
+                            <div className="rounded-[20px] rounded-bl-[4px] bg-[#E9E9EB] px-5 py-3.5 shadow-sm">
+                              <div className="flex gap-1.5 items-center">
+                                {[0, 1, 2].map((i) => (
+                                  <motion.div
+                                    key={i}
+                                    className="w-[7px] h-[7px] rounded-full bg-[#8E8E93]"
+                                    animate={{ y: [0, -4, 0] }}
+                                    transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.15, ease: 'easeInOut' }}
+                                  />
+                                ))}
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+
+                      {/* Nest reply */}
+                      <AnimatePresence>
+                        {(showcasePhase === 'nest-in' || showcasePhase === 'hold') && (
+                          <motion.div
+                            className="flex items-end gap-2"
+                            initial={{ opacity: 0, y: 12, scale: 0.95 }}
+                            animate={{ opacity: 1, y: 0, scale: 1 }}
+                            transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                          >
+                            <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
+                            <div className="max-w-[85%] rounded-[20px] rounded-bl-[4px] bg-[#E9E9EB] px-4 py-2.5 text-[15px] leading-relaxed text-[#000000] shadow-sm">
+                              {SHOWCASE[showcaseIndex].nestMessage}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
 
               {/* Pinned CTA */}
