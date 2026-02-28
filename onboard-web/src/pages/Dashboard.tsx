@@ -26,47 +26,34 @@ interface GoogleAccount {
   is_primary: boolean
 }
 
-/* ── Showcase conversations for step 3 ── */
-interface ShowcaseConversation {
-  category: string
-  userMessage: string
-  nestMessage: string
+/* ── Showcase messages for step 3 auto-scrolling feed ── */
+interface ShowcaseMsg {
+  type: 'user' | 'nest'
+  text: string
 }
 
-const SHOWCASE: ShowcaseConversation[] = [
-  {
-    category: 'Travel',
-    userMessage: 'When should I leave for the airport?',
-    nestMessage: "Your flight's at 10pm. Leave by 6:30 — 45 min drive with Friday traffic.",
-  },
-  {
-    category: 'Meetings',
-    userMessage: 'Brief me on my 2pm with Tom Chen',
-    nestMessage: "VP Product at Notion. You last emailed 3 weeks ago about an API integration.",
-  },
-  {
-    category: 'Email',
-    userMessage: 'Any important emails today?',
-    nestMessage: '3 need attention: a contract from Sarah, a reschedule from James, and an invoice.',
-  },
-  {
-    category: 'Weather',
-    userMessage: 'Do I need an umbrella today?',
-    nestMessage: "Nope — sunny and 24\u00b0 all day. Rain's not until Thursday.",
-  },
-  {
-    category: 'Reminders',
-    userMessage: 'Remind me to call mum at 5',
-    nestMessage: "Done — I'll ping you at 5pm sharp.",
-  },
-  {
-    category: 'Actions',
-    userMessage: "Draft a reply to Tom's email",
-    nestMessage: 'Sent: "Hi Tom, thanks for the update. I\'ll review and circle back by EOD."',
-  },
+const SHOWCASE_MESSAGES: ShowcaseMsg[] = [
+  { type: 'user', text: 'When should I leave for the airport?' },
+  { type: 'nest', text: "Your flight's at 10pm. Leave by 6:30 — 45 min drive with Friday traffic." },
+  { type: 'user', text: 'Brief me on my 2pm with Tom Chen' },
+  { type: 'nest', text: "VP Product at Notion. You last emailed 3 weeks ago about an API integration." },
+  { type: 'user', text: 'Any important emails today?' },
+  { type: 'nest', text: '3 need attention: a contract from Sarah, a reschedule from James, and an invoice.' },
+  { type: 'user', text: "What's the meaning behind Kafka's Metamorphosis?" },
+  { type: 'nest', text: "It's widely read as an allegory for alienation — the crushing weight of modern work and family obligation." },
+  { type: 'user', text: 'Summarise my meeting notes from today' },
+  { type: 'nest', text: "Covered Q2 roadmap, agreed on May 15 launch. Tom's handling the press release." },
+  { type: 'user', text: 'Do I need an umbrella today?' },
+  { type: 'nest', text: "Nope — sunny and 24\u00b0 all day. Rain's not until Thursday." },
+  { type: 'user', text: "What's a good restaurant near the office?" },
+  { type: 'nest', text: "Luca's — 4 min walk, 4.7\u2605, great pasta. Want me to book a table?" },
+  { type: 'user', text: 'Remind me to call mum at 5' },
+  { type: 'nest', text: "Done — I'll ping you at 5pm sharp." },
+  { type: 'user', text: 'Send Sarah a birthday message' },
+  { type: 'nest', text: "Sent! \"Happy birthday Sarah! Hope you have an amazing day. Let's catch up soon!\"" },
+  { type: 'user', text: "Draft a reply to Tom's proposal" },
+  { type: 'nest', text: 'Sent: "Hi Tom, thanks for the update. I\'ll review and circle back by EOD."' },
 ]
-
-type ShowcasePhase = 'user-in' | 'typing' | 'nest-in' | 'hold' | 'fade-out'
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -78,8 +65,8 @@ export default function Dashboard() {
   const [step, setStep] = useState(1)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const [showcaseIndex, setShowcaseIndex] = useState(0)
-  const [showcasePhase, setShowcasePhase] = useState<ShowcasePhase>('user-in')
+  const scrollTrackRef = useRef<HTMLDivElement>(null)
+  const [scrollHeight, setScrollHeight] = useState(0)
 
   useEffect(() => {
     async function init() {
@@ -110,40 +97,11 @@ export default function Dashboard() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  /* ── Showcase animation cycle for step 3 ── */
+  /* ── Measure scroll track height for seamless loop ── */
   useEffect(() => {
-    if (step !== 3) return
-    let cancelled = false
-    const timeouts: ReturnType<typeof setTimeout>[] = []
-
-    function runCycle(index: number) {
-      if (cancelled) return
-
-      setShowcaseIndex(index)
-      setShowcasePhase('user-in')
-
-      timeouts.push(setTimeout(() => {
-        if (!cancelled) setShowcasePhase('typing')
-      }, 1200))
-
-      timeouts.push(setTimeout(() => {
-        if (!cancelled) setShowcasePhase('nest-in')
-      }, 2800))
-
-      timeouts.push(setTimeout(() => {
-        if (!cancelled) setShowcasePhase('fade-out')
-      }, 5600))
-
-      timeouts.push(setTimeout(() => {
-        if (!cancelled) runCycle((index + 1) % SHOWCASE.length)
-      }, 6100))
-    }
-
-    runCycle(0)
-    return () => {
-      cancelled = true
-      timeouts.forEach(clearTimeout)
-    }
+    if (step !== 3 || !scrollTrackRef.current) return
+    const h = scrollTrackRef.current.scrollHeight / 2
+    setScrollHeight(h)
   }, [step])
 
   async function fetchAccounts(token?: string) {
@@ -456,7 +414,7 @@ export default function Dashboard() {
             </motion.section>
           )}
 
-          {/* ── STEP 3: ANIMATED SHOWCASE ── */}
+          {/* ── STEP 3: AUTO-SCROLLING SHOWCASE ── */}
           {step === 3 && (
             <motion.section
               key="chat"
@@ -466,8 +424,8 @@ export default function Dashboard() {
               transition={{ duration: 0.35, ease: [0.25, 0.1, 0.25, 1] }}
               className="flex-1 flex flex-col items-center w-full max-w-sm"
             >
-              {/* Heading + rotating category */}
-              <div className="shrink-0 pt-4 pb-2 text-center">
+              {/* Heading */}
+              <div className="shrink-0 pt-4 pb-3 text-center">
                 <motion.h1
                   className="text-[28px] font-bold tracking-tight text-gray-900"
                   initial={{ opacity: 0, y: 10 }}
@@ -476,97 +434,62 @@ export default function Dashboard() {
                 >
                   You're all set
                 </motion.h1>
-                <div className="h-6 mt-1.5 flex items-center justify-center overflow-hidden">
-                  <AnimatePresence mode="wait">
-                    <motion.p
-                      key={SHOWCASE[showcaseIndex].category}
-                      className="text-[13px] font-medium tracking-widest uppercase text-[#007AFF]"
-                      initial={{ opacity: 0, y: 8 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, y: -8 }}
-                      transition={{ duration: 0.25, ease: 'easeOut' }}
-                    >
-                      {SHOWCASE[showcaseIndex].category}
-                    </motion.p>
-                  </AnimatePresence>
-                </div>
+                <motion.p
+                  className="text-[15px] text-gray-400 mt-1"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.5, delay: 0.2 }}
+                >
+                  Here's what Nest can do for you.
+                </motion.p>
               </div>
 
-              {/* Chat showcase area */}
-              <div className="flex-1 flex flex-col justify-center w-full gap-3 min-h-0">
-                <AnimatePresence mode="wait">
-                  {showcasePhase !== 'fade-out' && (
-                    <motion.div
-                      key={`convo-${showcaseIndex}`}
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      exit={{ opacity: 0, y: -8, transition: { duration: 0.3 } }}
-                      transition={{ duration: 0.2 }}
-                      className="flex flex-col gap-3"
+              {/* Scrolling chat feed with fade edges */}
+              <div
+                className="flex-1 w-full min-h-0 overflow-hidden relative"
+                style={{
+                  WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
+                  maskImage: 'linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
+                }}
+              >
+                <div
+                  ref={scrollTrackRef}
+                  className="flex flex-col gap-2.5 will-change-transform"
+                  style={{
+                    animation: scrollHeight > 0 ? `showcaseScroll ${scrollHeight / 18}s linear infinite` : 'none',
+                  }}
+                >
+                  {/* Render messages twice for seamless loop */}
+                  {[...SHOWCASE_MESSAGES, ...SHOWCASE_MESSAGES].map((msg, i) => (
+                    <div
+                      key={i}
+                      className={`flex w-full ${msg.type === 'user' ? 'justify-end' : 'items-end gap-2'}`}
                     >
-                      {/* User bubble */}
-                      <motion.div
-                        className="flex w-full justify-end"
-                        initial={{ opacity: 0, y: 12, scale: 0.95 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
+                      {msg.type === 'nest' && (
+                        <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
+                      )}
+                      <div
+                        className={`max-w-[82%] rounded-[20px] px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ${
+                          msg.type === 'user'
+                            ? 'bg-[#007AFF] text-white rounded-br-[4px]'
+                            : 'bg-[#E9E9EB] text-[#000000] rounded-bl-[4px]'
+                        }`}
                       >
-                        <div className="max-w-[85%] rounded-[20px] rounded-br-[4px] bg-[#007AFF] px-4 py-2.5 text-[15px] leading-relaxed text-white shadow-sm">
-                          {SHOWCASE[showcaseIndex].userMessage}
-                        </div>
-                      </motion.div>
-
-                      {/* Typing indicator */}
-                      <AnimatePresence>
-                        {showcasePhase === 'typing' && (
-                          <motion.div
-                            key="typing"
-                            className="flex items-end gap-2"
-                            initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                            animate={{ opacity: 1, y: 0, scale: 1 }}
-                            exit={{ opacity: 0, scale: 0.95, transition: { duration: 0.15 } }}
-                            transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-                          >
-                            <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm" />
-                            <div className="rounded-[20px] rounded-bl-[4px] bg-[#E9E9EB] px-5 py-3.5 shadow-sm">
-                              <div className="flex gap-1.5 items-center">
-                                {[0, 1, 2].map((i) => (
-                                  <motion.div
-                                    key={i}
-                                    className="w-[7px] h-[7px] rounded-full bg-[#8E8E93]"
-                                    animate={{ y: [0, -4, 0] }}
-                                    transition={{ duration: 0.6, repeat: Infinity, delay: i * 0.15, ease: 'easeInOut' }}
-                                  />
-                                ))}
-                              </div>
-                            </div>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-
-                      {/* Nest reply */}
-                      <AnimatePresence>
-                        {(showcasePhase === 'nest-in' || showcasePhase === 'hold') && (
-                          <motion.div
-                            className="flex items-end gap-2"
-                            initial={{ opacity: 0, y: 12, scale: 0.95 }}
-                            animate={{ opacity: 1, y: 0, scale: 1 }}
-                            transition={{ duration: 0.4, ease: [0.16, 1, 0.3, 1] }}
-                          >
-                            <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
-                            <div className="max-w-[85%] rounded-[20px] rounded-bl-[4px] bg-[#E9E9EB] px-4 py-2.5 text-[15px] leading-relaxed text-[#000000] shadow-sm">
-                              {SHOWCASE[showcaseIndex].nestMessage}
-                            </div>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
+                        {msg.text}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <style>{`
+                  @keyframes showcaseScroll {
+                    0% { transform: translateY(0); }
+                    100% { transform: translateY(-50%); }
+                  }
+                `}</style>
               </div>
 
               {/* Pinned CTA */}
-              <div className="shrink-0 w-full pb-10">
+              <div className="shrink-0 w-full pb-10 pt-2">
                 <a
                   href="sms:tlidgett@icloud.com&body=Hey%20Nest!"
                   className="block w-full rounded-full bg-[#007AFF] py-3.5 text-center text-[15px] font-semibold text-white shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:bg-[#0071E3] transition-colors"
