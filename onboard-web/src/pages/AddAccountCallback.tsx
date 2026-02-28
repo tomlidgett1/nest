@@ -6,43 +6,60 @@ import { supabase } from '../lib/supabase'
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 
-const spring = { type: 'spring' as const, stiffness: 300, damping: 30 }
-
 type Status = 'loading' | 'success' | 'error'
 
-function LoadingDots() {
+/* ── Apple-style iOS spinner ── */
+function AppleSpinner({ size = 40 }: { size?: number }) {
+  const bars = 12
   return (
-    <div className="mb-6 flex items-center justify-center gap-2">
-      {[0, 1, 2].map((i) => (
-        <motion.div
-          key={i}
-          className="h-2.5 w-2.5 rounded-full bg-gray-400"
-          animate={{ y: [0, -6, 0] }}
-          transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }}
-        />
-      ))}
+    <div className="relative" style={{ width: size, height: size }}>
+      {Array.from({ length: bars }).map((_, i) => {
+        const angle = (360 / bars) * i
+        const delay = -(1 - i / bars)
+        return (
+          <div
+            key={i}
+            className="absolute left-1/2 top-0 h-1/2 w-[2px] -translate-x-1/2 origin-bottom"
+            style={{ transform: `rotate(${angle}deg)` }}
+          >
+            <div
+              className="h-[28%] w-full rounded-full bg-gray-900"
+              style={{
+                animation: `spinFade 1s linear ${delay}s infinite`,
+              }}
+            />
+          </div>
+        )
+      })}
+      <style>{`
+        @keyframes spinFade {
+          0% { opacity: 1; }
+          100% { opacity: 0.15; }
+        }
+      `}</style>
     </div>
   )
 }
 
+/* ── Animated checkmark ── */
 function AnimatedCheck() {
   return (
     <motion.div
-      className="mb-5 flex h-14 w-14 items-center justify-center rounded-full bg-green-50"
-      initial={{ scale: 0 }}
-      animate={{ scale: 1 }}
-      transition={{ type: 'spring', stiffness: 400, damping: 20 }}
+      className="mb-6 flex h-16 w-16 items-center justify-center rounded-full bg-gray-900"
+      initial={{ scale: 0, opacity: 0 }}
+      animate={{ scale: 1, opacity: 1 }}
+      transition={{ type: 'spring', stiffness: 400, damping: 22, delay: 0.1 }}
     >
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+      <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
         <motion.path
           d="M20 6L9 17L4 12"
-          stroke="#16a34a"
+          stroke="white"
           strokeWidth="2.5"
           strokeLinecap="round"
           strokeLinejoin="round"
           initial={{ pathLength: 0 }}
           animate={{ pathLength: 1 }}
-          transition={{ duration: 0.4, delay: 0.2, ease: 'easeOut' }}
+          transition={{ duration: 0.4, delay: 0.35, ease: 'easeOut' }}
         />
       </svg>
     </motion.div>
@@ -177,10 +194,9 @@ export default function AddAccountCallback() {
 
   return (
     <motion.div
-      className="min-h-screen flex items-center justify-center bg-[#FAFAFA] font-sans selection:bg-gray-200"
+      className="h-[100dvh] flex items-center justify-center bg-[#FAFAFA] font-sans"
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
       transition={{ duration: 0.3 }}
     >
       <div className="w-full max-w-sm px-6 text-center">
@@ -190,24 +206,26 @@ export default function AddAccountCallback() {
               key="loading"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              transition={{ duration: 0.2 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              transition={{ duration: 0.25 }}
               className="flex flex-col items-center"
             >
-              <LoadingDots />
+              <div className="mb-8">
+                <AppleSpinner size={44} />
+              </div>
               <motion.h1
-                className="text-2xl font-bold tracking-tight text-gray-900 mb-2"
+                className="text-[28px] font-bold tracking-tight text-gray-900 mb-2"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ ...spring, delay: 0.1 }}
+                transition={{ duration: 0.4, delay: 0.1 }}
               >
-                Linking account...
+                Linking account
               </motion.h1>
               <motion.p
-                className="text-gray-500"
+                className="text-[15px] text-gray-400"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                transition={{ ...spring, delay: 0.2 }}
+                transition={{ duration: 0.4, delay: 0.2 }}
               >
                 Connecting your additional Google account.
               </motion.p>
@@ -224,18 +242,18 @@ export default function AddAccountCallback() {
             >
               <AnimatedCheck />
               <motion.h1
-                className="text-2xl font-bold tracking-tight text-green-700 mb-2"
+                className="text-[28px] font-bold tracking-tight text-gray-900 mb-2"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                transition={{ ...spring, delay: 0.3 }}
+                transition={{ duration: 0.4, delay: 0.4 }}
               >
                 Account linked
               </motion.h1>
               <motion.p
-                className="text-gray-500"
+                className="text-[15px] text-gray-400"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                transition={{ ...spring, delay: 0.4 }}
+                transition={{ duration: 0.4, delay: 0.5 }}
               >
                 Redirecting back...
               </motion.p>
@@ -245,20 +263,23 @@ export default function AddAccountCallback() {
           {status === 'error' && (
             <motion.div
               key="error"
-              initial={{ opacity: 0, y: 8 }}
+              initial={{ opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={spring}
+              transition={{ duration: 0.35 }}
               className="flex flex-col items-center"
             >
-              <h1 className="text-2xl font-bold tracking-tight text-red-600 mb-4">Something went wrong</h1>
-              {errorMessage && <p className="text-sm text-gray-600 bg-red-50 p-4 rounded-xl border border-red-100 mb-8 w-full">{errorMessage}</p>}
-              <motion.button
-                className="flex w-full items-center justify-center rounded-full bg-gray-900 px-6 py-3.5 text-base font-medium text-white shadow-sm hover:bg-black transition-colors"
+              <h1 className="text-[28px] font-bold tracking-tight text-red-600 mb-4">Something went wrong</h1>
+              {errorMessage && (
+                <p className="text-sm text-gray-600 bg-white p-4 rounded-2xl border border-gray-200/60 shadow-sm mb-8 w-full">
+                  {errorMessage}
+                </p>
+              )}
+              <button
+                className="w-full rounded-full bg-gray-900 py-3.5 text-[15px] font-semibold text-white hover:bg-black transition-colors"
                 onClick={() => navigate('/dashboard', { replace: true })}
-                whileTap={{ scale: 0.97 }}
               >
                 Back to Dashboard
-              </motion.button>
+              </button>
             </motion.div>
           )}
         </AnimatePresence>

@@ -137,17 +137,25 @@ export default function Dashboard() {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[#FAFAFA]">
         <div className="flex flex-col items-center">
-          <div className="mb-6 flex gap-2">
-            {[0, 1, 2].map((i) => (
-              <motion.div
-                key={i}
-                className="h-2 w-2 rounded-full bg-gray-300"
-                animate={{ y: [0, -6, 0] }}
-                transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.12, ease: 'easeInOut' }}
-              />
-            ))}
+          <div className="relative mb-6" style={{ width: 44, height: 44 }}>
+            {Array.from({ length: 12 }).map((_, i) => {
+              const angle = (360 / 12) * i
+              const delay = -(1 - i / 12)
+              return (
+                <div
+                  key={i}
+                  className="absolute left-1/2 top-0 h-1/2 w-[2px] -translate-x-1/2 origin-bottom"
+                  style={{ transform: `rotate(${angle}deg)` }}
+                >
+                  <div
+                    className="h-[28%] w-full rounded-full bg-gray-900"
+                    style={{ animation: `spinFade 1s linear ${delay}s infinite` }}
+                  />
+                </div>
+              )
+            })}
+            <style>{`@keyframes spinFade { 0% { opacity: 1; } 100% { opacity: 0.15; } }`}</style>
           </div>
-          <p className="text-base font-medium text-gray-400">Loading...</p>
         </div>
       </div>
     )
@@ -400,7 +408,7 @@ export default function Dashboard() {
               <div className="shrink-0 w-full pb-10">
                 <a
                   href="sms:tlidgett@icloud.com&body=Hey%20Nest!"
-                  className="block w-full rounded-full bg-[#007AFF] py-3.5 text-center text-[15px] font-semibold text-white shadow-lg shadow-blue-500/20 hover:bg-blue-600 transition-colors"
+                  className="block w-full rounded-full bg-[#007AFF] py-3.5 text-center text-[15px] font-semibold text-white shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:bg-[#0071E3] transition-colors"
                 >
                   Open iMessage
                 </a>
