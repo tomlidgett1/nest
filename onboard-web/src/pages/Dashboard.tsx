@@ -164,16 +164,7 @@ export default function Dashboard() {
       <header className="shrink-0 z-50 bg-[#FAFAFA]/80 backdrop-blur-md">
         <div className="mx-auto max-w-2xl px-5 py-2.5 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            {step > 1 ? (
-              <button
-                onClick={() => setStep(step - 1)}
-                className="flex items-center justify-center h-8 w-8 -ml-1 rounded-full hover:bg-gray-100 transition-colors"
-              >
-                <ChevronLeft className="h-5 w-5 text-gray-400" />
-              </button>
-            ) : (
-              <img src="/nest-logo.png" alt="Nest" className="h-8 w-8 rounded-[10px] shadow-sm" />
-            )}
+            <img src="/nest-logo.png" alt="Nest" className="h-8 w-8 rounded-[10px] shadow-sm" />
             <span className="text-lg font-semibold tracking-tight text-gray-900">Nest</span>
           </div>
 
@@ -233,16 +224,26 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* ── Progress dots ── */}
-      <div className="shrink-0 flex items-center justify-center gap-2 py-3">
-        {[1, 2, 3].map((i) => (
-          <motion.div
-            key={i}
-            className="h-[7px] rounded-full bg-gray-900"
-            animate={{ width: step === i ? 24 : 7, opacity: step === i ? 1 : 0.15 }}
-            transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-          />
-        ))}
+      {/* ── Progress dots with back arrow ── */}
+      <div className="shrink-0 flex items-center justify-center py-3 relative">
+        {step > 1 && (
+          <button
+            onClick={() => setStep(step - 1)}
+            className="absolute left-5 flex items-center justify-center h-8 w-8 rounded-full hover:bg-gray-100 transition-colors"
+          >
+            <ChevronLeft className="h-5 w-5 text-gray-400" />
+          </button>
+        )}
+        <div className="flex items-center gap-2">
+          {[1, 2, 3].map((i) => (
+            <motion.div
+              key={i}
+              className="h-[7px] rounded-full bg-gray-900"
+              animate={{ width: step === i ? 24 : 7, opacity: step === i ? 1 : 0.15 }}
+              transition={{ type: 'spring', stiffness: 400, damping: 30 }}
+            />
+          ))}
+        </div>
       </div>
 
       {/* ── Content area ── */}
@@ -266,9 +267,9 @@ export default function Dashboard() {
                 </h1>
                 <p className="text-[15px] text-gray-400 mt-1.5 text-center">Your connected accounts</p>
 
-                <div className="w-full mt-8 divide-y divide-gray-100">
+                <div className="w-full mt-8 rounded-2xl bg-white border border-gray-200/60 shadow-sm divide-y divide-gray-100 overflow-hidden">
                   {accounts.map((account) => (
-                    <div key={account.id} className="flex items-center gap-3 py-3.5">
+                    <div key={account.id} className="flex items-center gap-3 px-4 py-3.5">
                       {account.google_avatar_url ? (
                         <img
                           src={account.google_avatar_url}
@@ -382,7 +383,7 @@ export default function Dashboard() {
                 <motion.img
                   src="/imessage-icon.png"
                   alt=""
-                  className="h-16 w-16 rounded-2xl shadow-md mb-6"
+                  className="h-16 w-16 rounded-2xl mb-6"
                   initial={{ opacity: 0, scale: 0.8 }}
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ duration: 0.4, delay: 0.1 }}
@@ -403,9 +404,6 @@ export default function Dashboard() {
                 >
                   Open iMessage
                 </a>
-                <p className="text-[11px] text-gray-400 text-center mt-4 max-w-[300px] mx-auto leading-relaxed">
-                  By messaging Nest you agree to receive messages. Reply "Unsubscribe" to stop.
-                </p>
               </div>
             </motion.section>
           )}
