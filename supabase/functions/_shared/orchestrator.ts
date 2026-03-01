@@ -51,6 +51,7 @@ export interface RoutingResult {
   prefetch?: PrefetchTask[];     // data to fetch in parallel
   contextDepth?: "full" | "minimal"; // minimal = skip heavy context blocks (profile, learnings, identity model)
   needsProfile?: boolean; // true = inject rich user profile into context (default: false for operational queries)
+  skipAck?: boolean; // true = suppress the inline ack message (reminders, etc. that confirm in one message)
 }
 
 export interface PrefetchTask {
@@ -1665,6 +1666,7 @@ export function routeMessage(
       tools,
       prefetch: prefetch.length > 0 ? prefetch : undefined,
       contextDepth: "minimal",
+      skipAck: lightIntent === "reminder",
     };
   }
 

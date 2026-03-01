@@ -1685,7 +1685,7 @@ export async function handleMessage(
   }
   const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
 
-  const shouldAck = routing.path === "agent" && options?.onAck && looksLikeToolQuery(message);
+  const shouldAck = routing.path === "agent" && options?.onAck && looksLikeToolQuery(message) && !routing.skipAck;
   const ackPromise = shouldAck
     ? generateInlineAck(message, recentChat, ctx).then(ack => {
         if (ack) options!.onAck!(ack);
