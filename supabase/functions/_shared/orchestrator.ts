@@ -1086,6 +1086,8 @@ Draft email → gather context → send_draft → show draft → user confirms �
 Travel / trip / "what am I doing in [city]" → gmail_search + semantic_search + calendar_lookup ALL IN PARALLEL first
 Accommodation / booking → gmail_search + calendar_lookup IN PARALLEL. Search broadly. ALWAYS get_email for exact details.
 Location/timezone change → update_user_timezone immediately (map city to IANA)
+
+TIMEZONE AWARENESS: If the user mentions being in, traveling to, or asking about local things (trains, restaurants, weather, places) in a city that is in a DIFFERENT timezone to their stored timezone, you MUST call update_user_timezone BEFORE answering. For example, if timezone says "Australia/Sydney" but user asks "next train from Shinjuku" or "what time is it here in Tokyo", update to "Asia/Tokyo" first. Context clues: city names in queries, transit in foreign cities, "here in [city]", recent travel discussion. When unsure, ask: "Are you in [city] right now? I'll update your timezone."
 Reminder → manage_reminder. If clear, set and confirm with EXACTLY one message + ✓. No pre-confirmation, no follow-up.
 Todo → manage_todos
 Documents → document_search, fall back to semantic_search
@@ -1202,6 +1204,7 @@ Current time: ${timeStr} (${tzAbbr})
 User timezone: ${tz}
 Current location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
 IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
+CRITICAL: If conversation context suggests the user is in a DIFFERENT timezone (e.g. asking about trains/places/weather in a foreign city), call update_user_timezone FIRST before answering. The stored timezone may be stale from travel.
 User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
 
 You are ${user.name}'s person. You know ${user.name}. Use their name naturally in conversation.`;
@@ -1225,7 +1228,11 @@ Use tools proactively. Call BEFORE responding.
 If pre-fetched evidence answers the question, use it directly. Never fabricate.
 Never state real-time numbers from memory. If a tool fails: "Hmm, couldn't do that. Want me to try again?"
 "Next/now/latest" = nearest upcoming result from current local time.
-Keep responses concise. Each line = separate iMessage bubble.`;
+Keep responses concise. Each line = separate iMessage bubble.
+
+─── TIMEZONE ───
+CRITICAL: If the user's query implies they are in a different city/timezone than their stored timezone (shown in USER CONTEXT below), call update_user_timezone FIRST before any other tool. Examples: asking about trains in Tokyo when timezone is Australia/Sydney, weather in Paris when timezone is Asia/Tokyo. If unsure, ask: "Are you in [city]? I'll update your time."
+This ensures all times (reminders, calendar, transit) are correct for where they actually are.`;
 
 const LIGHT_INTENT_INSTRUCTIONS: Record<string, string> = {
   calendar: `
@@ -1263,7 +1270,9 @@ For list: show active reminders. For edit/delete: confirm the change with one li
 Complete: "Done, crossed off '[item]' ✓ N left"
 List: show open todos.`,
 
-  transit: `ALWAYS call travel_time with mode="transit" and departure_time="now" (unless the user specified a different time).
+  transit: `TIMEZONE CHECK FIRST: If the transit query mentions a city in a different timezone to the user's stored timezone, call update_user_timezone BEFORE travel_time. E.g. user asks about trains in Tokyo but timezone is "Australia/Sydney" → update to "Asia/Tokyo" first.
+
+ALWAYS call travel_time with mode="transit" and departure_time="now" (unless the user specified a different time).
 Use the user's current location or nearest station as origin if not specified.
 Sanity-check times against the user's current local time — never present past departures as "next".
 If the tool returns no results, it auto-falls back to web search. Present whatever you get clearly.
@@ -1378,14 +1387,14 @@ User: ${user.name}`;
 // tokens) for simple queries, send only the 1-5 tools actually needed.
 
 const TOOL_SUBSETS: Record<string, string[]> = {
-  calendar: ["calendar_lookup", "calendar_create", "calendar_update", "calendar_delete", "contacts_search"],
-  weather: ["weather_lookup"],
+  calendar: ["calendar_lookup", "calendar_create", "calendar_update", "calendar_delete", "contacts_search", "update_user_timezone"],
+  weather: ["weather_lookup", "update_user_timezone"],
   currency: ["web_search"],
-  reminder: ["manage_reminder"],
+  reminder: ["manage_reminder", "update_user_timezone"],
   todo: ["manage_todos"],
   time: ["web_search"],
-  transit: ["travel_time", "web_search"],
-  places: ["places_search", "web_search"],
+  transit: ["travel_time", "web_search", "update_user_timezone"],
+  places: ["places_search", "web_search", "update_user_timezone"],
   inbox: ["gmail_search", "get_email"],
 };
 
