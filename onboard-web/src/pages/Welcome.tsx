@@ -483,7 +483,7 @@ export default function Welcome() {
                 <span className="flex items-baseline gap-x-[0.3em] flex-wrap">
                   <span>Your</span>
                   <RotatingText
-                    texts={['chief of staff', 'executive assistant', 'companion', 'smart friend', 'wingman', 'co-pilot', 'lifeline']}
+                    texts={['AI mate', 'smart friend', 'wingman', 'co-pilot', 'right hand', 'secret weapon', 'lifeline']}
                     mainClassName="inline-flex text-[#007AFF] overflow-hidden items-baseline"
                     staggerFrom={"last"}
                     initial={{ y: "100%" }}
@@ -897,7 +897,7 @@ export default function Welcome() {
           >
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(255,255,255,0.1),transparent_50%)]" />
             <h2 className="text-3xl sm:text-4xl lg:text-5xl font-semibold tracking-tight text-white mb-6 relative z-10">
-              Ready to meet your chief of staff?
+              Ready to meet your AI mate?
             </h2>
             <p className="text-lg text-gray-300 mb-10 max-w-xl mx-auto relative z-10">
               Connect your Google or Microsoft account and start chatting in iMessage. It takes less than 30 seconds.

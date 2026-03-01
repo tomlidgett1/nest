@@ -229,7 +229,7 @@ Deno.serve(async (req: Request) => {
 
             if (!lastLinkAt) {
               canShowNestLink = true; // Never shared before
-            } else if (messagesSinceLink >= 50 && lastLinkAt < threeHoursAgo) {
+            } else if (messagesSinceLink >= 15 && lastLinkAt < threeHoursAgo) {
               canShowNestLink = true; // Both conditions met
             }
 
