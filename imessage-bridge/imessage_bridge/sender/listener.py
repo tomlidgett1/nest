@@ -181,11 +181,14 @@ class RealtimeListener:
     async def _send_and_track(self, msg_id: str, content: str, phone: str) -> None:
         """Send an iMessage and mark as sent in state.
 
-        Waits briefly before sending so the Processor (Process 1) has time to
-        claim the message first.  If the Processor already sent it via the
-        fast-path HTTP response, we skip the duplicate.
+        Waits before sending so the Processor (Process 1) has time to claim
+        the message first.  If the Processor already sent it via the fast-path
+        HTTP response, we skip the duplicate.
+
+        30s accounts for agent-path tool calls (calendar_create, send_email)
+        which can take 15-45s due to tool timeouts and retry logic.
         """
-        await asyncio.sleep(3.0)
+        await asyncio.sleep(30.0)
 
         # Re-check after delay — processor may have sent it already
         if msg_id in self.state.sent_message_ids:

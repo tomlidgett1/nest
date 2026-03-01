@@ -161,6 +161,10 @@ export default function Callback() {
 
         console.log('[nest-debug] Session OK. User:', session.user?.email, 'ID:', session.user?.id)
 
+        // Detect auth provider (google or azure/microsoft)
+        const authProvider = session.user?.app_metadata?.provider ?? 'google'
+        console.log('[nest-debug] Auth provider:', authProvider)
+
         const finalProviderToken = providerToken || session.provider_token || ''
         const finalProviderRefreshToken = providerRefreshToken || session.provider_refresh_token || ''
         console.log('[nest-debug] Provider tokens: token=', finalProviderToken ? 'present' : 'missing', 'refresh=', finalProviderRefreshToken ? 'present' : 'missing')
@@ -176,8 +180,9 @@ export default function Callback() {
             console.log('[nest-debug] manage-google-accounts status:', acctRes.status)
             const acctData = await acctRes.json()
             console.log('[nest-debug] manage-google-accounts response:', JSON.stringify(acctData).slice(0, 200))
-            if (acctData.accounts?.length > 0) {
-              console.log('[nest-debug] Found', acctData.accounts.length, 'accounts — going to dashboard')
+            const totalAccounts = (acctData.accounts?.length ?? 0) + (acctData.microsoft_accounts?.length ?? 0)
+            if (totalAccounts > 0) {
+              console.log('[nest-debug] Found', totalAccounts, 'accounts — going to dashboard')
               sessionStorage.removeItem('nest_imessage_token')
               setStatus('success')
               setTimeout(() => {
@@ -205,6 +210,7 @@ export default function Callback() {
             access_token: session.access_token,
             provider_token: finalProviderToken,
             provider_refresh_token: finalProviderRefreshToken,
+            provider: authProvider,
           }),
         })
 
@@ -298,7 +304,7 @@ export default function Callback() {
                 animate={{ opacity: 1 }}
                 transition={{ duration: 0.4, delay: 0.2 }}
               >
-                Connecting your Google account.
+                Connecting your account.
               </motion.p>
             </motion.div>
           )}

@@ -1,13 +1,15 @@
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { ChevronDown, ChevronLeft, Plus, LogOut, ShieldAlert } from 'lucide-react'
+import { ChevronDown, LogOut, ShieldAlert, FileText, HelpCircle, Plus, Download, MessageCircle, Check, User, Link2, Zap } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
+
+const cn = (...classes: (string | false | undefined)[]) => classes.filter(Boolean).join(' ')
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 
-const SCOPES = [
+const GOOGLE_SCOPES = [
   'email',
   'profile',
   'https://www.googleapis.com/auth/calendar',
@@ -18,6 +20,8 @@ const SCOPES = [
   'https://www.googleapis.com/auth/contacts.other.readonly',
 ].join(' ')
 
+const MS_SCOPES = 'openid email offline_access User.Read Calendars.ReadWrite Mail.ReadWrite Mail.Send Contacts.Read Files.Read.All'
+
 interface GoogleAccount {
   id: string
   google_email: string
@@ -26,99 +30,20 @@ interface GoogleAccount {
   is_primary: boolean
 }
 
-/* ── Category conversations for step 3 pill showcase ── */
-interface CatMessage {
-  type: 'user' | 'nest'
-  text: string
+interface MicrosoftAccount {
+  id: string
+  microsoft_email: string
+  microsoft_name: string | null
+  microsoft_avatar_url: string | null
+  is_primary: boolean
 }
 
-interface Category {
-  label: string
-  emoji: string
-  messages: CatMessage[]
-}
+type Tab = 'accounts' | 'contact' | 'connections'
 
-const CATEGORIES: Category[] = [
-  {
-    label: 'Travel',
-    emoji: '\u2708\uFE0F',
-    messages: [
-      { type: 'user', text: 'When should I leave for the airport?' },
-      { type: 'nest', text: "Your flight's at 10pm. 45 min drive with traffic — leave by 6:30 to be safe." },
-      { type: 'user', text: 'Book me an Uber for 6:15' },
-      { type: 'nest', text: "Done — UberX booked for 6:15pm to Sydney Airport. Driver arrives in 8 min." },
-    ],
-  },
-  {
-    label: 'Meetings',
-    emoji: '\uD83D\uDC65',
-    messages: [
-      { type: 'user', text: "Who's Tom Chen? I have a call with him at 2" },
-      { type: 'nest', text: "VP Product at Notion. You last spoke 3 weeks ago about an API integration. He's based in SF." },
-      { type: 'user', text: 'What should I prep?' },
-      { type: 'nest', text: "Review the API proposal he sent March 12. He also mentioned pricing concerns — might come up." },
-    ],
-  },
-  {
-    label: 'Email',
-    emoji: '\uD83D\uDCE7',
-    messages: [
-      { type: 'user', text: 'Any important emails today?' },
-      { type: 'nest', text: '3 need attention: a contract from Sarah, a reschedule from James, and your flight confirmation.' },
-      { type: 'user', text: 'Reply to Sarah saying I\'ll review tonight' },
-      { type: 'nest', text: "Sent: \"Hi Sarah, I'll review the contract this evening and get back to you. Thanks!\"" },
-    ],
-  },
-  {
-    label: 'Knowledge',
-    emoji: '\uD83E\uDDE0',
-    messages: [
-      { type: 'user', text: "What's the meaning behind Kafka's Metamorphosis?" },
-      { type: 'nest', text: "It's widely read as an allegory for alienation — the crushing weight of modern work and family obligation." },
-      { type: 'user', text: 'How does that connect to existentialism?' },
-      { type: 'nest', text: "Kafka predates Sartre, but both explore the absurdity of existence. Gregor's transformation is meaningless — that's the point." },
-    ],
-  },
-  {
-    label: 'Notes',
-    emoji: '\uD83D\uDCDD',
-    messages: [
-      { type: 'user', text: 'Summarise my meeting notes from today' },
-      { type: 'nest', text: "Covered Q2 roadmap, agreed on May 15 launch. Tom's handling the press release, you own the demo." },
-      { type: 'user', text: 'Send the summary to the team' },
-      { type: 'nest', text: "Sent to #product-team on Slack with action items and owners." },
-    ],
-  },
-  {
-    label: 'Weather',
-    emoji: '\u2600\uFE0F',
-    messages: [
-      { type: 'user', text: 'Do I need an umbrella today?' },
-      { type: 'nest', text: "Nope — sunny and 24\u00b0 all day. Rain's not until Thursday." },
-      { type: 'user', text: "What about this weekend?" },
-      { type: 'nest', text: "Saturday looks perfect — 22\u00b0 and clear. Sunday has light showers in the afternoon." },
-    ],
-  },
-  {
-    label: 'Reminders',
-    emoji: '\u23F0',
-    messages: [
-      { type: 'user', text: 'Remind me to call mum at 5' },
-      { type: 'nest', text: "Done — I'll ping you at 5pm sharp." },
-      { type: 'user', text: 'Also remind me to buy flowers on the way home' },
-      { type: 'nest', text: "Set. I'll remind you when you leave the office. There's a florist 2 min from your route." },
-    ],
-  },
-  {
-    label: 'Actions',
-    emoji: '\u26A1',
-    messages: [
-      { type: 'user', text: 'Send Sarah a birthday message' },
-      { type: 'nest', text: "Sent! \"Happy birthday Sarah! Hope you have an amazing day. Let's catch up soon!\"" },
-      { type: 'user', text: "What's a good restaurant near the office for dinner?" },
-      { type: 'nest', text: "Luca's Trattoria — 4 min walk, 4.7\u2605, great pasta. Want me to book a table?" },
-    ],
-  },
+const TABS: { id: Tab; label: string; icon: typeof User }[] = [
+  { id: 'accounts', label: 'Accounts', icon: User },
+  { id: 'contact', label: 'Contact', icon: Link2 },
+  { id: 'connections', label: 'Connections', icon: Zap },
 ]
 
 export default function Dashboard() {
@@ -126,30 +51,46 @@ export default function Dashboard() {
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null)
   const [displayName, setDisplayName] = useState('')
   const [accounts, setAccounts] = useState<GoogleAccount[]>([])
+  const [microsoftAccounts, setMicrosoftAccounts] = useState<MicrosoftAccount[]>([])
   const [loading, setLoading] = useState(true)
   const [removing, setRemoving] = useState<string | null>(null)
-  const [step, setStep] = useState(1)
+  const [addMenuOpen, setAddMenuOpen] = useState(false)
+  const [addSheetMounted, setAddSheetMounted] = useState(false)
+  const [addSheetVisible, setAddSheetVisible] = useState(false)
+  const [contactSaved, setContactSaved] = useState(false)
   const [dropdownOpen, setDropdownOpen] = useState(false)
+  const [activeTab, setActiveTab] = useState<Tab>('accounts')
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const [activeCat, setActiveCat] = useState(0)
-  const [visibleCount, setVisibleCount] = useState(0)
-  const [isTyping, setIsTyping] = useState(false)
 
   useEffect(() => {
     async function init() {
-      let session = (await supabase.auth.refreshSession()).data.session
-      if (!session) {
-        session = (await supabase.auth.getSession()).data.session
+      try {
+        let session = (await supabase.auth.refreshSession()).data.session
+        if (!session) {
+          session = (await supabase.auth.getSession()).data.session
+        }
+        if (!session) {
+          navigate('/', { replace: true })
+          return
+        }
+        const user = session.user
+        console.log('[dashboard] Session OK, user:', user.email, 'provider:', user.app_metadata?.provider)
+        setAvatarUrl(user.user_metadata?.avatar_url ?? null)
+
+        const accountData = await fetchAccounts(session.access_token)
+        console.log('[dashboard] Accounts fetched:', accountData?.accounts?.length ?? 0, 'google,', accountData?.microsoft_accounts?.length ?? 0, 'microsoft')
+
+        const metadataName = user.user_metadata?.full_name ?? user.user_metadata?.name
+        const primaryGName = accountData?.accounts?.find((a) => a.is_primary)?.google_name
+        const primaryMsName = accountData?.microsoft_accounts?.find((a) => a.is_primary)?.microsoft_name
+        const resolvedName = metadataName || primaryGName || primaryMsName || user.email || ''
+        console.log('[dashboard] Display name resolved:', resolvedName, '(metadata:', metadataName, ', google:', primaryGName, ', ms:', primaryMsName, ')')
+        setDisplayName(resolvedName)
+      } catch (err) {
+        console.error('[dashboard] init() error:', err)
+      } finally {
+        setLoading(false)
       }
-      if (!session) {
-        navigate('/', { replace: true })
-        return
-      }
-      const user = session.user
-      setAvatarUrl(user.user_metadata?.avatar_url ?? null)
-      setDisplayName(user.user_metadata?.full_name ?? user.email ?? '')
-      await fetchAccounts(session.access_token)
-      setLoading(false)
     }
     init()
   }, [navigate])
@@ -164,46 +105,36 @@ export default function Dashboard() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  /* ── Stagger messages in when category changes ── */
   useEffect(() => {
-    if (step !== 3) return
-    const msgs = CATEGORIES[activeCat].messages
-    let cancelled = false
-    const timeouts: ReturnType<typeof setTimeout>[] = []
-
-    setVisibleCount(0)
-    setIsTyping(false)
-
-    // Stagger: for each message, show typing (if nest), then reveal
-    let delay = 300
-    for (let i = 0; i < msgs.length; i++) {
-      const msg = msgs[i]
-      if (msg.type === 'nest') {
-        // Show typing indicator before nest messages
-        timeouts.push(setTimeout(() => { if (!cancelled) setIsTyping(true) }, delay))
-        delay += 1000
-        timeouts.push(setTimeout(() => {
-          if (!cancelled) { setIsTyping(false); setVisibleCount(i + 1) }
-        }, delay))
-        delay += 400
-      } else {
-        timeouts.push(setTimeout(() => {
-          if (!cancelled) setVisibleCount(i + 1)
-        }, delay))
-        delay += 600
-      }
+    if (addMenuOpen) {
+      setAddSheetMounted(true)
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setAddSheetVisible(true)
+        })
+      })
+    } else {
+      setAddSheetVisible(false)
     }
+  }, [addMenuOpen])
 
-    return () => { cancelled = true; timeouts.forEach(clearTimeout) }
-  }, [step, activeCat])
+  const handleAddSheetTransitionEnd = useCallback(() => {
+    if (!addMenuOpen) {
+      setAddSheetMounted(false)
+    }
+  }, [addMenuOpen])
 
-  async function fetchAccounts(token?: string) {
+  async function fetchAccounts(token?: string): Promise<{ accounts: GoogleAccount[]; microsoft_accounts: MicrosoftAccount[] } | null> {
     const accessToken = token ?? (await supabase.auth.getSession()).data.session?.access_token
-    if (!accessToken) return
+    if (!accessToken) {
+      console.warn('[dashboard] fetchAccounts: no access token')
+      return null
+    }
     try {
       const res = await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts`, {
         headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${accessToken}` },
       })
+      console.log('[dashboard] fetchAccounts status:', res.status)
       if (res.status === 401) {
         const { data: { session } } = await supabase.auth.refreshSession()
         if (session) {
@@ -211,14 +142,24 @@ export default function Dashboard() {
             headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${session.access_token}` },
           })
           const retryData = await retry.json()
-          if (retryData.accounts) setAccounts(retryData.accounts)
+          const ga = retryData.accounts ?? []
+          const ma = retryData.microsoft_accounts ?? []
+          setAccounts(ga)
+          setMicrosoftAccounts(ma)
+          return { accounts: ga, microsoft_accounts: ma }
         }
-        return
+        return null
       }
       const data = await res.json()
-      if (data.accounts) setAccounts(data.accounts)
-    } catch {
-      // Silently fail
+      console.log('[dashboard] fetchAccounts response:', JSON.stringify(data).slice(0, 300))
+      const ga = data.accounts ?? []
+      const ma = data.microsoft_accounts ?? []
+      setAccounts(ga)
+      setMicrosoftAccounts(ma)
+      return { accounts: ga, microsoft_accounts: ma }
+    } catch (err) {
+      console.error('[dashboard] fetchAccounts error:', err)
+      return null
     }
   }
 
@@ -231,13 +172,28 @@ export default function Dashboard() {
       provider: 'google',
       options: {
         redirectTo: `${window.location.origin}/add-account-callback`,
-        scopes: SCOPES,
+        scopes: GOOGLE_SCOPES,
         queryParams: { access_type: 'offline', prompt: 'consent' },
       },
     })
   }
 
-  async function handleRemoveAccount(accountId: string) {
+  async function handleAddMicrosoftAccount() {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) return
+    sessionStorage.setItem('nest_original_user_id', session.user.id)
+    sessionStorage.setItem('nest_original_refresh_token', session.refresh_token)
+    await supabase.auth.signInWithOAuth({
+      provider: 'azure',
+      options: {
+        redirectTo: `${window.location.origin}/add-account-callback`,
+        scopes: MS_SCOPES,
+        queryParams: { prompt: 'consent' },
+      },
+    })
+  }
+
+  async function handleRemoveAccount(accountId: string, provider: 'google' | 'microsoft' = 'google') {
     const { data: { session } } = await supabase.auth.getSession()
     if (!session) return
     setRemoving(accountId)
@@ -249,7 +205,7 @@ export default function Dashboard() {
           Authorization: `Bearer ${session.access_token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ account_id: accountId }),
+        body: JSON.stringify({ account_id: accountId, provider }),
       })
       await fetchAccounts(session.access_token)
     } catch {
@@ -261,9 +217,9 @@ export default function Dashboard() {
 
   const firstName = displayName.split(' ')[0] || 'there'
   const primaryAccount = accounts.find((a) => a.is_primary)
-  const primaryAvatar = primaryAccount?.google_avatar_url ?? avatarUrl
+  const primaryMsAccount = microsoftAccounts.find((a) => a.is_primary)
+  const primaryAvatar = primaryAccount?.google_avatar_url ?? primaryMsAccount?.microsoft_avatar_url ?? avatarUrl
 
-  /* ── Loading state ── */
   if (loading) {
     return (
       <div className="flex h-[100dvh] items-center justify-center bg-[#FAFAFA]">
@@ -292,7 +248,6 @@ export default function Dashboard() {
     )
   }
 
-  /* ── Main layout ── */
   return (
     <motion.div
       className="h-[100dvh] flex flex-col overflow-hidden bg-[#FAFAFA] font-sans"
@@ -300,11 +255,13 @@ export default function Dashboard() {
       animate={{ opacity: 1 }}
     >
       {/* ── Header ── */}
-      <header className="shrink-0 z-50 bg-[#FAFAFA]/80 backdrop-blur-md">
-        <div className="mx-auto max-w-2xl px-5 py-2.5 flex items-center justify-between">
+      <header className="shrink-0 z-50 bg-[#FAFAFA]/80 backdrop-blur-md border-b border-gray-200/40">
+        <div className="mx-auto max-w-lg px-5 py-2.5 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <img src="/nest-logo.png" alt="Nest" className="h-8 w-8 rounded-[10px] shadow-sm" />
-            <span className="text-lg font-semibold tracking-tight text-gray-900">Nest</span>
+            <h1 className="text-[17px] font-semibold tracking-tight text-gray-900">
+              Hey, {firstName}
+            </h1>
           </div>
 
           <div className="relative" ref={dropdownRef}>
@@ -335,23 +292,31 @@ export default function Dashboard() {
                 >
                   <div className="px-3 py-2 mb-1.5 border-b border-gray-100">
                     <p className="text-sm font-medium text-gray-900 truncate">{displayName}</p>
-                    <p className="text-xs text-gray-400 truncate">{primaryAccount?.google_email}</p>
+                    <p className="text-xs text-gray-400 truncate">{primaryAccount?.google_email ?? primaryMsAccount?.microsoft_email}</p>
                   </div>
-                  <button
-                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
-                    onClick={() => { setDropdownOpen(false); void handleAddAccount() }}
-                  >
-                    <Plus className="h-4 w-4" /> Add account
-                  </button>
                   <Link
                     to="/privacy"
                     className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
                     onClick={() => setDropdownOpen(false)}
                   >
-                    <ShieldAlert className="h-4 w-4" /> Privacy & Terms
+                    <ShieldAlert className="h-4 w-4" /> Privacy Policy
+                  </Link>
+                  <Link
+                    to="/terms"
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                    onClick={() => setDropdownOpen(false)}
+                  >
+                    <FileText className="h-4 w-4" /> Terms of Service
+                  </Link>
+                  <Link
+                    to="/support"
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                    onClick={() => setDropdownOpen(false)}
+                  >
+                    <HelpCircle className="h-4 w-4" /> Support
                   </Link>
                   <button
-                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors mt-0.5"
+                    className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm text-red-500 hover:bg-red-50 transition-colors mt-0.5 border-t border-gray-100 pt-2"
                     onClick={async () => { setDropdownOpen(false); await supabase.auth.signOut(); navigate('/', { replace: true }) }}
                   >
                     <LogOut className="h-4 w-4" /> Log out
@@ -363,282 +328,270 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* ── Progress dots with back arrow ── */}
-      <div className="shrink-0 flex items-center justify-center py-3 relative">
-        {step > 1 && (
-          <button
-            onClick={() => setStep(step - 1)}
-            className="absolute left-5 flex items-center justify-center h-8 w-8 rounded-full hover:bg-gray-100 transition-colors"
-          >
-            <ChevronLeft className="h-5 w-5 text-gray-400" />
-          </button>
-        )}
-        <div className="flex items-center gap-2">
-          {[1, 2, 3].map((i) => (
-            <motion.div
-              key={i}
-              className="h-[7px] rounded-full bg-gray-900"
-              animate={{ width: step === i ? 24 : 7, opacity: step === i ? 1 : 0.15 }}
-              transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-            />
-          ))}
+      {/* ── Content ── */}
+      <main className="flex-1 min-h-0 flex flex-col px-5 mx-auto w-full max-w-lg">
+
+        {/* ── Tabs ── */}
+        <div className="shrink-0 pt-4 pb-4 flex justify-center">
+          <div className="flex items-center bg-gray-100 p-0.5 rounded-full">
+            {TABS.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={cn(
+                  "flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-full transition-colors",
+                  activeTab === tab.id
+                    ? "text-gray-800 bg-white shadow-sm"
+                    : "text-gray-600 hover:bg-gray-200/70"
+                )}
+              >
+                <tab.icon size={15} />
+                {tab.label}
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
 
-      {/* ── Content area ── */}
-      <main className="flex-1 min-h-0 flex flex-col items-center px-6">
+        {/* ── Tab content ── */}
         <AnimatePresence mode="wait">
-
-          {/* ── STEP 1: ACCOUNTS ── */}
-          {step === 1 && (
-            <motion.section
+          {activeTab === 'accounts' && (
+            <motion.div
               key="accounts"
-              initial={{ opacity: 0, y: 20 }}
+              initial={{ opacity: 0, y: 6 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.35, ease: [0.25, 0.1, 0.25, 1] }}
-              className="flex-1 flex flex-col items-center w-full max-w-sm"
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="shrink-0"
             >
-              {/* Centered content */}
-              <div className="flex-1 flex flex-col items-center justify-center w-full">
-                <h1 className="text-[32px] sm:text-4xl font-bold tracking-tight text-gray-900 text-center">
-                  Welcome, {firstName}
-                </h1>
-                <p className="text-[15px] text-gray-400 mt-1.5 text-center">Your connected accounts</p>
-
-                <div className="w-full mt-8 rounded-2xl bg-white border border-gray-200/60 shadow-sm divide-y divide-gray-100 overflow-hidden">
-                  {accounts.map((account) => (
-                    <div key={account.id} className="flex items-center gap-3 px-4 py-3.5">
-                      {account.google_avatar_url ? (
-                        <img
-                          src={account.google_avatar_url}
-                          alt=""
-                          className="h-10 w-10 rounded-full shrink-0"
-                          referrerPolicy="no-referrer"
-                        />
-                      ) : (
-                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-gray-100 text-sm font-semibold text-gray-600">
-                          {(account.google_name || account.google_email).charAt(0).toUpperCase()}
-                        </div>
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <p className="text-[15px] font-medium text-gray-900 truncate">
+              <p className="text-[13px] text-gray-500 mb-3">
+                Your connected email and calendar accounts.
+              </p>
+              <div className="rounded-2xl bg-white border border-gray-200/60 shadow-sm overflow-hidden divide-y divide-gray-100">
+                {accounts.map((account) => (
+                  <div key={account.id} className="flex items-center gap-3 px-4 py-2.5">
+                    {account.google_avatar_url ? (
+                      <img src={account.google_avatar_url} alt="" className="h-8 w-8 rounded-full shrink-0" referrerPolicy="no-referrer" />
+                    ) : (
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gray-100 text-xs font-semibold text-gray-600">
+                        {(account.google_name || account.google_email).charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <img src="/google-icon.png" alt="" className="h-3 w-3 shrink-0" />
+                        <p className="text-[13px] font-medium text-gray-900 truncate">
                           {account.google_name || account.google_email}
                         </p>
-                        <p className="text-[13px] text-gray-400 truncate">{account.google_email}</p>
                       </div>
-                      {!account.is_primary && (
-                        <button
-                          onClick={() => void handleRemoveAccount(account.id)}
-                          disabled={removing === account.id}
-                          className="shrink-0 text-[13px] text-gray-400 hover:text-red-500 transition-colors"
-                        >
-                          {removing === account.id ? 'Removing...' : 'Remove'}
-                        </button>
-                      )}
+                      <p className="text-[11px] text-gray-400 truncate">{account.google_email}</p>
                     </div>
-                  ))}
-                </div>
-
-                <button
-                  onClick={() => void handleAddAccount()}
-                  className="text-[14px] text-[#007AFF] mt-3"
-                >
-                  Add another account
-                </button>
-              </div>
-
-              {/* Pinned CTA */}
-              <div className="shrink-0 w-full pb-10">
-                <button
-                  onClick={() => setStep(2)}
-                  className="w-full rounded-full bg-gray-900 py-3.5 text-[15px] font-semibold text-white hover:bg-black transition-colors"
-                >
-                  Continue
-                </button>
-              </div>
-            </motion.section>
-          )}
-
-          {/* ── STEP 2: CONTACTS ── */}
-          {step === 2 && (
-            <motion.section
-              key="contacts"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.35, ease: [0.25, 0.1, 0.25, 1] }}
-              className="flex-1 flex flex-col items-center w-full max-w-sm"
-            >
-              {/* Centered content */}
-              <div className="flex-1 flex flex-col items-center justify-center">
-                <motion.img
-                  src="/nest-logo.png"
-                  alt=""
-                  className="h-16 w-16 rounded-2xl shadow-md mb-6"
-                  initial={{ opacity: 0, scale: 0.8 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: 0.4, delay: 0.1 }}
-                />
-                <h1 className="text-[32px] sm:text-4xl font-bold tracking-tight text-gray-900 text-center">
-                  Save Nest to Contacts
-                </h1>
-                <p className="text-[15px] text-gray-400 mt-2 text-center max-w-[280px]">
-                  So your messages show a name, not a number.
-                </p>
-              </div>
-
-              {/* Pinned CTA */}
-              <div className="shrink-0 w-full pb-10 space-y-3">
-                <a
-                  href="/nest.vcf"
-                  onClick={() => setTimeout(() => setStep(3), 800)}
-                  className="block w-full rounded-full bg-gray-900 py-3.5 text-center text-[15px] font-semibold text-white hover:bg-black transition-colors"
-                >
-                  Add to Contacts
-                </a>
-                <button
-                  onClick={() => setStep(3)}
-                  className="w-full text-[14px] text-gray-400 hover:text-gray-600 transition-colors"
-                >
-                  Skip
-                </button>
-              </div>
-            </motion.section>
-          )}
-
-          {/* ── STEP 3: PILL CAROUSEL + CONVERSATION ── */}
-          {step === 3 && (
-            <motion.section
-              key="chat"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              transition={{ duration: 0.35, ease: [0.25, 0.1, 0.25, 1] }}
-              className="flex-1 flex flex-col w-full max-w-sm"
-            >
-              {/* Heading */}
-              <div className="shrink-0 pt-3 pb-2 text-center">
-                <motion.h1
-                  className="text-[26px] font-bold tracking-tight text-gray-900"
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.5, delay: 0.1 }}
-                >
-                  You're all set
-                </motion.h1>
-                <motion.p
-                  className="text-[14px] text-gray-400 mt-0.5"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ duration: 0.5, delay: 0.2 }}
-                >
-                  Tap to explore what Nest can do.
-                </motion.p>
-              </div>
-
-              {/* Pill carousel */}
-              <motion.div
-                className="shrink-0 -mx-6 px-5 pb-3 pt-1"
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.4, delay: 0.25 }}
-              >
-                <div className="flex gap-2 overflow-x-auto no-scrollbar">
-                  {CATEGORIES.map((cat, i) => (
-                    <button
-                      key={cat.label}
-                      onClick={() => setActiveCat(i)}
-                      className={`shrink-0 flex items-center gap-1.5 rounded-full px-3.5 py-2 text-[13px] font-medium transition-all duration-200 ${
-                        activeCat === i
-                          ? 'bg-gray-900 text-white shadow-sm'
-                          : 'bg-white text-gray-600 border border-gray-200/80 hover:bg-gray-50'
-                      }`}
-                    >
-                      <span className="text-[14px]">{cat.emoji}</span>
-                      {cat.label}
-                    </button>
-                  ))}
-                </div>
-                <style>{`.no-scrollbar::-webkit-scrollbar { display: none; } .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }`}</style>
-              </motion.div>
-
-              {/* Conversation area */}
-              <div className="flex-1 min-h-0 w-full overflow-y-auto px-1">
-                <AnimatePresence mode="wait">
-                  <motion.div
-                    key={activeCat}
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ duration: 0.25, ease: 'easeOut' }}
-                    className="flex flex-col gap-2.5 py-2"
-                  >
-                    {CATEGORIES[activeCat].messages.slice(0, visibleCount).map((msg, i) => (
-                      <motion.div
-                        key={`${activeCat}-${i}`}
-                        initial={{ opacity: 0, y: 12, scale: 0.96 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        transition={{ duration: 0.35, ease: [0.16, 1, 0.3, 1] }}
-                        className={`flex w-full ${msg.type === 'user' ? 'justify-end' : 'items-end gap-2'}`}
+                    {!account.is_primary && (
+                      <button
+                        onClick={() => void handleRemoveAccount(account.id, 'google')}
+                        disabled={removing === account.id}
+                        className="shrink-0 text-[11px] text-gray-400 hover:text-red-500 transition-colors"
                       >
-                        {msg.type === 'nest' && (
-                          <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
-                        )}
-                        <div
-                          className={`max-w-[82%] rounded-[20px] px-4 py-2.5 text-[15px] leading-relaxed shadow-sm ${
-                            msg.type === 'user'
-                              ? 'bg-[#007AFF] text-white rounded-br-[4px]'
-                              : 'bg-[#E9E9EB] text-[#000000] rounded-bl-[4px]'
-                          }`}
-                        >
-                          {msg.text}
-                        </div>
-                      </motion.div>
-                    ))}
-
-                    {/* Typing indicator */}
-                    {isTyping && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, scale: 0.95 }}
-                        transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-                        className="flex items-end gap-2"
-                      >
-                        <img src="/nest-logo.png" alt="" className="h-6 w-6 rounded-full object-cover shadow-sm shrink-0" />
-                        <div className="rounded-[20px] rounded-bl-[4px] bg-[#E9E9EB] px-5 py-3.5 shadow-sm">
-                          <div className="flex gap-1.5 items-center">
-                            {[0, 1, 2].map((d) => (
-                              <motion.div
-                                key={d}
-                                className="w-[7px] h-[7px] rounded-full bg-[#8E8E93]"
-                                animate={{ y: [0, -4, 0] }}
-                                transition={{ duration: 0.6, repeat: Infinity, delay: d * 0.15, ease: 'easeInOut' }}
-                              />
-                            ))}
-                          </div>
-                        </div>
-                      </motion.div>
+                        {removing === account.id ? '...' : 'Remove'}
+                      </button>
                     )}
-                  </motion.div>
-                </AnimatePresence>
-              </div>
-
-              {/* Pinned CTA */}
-              <div className="shrink-0 w-full pb-10 pt-3">
-                <a
-                  href="sms:tlidgett@icloud.com&body=Hey%20Nest!"
-                  className="block w-full rounded-full bg-[#007AFF] py-3.5 text-center text-[15px] font-semibold text-white shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:bg-[#0071E3] transition-colors"
+                  </div>
+                ))}
+                {microsoftAccounts.map((account) => (
+                  <div key={account.id} className="flex items-center gap-3 px-4 py-2.5">
+                    {account.microsoft_avatar_url ? (
+                      <img src={account.microsoft_avatar_url} alt="" className="h-8 w-8 rounded-full shrink-0" referrerPolicy="no-referrer" />
+                    ) : (
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gray-100 text-xs font-semibold text-gray-600">
+                        {(account.microsoft_name || account.microsoft_email).charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <img src="/microsoft-icon.svg" alt="" className="h-3 w-3 shrink-0" />
+                        <p className="text-[13px] font-medium text-gray-900 truncate">
+                          {account.microsoft_name || account.microsoft_email}
+                        </p>
+                      </div>
+                      <p className="text-[11px] text-gray-400 truncate">{account.microsoft_email}</p>
+                    </div>
+                    {!account.is_primary && (
+                      <button
+                        onClick={() => void handleRemoveAccount(account.id, 'microsoft')}
+                        disabled={removing === account.id}
+                        className="shrink-0 text-[11px] text-gray-400 hover:text-red-500 transition-colors"
+                      >
+                        {removing === account.id ? '...' : 'Remove'}
+                      </button>
+                    )}
+                  </div>
+                ))}
+                <button
+                  onClick={() => setAddMenuOpen(true)}
+                  className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-gray-50 transition-colors"
                 >
-                  Open iMessage
-                </a>
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#007AFF]/10">
+                    <Plus className="h-3.5 w-3.5 text-[#007AFF]" />
+                  </div>
+                  <span className="text-[13px] font-medium text-[#007AFF]">Add another account</span>
+                </button>
               </div>
-            </motion.section>
+            </motion.div>
           )}
 
+          {activeTab === 'contact' && (
+            <motion.div
+              key="contact"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="shrink-0"
+            >
+              <p className="text-[13px] text-gray-500 mb-3">
+                Save Nest as a contact so messages show a name, not a number.
+              </p>
+              <div className="rounded-2xl bg-white border border-gray-200/60 shadow-sm overflow-hidden">
+                <div className="flex items-center gap-3.5 px-4 py-4">
+                  <img src="/nest-logo.png" alt="" className="h-12 w-12 rounded-xl shadow-sm shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[15px] font-medium text-gray-900">Nest</p>
+                    <p className="text-[12px] text-gray-400 mt-0.5">iMessage assistant</p>
+                  </div>
+                  <a
+                    href="/nest.vcf"
+                    onClick={() => setContactSaved(true)}
+                    className={cn(
+                      "shrink-0 flex items-center gap-1.5 rounded-full px-4 py-2 text-[13px] font-medium transition-all",
+                      contactSaved
+                        ? 'bg-gray-100 text-gray-400'
+                        : 'bg-gray-900 text-white active:scale-[0.96]'
+                    )}
+                  >
+                    {contactSaved ? (
+                      <><Check className="h-3.5 w-3.5" /> Saved</>
+                    ) : (
+                      <><Download className="h-3.5 w-3.5" /> Save</>
+                    )}
+                  </a>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {activeTab === 'connections' && (
+            <motion.div
+              key="connections"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="shrink-0"
+            >
+              <p className="text-[13px] text-gray-500 mb-3">
+                Connect apps to give Nest more context about your life.
+              </p>
+              <div className="rounded-2xl bg-white border border-gray-200/60 shadow-sm overflow-hidden divide-y divide-gray-100">
+                {[
+                  { name: 'Strava', desc: 'Fitness & activities', color: '#FC4C02', path: 'M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066l-2.084 4.116zm-7.98-5.743l2.615 5.157h3.064L8.22 6.672 3.033 17.358h3.065l2.31-5.157z' },
+                  { name: 'Slack', desc: 'Team messaging', color: '#4A154B', path: 'M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zm1.271 0a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zm0 1.271a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zm10.122 2.521a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zm-1.268 0a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zm-2.523 10.122a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zm0-1.268a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z' },
+                  { name: 'Notion', desc: 'Notes & docs', color: '#000000', path: 'M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L18.002 2.05c-.42-.326-.98-.7-2.055-.607L3.01 2.41c-.467.047-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.166V6.354c0-.606-.233-.933-.748-.886l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952l1.448.327s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.14c-.093-.514.28-.886.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z' },
+                ].map((app) => (
+                  <div key={app.name} className="flex items-center gap-3 px-4 py-3">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
+                      <svg viewBox="0 0 24 24" className="h-4 w-4" fill={app.color}>
+                        <path d={app.path} />
+                      </svg>
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[13px] font-medium text-gray-900">{app.name}</p>
+                      <p className="text-[11px] text-gray-400">{app.desc}</p>
+                    </div>
+                    <span className="shrink-0 text-[11px] text-gray-400 bg-gray-100 px-2 py-0.5 rounded-md">Soon</span>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          )}
         </AnimatePresence>
+
+        <div className="flex-1" />
+
+        {/* ── Bottom: CTA always visible ── */}
+        <motion.div
+          className="shrink-0 pt-4 pb-10"
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, delay: 0.12, ease: [0.25, 0.1, 0.25, 1] }}
+        >
+          <a
+            href="sms:tlidgett@icloud.com&body=Hey%20Nest!"
+            className="flex items-center justify-center gap-2 w-full rounded-full bg-[#007AFF] py-3.5 text-[15px] font-semibold text-white shadow-[0_4px_14px_rgba(0,122,255,0.25)] hover:bg-[#0071E3] active:scale-[0.98] transition-all"
+          >
+            <MessageCircle className="h-4 w-4" />
+            Open iMessage
+          </a>
+        </motion.div>
       </main>
+
+      {/* ── Add account bottom sheet ── */}
+      {addSheetMounted && (
+        <>
+          <div
+            className="fixed inset-0 z-[60]"
+            style={{
+              backgroundColor: 'rgba(0,0,0,0.3)',
+              opacity: addSheetVisible ? 1 : 0,
+              transition: 'opacity 0.3s ease-out',
+              willChange: 'opacity',
+            }}
+            onClick={() => setAddMenuOpen(false)}
+          />
+          <div
+            className="fixed bottom-0 left-0 right-0 z-[70] bg-white rounded-t-[28px] pb-[max(env(safe-area-inset-bottom,0px),16px)] px-6 pt-3"
+            style={{
+              transform: addSheetVisible ? 'translateY(0)' : 'translateY(100%)',
+              transition: 'transform 0.4s cubic-bezier(0.32, 0.72, 0, 1)',
+              willChange: 'transform',
+            }}
+            onTransitionEnd={handleAddSheetTransitionEnd}
+          >
+            <div className="flex justify-center mb-5">
+              <div className="w-9 h-[5px] rounded-full bg-gray-300" />
+            </div>
+
+            <h2 className="text-[22px] font-bold tracking-tight text-gray-900 text-center mb-1">
+              Add an account
+            </h2>
+            <p className="text-[14px] text-gray-400 text-center mb-6">
+              Choose a provider to connect
+            </p>
+
+            <div className="flex flex-col gap-3">
+              <button
+                onClick={() => { setAddMenuOpen(false); void handleAddAccount() }}
+                className="flex items-center justify-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-4 text-[16px] font-semibold shadow-sm active:scale-[0.98] transition-all"
+              >
+                <img src="/google-icon.png" alt="" className="h-5 w-5" />
+                Continue with Google
+              </button>
+              <button
+                onClick={() => { setAddMenuOpen(false); void handleAddMicrosoftAccount() }}
+                className="flex items-center justify-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-4 text-[16px] font-semibold shadow-sm active:scale-[0.98] transition-all"
+              >
+                <img src="/microsoft-icon.svg" alt="" className="h-5 w-5" />
+                Continue with Microsoft
+              </button>
+            </div>
+
+            <button
+              onClick={() => setAddMenuOpen(false)}
+              className="w-full mt-4 mb-2 text-[14px] text-gray-400 hover:text-gray-600 transition-colors py-2"
+            >
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
     </motion.div>
   )
 }

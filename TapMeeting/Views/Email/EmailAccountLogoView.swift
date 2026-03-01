@@ -59,7 +59,7 @@ struct EmailAccountLogoView: View {
             // Google's default blue globe is very small (~726 bytes at sz=128).
             // Real company favicons are significantly larger.
             guard data.count > 1000 else { return }
-            
+
             guard let nsImage = NSImage(data: data),
                   nsImage.size.width > 1 else { return }
             

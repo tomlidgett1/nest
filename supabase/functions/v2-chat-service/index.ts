@@ -46,6 +46,7 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
+
   if (req.method !== "POST") {
     return jsonResponse({ error: "method_not_allowed" }, 405);
   }
@@ -110,13 +111,14 @@ Deno.serve(async (req: Request) => {
     let richProfile: any = null;
     let userLearnings: any[] = [];
     let pdlWelcomeContext: string | undefined;
-    let connectedAccounts: Array<{ email: string; isPrimary: boolean }> = [];
+    let connectedAccounts: Array<{ email: string; isPrimary: boolean; provider: "google" | "microsoft" }> = [];
     let userTimezone = "Australia/Sydney";
     let locationCity: string | undefined;
     let totalMessageCountResult: any = { count: 0 };
     let userProfile: { name: string | null; email: string | null; phone: string | null } = { name: null, email: null, phone: null };
     let dailyBriefingData: any = null;
     let activeCommitmentsData: any = null;
+    let testingPromptEnabled = false;
 
     if (isGroup) {
       // Group mode: use conversation context from the bridge (in-memory buffer)
@@ -146,7 +148,7 @@ Deno.serve(async (req: Request) => {
       const today = new Date().toLocaleDateString("en-CA", { timeZone: _prefetchTz });
       const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString("en-CA", { timeZone: _prefetchTz });
 
-      const [recentChatResult, _userMemory, _userProfile, _richProfile, imsgUserRow, linkedAccountsResult, userLearningsResult, _totalMessageCountResult, _briefingResult, _commitmentsResult] = await Promise.all([
+      const [recentChatResult, _userMemory, _userProfile, _richProfile, imsgUserRow, linkedAccountsResult, linkedMicrosoftAccountsResult, userLearningsResult, _totalMessageCountResult, _briefingResult, _commitmentsResult] = await Promise.all([
         supabaseAdmin
           .from("v2_chat_messages")
           .select("role, content, created_at")
@@ -157,16 +159,19 @@ Deno.serve(async (req: Request) => {
         getUserMemory(userId, supabaseAdmin),
         loadUserProfile(userId),
         loadRichProfile(userId),
-        !isAppPath
-          ? supabaseAdmin
-              .from("imessage_users")
-              .select("onboard_messages")
-              .eq("user_id", userId)
-              .maybeSingle()
-          : Promise.resolve({ data: null }),
+        supabaseAdmin
+          .from("imessage_users")
+          .select("onboard_messages, testing")
+          .eq("user_id", userId)
+          .maybeSingle(),
         supabaseAdmin
           .from("user_google_accounts")
           .select("google_email, is_primary, timezone")
+          .eq("user_id", userId)
+          .order("is_primary", { ascending: false }),
+        supabaseAdmin
+          .from("user_microsoft_accounts")
+          .select("microsoft_email, is_primary")
           .eq("user_id", userId)
           .order("is_primary", { ascending: false }),
         supabaseAdmin
@@ -181,13 +186,11 @@ Deno.serve(async (req: Request) => {
           .from("v2_chat_messages")
           .select("id", { count: "exact", head: true })
           .eq("user_id", userId),
-        // Situational Awareness: daily briefing
         supabaseAdmin
           .from("v2_daily_briefing")
           .select("briefing")
           .eq("user_id", userId)
           .maybeSingle(),
-        // Situational Awareness: active commitments (next 7 days, or recent with no date)
         supabaseAdmin
           .from("v2_user_learnings")
           .select("content, target_date, expires_after, context")
@@ -206,6 +209,7 @@ Deno.serve(async (req: Request) => {
       userMemory = _userMemory;
       userProfile = _userProfile;
       richProfile = _richProfile;
+      testingPromptEnabled = !!imsgUserRow?.data?.testing;
       totalMessageCountResult = _totalMessageCountResult;
       dailyBriefingData = _briefingResult;
       activeCommitmentsData = _commitmentsResult;
@@ -217,7 +221,7 @@ Deno.serve(async (req: Request) => {
           if (onboardMessages && onboardMessages.length > 0) {
             const onboardChat = onboardMessages
               .filter((m: any) => m.content && m.content.trim().length > 0)
-              .map((m: any) => ({ role: m.role, content: m.content, created_at: null }));
+              .map((m: any) => ({ role: m.role, content: m.content, created_at: undefined }));
             recentChat = [...onboardChat, ...recentChat];
             console.log(`[chat] Seeded ${onboardChat.length} onboarding messages`);
           }
@@ -231,12 +235,26 @@ Deno.serve(async (req: Request) => {
         pdlWelcomeContext = await tryPdlEnrichment(userId, user_name);
       }
 
-      // Linked accounts + timezone
-      const accounts = linkedAccountsResult.data ?? [];
-      connectedAccounts = accounts.map((a: any) => ({
-        email: a.google_email as string,
-        isPrimary: !!a.is_primary,
-      }));
+      // Linked accounts + timezone (Google + Microsoft)
+      const googleAccounts = linkedAccountsResult.data ?? [];
+      const microsoftAccounts = linkedMicrosoftAccountsResult.data ?? [];
+      if (linkedMicrosoftAccountsResult.error) {
+        console.warn("[chat] Microsoft accounts query failed (non-blocking):", linkedMicrosoftAccountsResult.error.message);
+      }
+      connectedAccounts = [
+        ...googleAccounts.map((a: any) => ({
+          email: a.google_email as string,
+          isPrimary: !!a.is_primary,
+          provider: "google" as const,
+        })),
+        ...microsoftAccounts.map((a: any) => ({
+          email: a.microsoft_email as string,
+          isPrimary: !!a.is_primary,
+          provider: "microsoft" as const,
+        })),
+      ];
+      console.log(`[chat] Connected accounts: ${connectedAccounts.length} total (${googleAccounts.length} Google, ${microsoftAccounts.length} Microsoft)`);
+      const accounts = googleAccounts;
 
       const primaryAccount = accounts.find((a: any) => a.is_primary) ?? accounts[0];
       userTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
@@ -301,6 +319,7 @@ Deno.serve(async (req: Request) => {
       locationCity: isGroup ? undefined : locationCity,
       connectedAccounts: isGroup ? undefined : (connectedAccounts.length > 0 ? connectedAccounts : undefined),
       isGroup,
+      testing: isGroup ? false : testingPromptEnabled,
     };
 
     const realMessageCount = isGroup ? 0 : (recentChat.length);
@@ -335,7 +354,7 @@ Deno.serve(async (req: Request) => {
     // Quick synchronous route to determine if tools will be used.
     // If agent path AND iMessage source, stream an ack first via NDJSON.
 
-    const quickRoute = routeMessage(message, nestUser);
+    const quickRoute = routeMessage(message, nestUser, recentChat);
     const needsAck = !isAppPath && quickRoute.path === "agent";
 
     if (needsAck) {
@@ -430,7 +449,7 @@ Deno.serve(async (req: Request) => {
               }).then(() => {}).catch((e: unknown) => console.error("[debug] Trace write failed:", e));
             }
 
-            const totalMessages = (totalMessageCountResult.count ?? recentChatResult.data?.length ?? 0) + 2;
+            const totalMessages = (totalMessageCountResult.count ?? recentChat.length ?? 0) + 2;
             updateMemory(
               userId, totalMessages,
               [...recentChat, { role: "user", content: message }, { role: "assistant", content: fullText }],

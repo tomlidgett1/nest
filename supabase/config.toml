@@ -318,6 +318,16 @@ skip_nonce_check = false
 # If enabled, it will allow the user to successfully authenticate when the provider does not return an email address.
 email_optional = false
 
+[auth.external.azure]
+enabled = true
+client_id = "env(SUPABASE_AUTH_EXTERNAL_AZURE_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_EXTERNAL_AZURE_SECRET)"
+redirect_uri = ""
+# Use "common" tenant to allow any Microsoft account (personal + work/school)
+url = "https://login.microsoftonline.com/common"
+skip_nonce_check = false
+email_optional = false
+
 # Allow Solana wallet holders to sign in to your project via the Sign in with Solana (SIWS, EIP-4361) standard.
 # You can configure "web3" rate limit in the [auth.rate_limit] section and set up [auth.captcha] if self-hosting.
 [auth.web3.solana]
@@ -413,6 +423,18 @@ verify_jwt = false
 verify_jwt = false
 
 [functions.v2-chat]
+verify_jwt = false
+
+[functions.microsoft-token-broker]
+verify_jwt = false
+
+[functions.sms-inbound]
+verify_jwt = false
+
+[functions.sms-status]
+verify_jwt = false
+
+[functions.v2-trigger]
 verify_jwt = false
 
 [functions.v2-chat-service]

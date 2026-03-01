@@ -1,8 +1,8 @@
-// profile-builder v2 — Deep user profiling from Gmail, Calendar, PDL, and web.
+// profile-builder v4 — Maximum-depth user profiling
 //
-// Scans sent emails (voice, frustrations, preferences), received emails (topics,
-// contacts, travel bookings), calendar (patterns, collaborators), and web
-// (company, LinkedIn) to build a rich psychological + professional profile.
+// Scans 6-12 months of Gmail across 30+ targeted query categories,
+// 6 months of calendar, PDL enrichment, and web search to build the
+// deepest possible psychological, professional, and personal profile.
 //
 // Input: { user_id: string }
 // Output: { success: true, profile: UserProfile }
@@ -11,6 +11,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   getGoogleAccessToken,
   getAllAccountTokens,
+  getAllMicrosoftAccountTokens,
   listGmailMessages,
   getGmailMessage,
 } from "../_shared/gmail-helpers.ts";
@@ -62,6 +63,7 @@ interface UserProfile {
     years_experience: number | null;
     headline: string | null;
     previous_roles: Array<{ title: string; company: string; duration: string }>;
+    job_in_context: string | null;
   };
   communication: {
     top_contacts: Array<{ name: string; email: string; frequency: string; relationship: string }>;
@@ -84,13 +86,50 @@ interface UserProfile {
     communication_style: string | null;
     decision_making: string | null;
   };
+  housing: {
+    situation: string | null;
+    location_details: string | null;
+    signals: string[];
+  };
+  family: {
+    members: Array<{ name: string; relationship: string; context: string }>;
+    family_structure: string | null;
+    signals: string[];
+  };
   life: {
     hobbies: string[];
     travel: string[];
+    travel_style: string | null;
     upcoming_events: string[];
     personal_commitments: string[];
+    side_projects: string[];
+    sports_and_fitness: string[];
+    subscriptions_and_memberships: string[];
+    food_and_dining: string[];
+    guilty_pleasures: string[];
+    secrets_and_surprises: string[];
+    pets: string[];
+    health_and_wellness: string[];
+    learning: string[];
+  };
+  fashion_and_style: {
+    clothing_brands: string[];
+    style_signals: string[];
+    notable_fashion_purchases: string[];
+  };
+  financial: {
+    spending_patterns: string[];
+    notable_purchases: string[];
+    subscriptions: string[];
+    lifestyle_tier: string | null;
+  };
+  social: {
+    inner_circle: Array<{ name: string; relationship: string; context: string }>;
+    social_style: string | null;
+    group_memberships: string[];
   };
   interests: string[];
+  hidden_gems: string[];
   summary: string;
 }
 
@@ -115,67 +154,136 @@ async function deepScanEmails(
   topContacts: Array<{ name: string; email: string; count: number }>;
   sentEmails: EmailMessage[];
   receivedEmails: EmailMessage[];
-  travelEmails: EmailMessage[];
   allMessages: EmailMessage[];
 }> {
   const queries = [
-    { q: "newer_than:14d from:me", label: "sent 2 weeks", max: 25 },
-    { q: "newer_than:30d from:me", label: "sent 30d", max: 15 },
-    { q: "newer_than:7d -from:me", label: "received 7d", max: 25 },
-    { q: "newer_than:30d is:important -from:me", label: "important 30d", max: 15 },
-    { q: "newer_than:90d (flight OR booking OR itinerary OR hotel OR airbnb OR qantas OR jetstar OR virgin OR emirates)", label: "travel", max: 10 },
-    { q: "newer_than:90d (invoice OR receipt OR subscription OR membership OR gym OR club)", label: "personal", max: 10 },
-    { q: "newer_than:30d is:starred", label: "starred", max: 10 },
+    // ── Work & general (6 months) ──
+    { q: "newer_than:30d from:me", max: 30 },
+    { q: "newer_than:180d from:me", max: 30 },
+    { q: "newer_than:14d -from:me", max: 30 },
+    { q: "newer_than:60d is:important -from:me", max: 20 },
+    { q: "newer_than:180d is:starred", max: 15 },
+
+    // ── Travel & bookings (12 months) ──
+    { q: "newer_than:365d (flight OR boarding pass OR itinerary OR e-ticket)", max: 20 },
+    { q: "newer_than:365d (hotel OR airbnb OR booking.com OR agoda OR hostelworld OR vrbo)", max: 15 },
+    { q: "newer_than:365d (qantas OR jetstar OR virgin OR emirates OR singapore airlines OR cathay OR united OR delta OR british airways OR lufthansa OR ANA OR JAL)", max: 15 },
+    { q: "newer_than:365d (first class OR business class OR premium economy OR lounge access OR priority boarding OR seat upgrade)", max: 10 },
+    { q: "newer_than:365d (loyalty OR frequent flyer OR points OR miles OR status OR platinum OR gold member)", max: 10 },
+
+    // ── Spending & purchases (6 months) ──
+    { q: "newer_than:180d (invoice OR receipt OR order confirmation OR payment received)", max: 25 },
+    { q: "newer_than:180d (subscription OR membership OR renewal OR billing)", max: 20 },
+    { q: "newer_than:365d (amazon OR ebay OR etsy OR shopify OR order shipped OR tracking number OR your order has shipped)", max: 20 },
+    { q: "newer_than:180d (uber OR lyft OR doordash OR ubereats OR deliveroo OR menulog OR grubhub OR skip the dishes)", max: 15 },
+
+    // ── Fashion & clothing (12 months) ──
+    { q: "newer_than:365d (ASOS OR Zara OR Uniqlo OR H&M OR Nike OR Adidas OR Lululemon OR Patagonia OR North Face OR Country Road OR RM Williams OR MR PORTER OR SSENSE OR Farfetch OR NET-A-PORTER)", max: 10 },
+    { q: "newer_than:365d (your order from OR order confirmation) (shirt OR pants OR shoes OR jacket OR dress OR sneakers OR boots OR suit OR tailored)", max: 10 },
+
+    // ── Property & housing (12 months) ──
+    { q: "newer_than:365d (rent OR lease OR tenancy OR landlord OR property manager OR real estate OR realestate.com OR domain.com.au OR rightmove OR zillow)", max: 10 },
+    { q: "newer_than:365d (mortgage OR home loan OR settlement OR conveyancer OR strata OR body corporate OR rates notice OR council rates)", max: 10 },
+    { q: "newer_than:365d (electricity OR gas OR water OR internet OR NBN OR broadband) (bill OR account OR statement)", max: 10 },
+    { q: "newer_than:365d (insurance OR contents insurance OR home insurance OR renters insurance OR car insurance)", max: 10 },
+
+    // ── Side projects & tech (12 months) ──
+    { q: "newer_than:365d (github OR gitlab OR bitbucket OR vercel OR netlify OR heroku OR railway OR render OR fly.io)", max: 15 },
+    { q: "newer_than:365d (aws OR digitalocean OR cloudflare OR stripe OR twilio OR sendgrid OR postmark OR infobip)", max: 10 },
+    { q: "newer_than:365d (domain registration OR SSL OR hosting OR deploy OR production OR staging)", max: 10 },
+    { q: "newer_than:365d (incorporation OR ABN OR ACN OR business registration OR company registration OR pty ltd OR LLC)", max: 5 },
+    { q: "newer_than:365d (app store OR google play OR testflight OR beta invite OR product hunt OR launch)", max: 5 },
+
+    // ── Sports, fitness, hobbies (12 months) ──
+    { q: "newer_than:365d (strava OR garmin OR fitbit OR peloton OR zwift OR myfitnesspal OR nike run club)", max: 10 },
+    { q: "newer_than:365d (gym OR crossfit OR F45 OR barry's OR orangetheory OR yoga OR pilates OR barre)", max: 10 },
+    { q: "newer_than:365d (marathon OR half marathon OR parkrun OR triathlon OR ironman OR race registration OR race confirmation)", max: 10 },
+    { q: "newer_than:365d (golf OR tennis OR cricket OR football OR soccer OR basketball OR rugby OR AFL OR surfing OR skiing OR snowboarding OR cycling OR swimming)", max: 10 },
+    { q: "newer_than:365d (team registration OR fixture OR season OR grand final OR finals OR ladder OR comp)", max: 5 },
+
+    // ── Entertainment & subscriptions (12 months) ──
+    { q: "newer_than:365d (spotify OR netflix OR disney OR stan OR binge OR apple tv OR hulu OR HBO OR paramount OR youtube premium)", max: 10 },
+    { q: "newer_than:365d (audible OR kindle OR blinkist OR medium OR substack)", max: 5 },
+    { q: "newer_than:365d (steam OR playstation OR xbox OR nintendo OR epic games OR twitch)", max: 5 },
+    { q: "newer_than:365d (eventbrite OR meetup OR tickets OR concert OR festival OR theatre OR show OR gig)", max: 10 },
+
+    // ── Family & personal relationships (12 months) ──
+    { q: "newer_than:365d (mum OR mom OR dad OR brother OR sister OR family OR parents OR grandma OR grandpa OR nan OR pop)", max: 10 },
+    { q: "newer_than:365d (surprise OR secret OR don't tell OR shhh OR birthday party OR engagement OR proposal OR anniversary OR ring)", max: 5 },
+    { q: "newer_than:365d (wedding OR registry OR bridal OR honeymoon OR engagement party)", max: 5 },
+    { q: "newer_than:365d (baby OR nursery OR pregnancy OR maternity OR paternity)", max: 5 },
+
+    // ── Health & wellness (6 months) ──
+    { q: "newer_than:180d (doctor OR dentist OR physio OR therapist OR psychologist OR chiropractor OR osteopath OR optometrist)", max: 5 },
+    { q: "newer_than:180d (prescription OR pharmacy OR chemist OR medication OR appointment confirmation)", max: 5 },
+
+    // ── Pets (12 months) ──
+    { q: "newer_than:365d (pet OR vet OR veterinary OR dog OR cat OR puppy OR kitten OR pet insurance OR pet food)", max: 5 },
+
+    // ── Learning & education (12 months) ──
+    { q: "newer_than:365d (course OR udemy OR coursera OR masterclass OR skillshare OR linkedin learning OR duolingo)", max: 10 },
+    { q: "newer_than:365d (certification OR exam OR study OR tutorial OR bootcamp OR workshop)", max: 5 },
+
+    // ── Community & volunteering (12 months) ──
+    { q: "newer_than:365d (club OR association OR volunteer OR charity OR donation OR community OR rotary OR lions)", max: 10 },
+
+    // ── Cars & transport (12 months) ──
+    { q: "newer_than:365d (car service OR rego OR registration OR mechanic OR tyres OR MOT OR roadside assist OR RACV OR NRMA)", max: 5 },
+    { q: "newer_than:365d (parking OR toll OR myki OR opal OR go card OR public transport)", max: 5 },
   ];
 
   const seenIds = new Set<string>();
   const allMessages: EmailMessage[] = [];
 
-  for (const { q, max } of queries) {
-    try {
-      const msgs = await listGmailMessages(accessToken, q, max);
-      for (const msg of msgs) {
-        if (seenIds.has(msg.id)) continue;
-        seenIds.add(msg.id);
-        try {
-          const full = await getGmailMessage(accessToken, msg.id);
-          allMessages.push({
-            from: full.from,
-            to: full.to,
-            cc: full.cc ?? "",
-            subject: full.subject,
-            snippet: full.snippet,
-            body: full.bodyPreview ?? full.snippet,
-            date: full.date,
-            is_sent: (full.from ?? "").toLowerCase().includes(userEmail.toLowerCase()),
-            labels: full.labelIds ?? [],
-          });
-        } catch { /* skip */ }
-      }
-    } catch (e) {
-      console.warn(`[profile-builder] Gmail query "${q}" failed:`, (e as Error).message);
+  // Run queries in parallel batches of 5 for speed
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < queries.length; i += BATCH_SIZE) {
+    const batch = queries.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.allSettled(
+      batch.map(async ({ q, max }) => {
+        const msgs = await listGmailMessages(accessToken, q, max);
+        const results: EmailMessage[] = [];
+        for (const msg of msgs) {
+          if (seenIds.has(msg.id)) continue;
+          seenIds.add(msg.id);
+          try {
+            const full = await getGmailMessage(accessToken, msg.id);
+            results.push({
+              from: full.from,
+              to: full.to,
+              cc: full.cc ?? "",
+              subject: full.subject,
+              snippet: full.snippet,
+              body: full.bodyPreview ?? full.snippet,
+              date: full.date,
+              is_sent: (full.from ?? "").toLowerCase().includes(userEmail.toLowerCase()),
+              labels: full.labelIds ?? [],
+            });
+          } catch { /* skip individual message */ }
+        }
+        return results;
+      }),
+    );
+    for (const r of batchResults) {
+      if (r.status === "fulfilled") allMessages.push(...r.value);
     }
   }
 
-  console.log(`[profile-builder] Scanned ${allMessages.length} unique emails`);
+  console.log(`[profile-builder] Scanned ${allMessages.length} unique emails across ${queries.length} queries`);
 
-  // Categorise
   const sentEmails = allMessages.filter((m) => m.is_sent);
   const receivedEmails = allMessages.filter((m) => !m.is_sent);
-  const travelKeywords = /flight|booking|itinerary|hotel|airbnb|qantas|jetstar|virgin|emirates|travel|trip|airport/i;
-  const travelEmails = allMessages.filter((m) =>
-    travelKeywords.test(m.subject) || travelKeywords.test(m.body),
-  );
 
   // Count contacts
   const contactCounts = new Map<string, { name: string; email: string; count: number }>();
+  const skipPatterns = /noreply|no-reply|mailer-daemon|calendar-notification|notifications@|updates@|marketing@|support@|info@|hello@|team@|billing@|donotreply|bounce/i;
   for (const msg of allMessages) {
     const addresses = [msg.from, msg.to, msg.cc].join(", ");
     const emailMatches = addresses.match(/[\w.-]+@[\w.-]+/g) ?? [];
     for (const email of emailMatches) {
       const lower = email.toLowerCase();
       if (lower === userEmail.toLowerCase()) continue;
-      if (lower.includes("noreply") || lower.includes("no-reply") || lower.includes("mailer-daemon") || lower.includes("calendar-notification")) continue;
+      if (skipPatterns.test(lower)) continue;
       const existing = contactCounts.get(lower);
       if (existing) {
         existing.count++;
@@ -192,9 +300,9 @@ async function deepScanEmails(
 
   const topContacts = [...contactCounts.values()]
     .sort((a, b) => b.count - a.count)
-    .slice(0, 15);
+    .slice(0, 30);
 
-  return { topContacts, sentEmails, receivedEmails, travelEmails, allMessages };
+  return { topContacts, sentEmails, receivedEmails, allMessages };
 }
 
 // ── Calendar Deep Scan ──────────────────────────────────────
@@ -207,22 +315,23 @@ async function deepScanCalendar(
   keyCollaborators: string[];
   recentEvents: Array<{ title: string; date: string; attendees: string[] }>;
   upcomingEvents: Array<{ title: string; date: string; attendees: string[] }>;
+  personalEvents: Array<{ title: string; date: string }>;
 }> {
   const now = new Date();
-  const threeWeeksAgo = new Date(now.getTime() - 21 * 86400000);
-  const threeWeeksAhead = new Date(now.getTime() + 21 * 86400000);
+  const sixMonthsAgo = new Date(now.getTime() - 180 * 86400000);
+  const threeMonthsAhead = new Date(now.getTime() + 90 * 86400000);
 
   try {
     const resp = await fetch(
       `https://www.googleapis.com/calendar/v3/calendars/primary/events?` +
-      `timeMin=${threeWeeksAgo.toISOString()}&timeMax=${threeWeeksAhead.toISOString()}` +
-      `&maxResults=150&singleEvents=true&orderBy=startTime`,
+      `timeMin=${sixMonthsAgo.toISOString()}&timeMax=${threeMonthsAhead.toISOString()}` +
+      `&maxResults=500&singleEvents=true&orderBy=startTime`,
       { headers: { Authorization: `Bearer ${accessToken}` } },
     );
 
     if (!resp.ok) {
       console.warn(`[profile-builder] Calendar API error: ${resp.status}`);
-      return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [] };
+      return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [], personalEvents: [] };
     }
 
     const data = await resp.json();
@@ -231,7 +340,8 @@ async function deepScanCalendar(
     const pastEvents = events.filter((e: any) => new Date(e.start?.dateTime ?? e.start?.date) < now);
     const futureEvents = events.filter((e: any) => new Date(e.start?.dateTime ?? e.start?.date) >= now);
 
-    const weeklyRate = pastEvents.length > 0 ? Math.round(pastEvents.length / 3) : null;
+    const weeks = Math.max(1, Math.round(pastEvents.length > 0 ? (now.getTime() - sixMonthsAgo.getTime()) / (7 * 86400000) : 1));
+    const weeklyRate = pastEvents.length > 0 ? Math.round(pastEvents.length / weeks) : null;
     const meetingFrequency = weeklyRate
       ? weeklyRate > 20 ? "very heavy (20+ per week)"
       : weeklyRate > 10 ? "heavy (10-20 per week)"
@@ -247,8 +357,8 @@ async function deepScanCalendar(
     const recurringMeetings = [...titleCounts.entries()]
       .filter(([_, count]) => count >= 2)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
-      .map(([title, count]) => `${title} (${count}x in 6 weeks)`);
+      .slice(0, 15)
+      .map(([title, count]) => `${title} (${count}x in 9 months)`);
 
     const attendeeCounts = new Map<string, number>();
     for (const e of events) {
@@ -259,7 +369,7 @@ async function deepScanCalendar(
     }
     const keyCollaborators = [...attendeeCounts.entries()]
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 12)
+      .slice(0, 15)
       .map(([email]) => email);
 
     const mapEvent = (e: any) => ({
@@ -268,16 +378,323 @@ async function deepScanCalendar(
       attendees: (e.attendees ?? []).filter((a: any) => !a.self).map((a: any) => a.email).slice(0, 5),
     });
 
+    const personalKeywords = /gym|workout|run|yoga|pilates|surf|golf|tennis|swim|basketball|football|cricket|dinner|lunch|drinks|birthday|anniversary|date night|movie|cinema|concert|festival|doctor|dentist|physio|vet|haircut|massage|meditation|class|lesson|training|game|match|practice|personal|family|mum|dad|brother|sister/i;
+    const personalEvents = events
+      .filter((e: any) => {
+        const title = (e.summary ?? "").toLowerCase();
+        const noAttendees = !e.attendees || e.attendees.length <= 1;
+        return noAttendees || personalKeywords.test(title);
+      })
+      .map((e: any) => ({
+        title: e.summary ?? "(no title)",
+        date: e.start?.dateTime ?? e.start?.date ?? "",
+      }));
+
     return {
       meetingFrequency,
       recurringMeetings,
       keyCollaborators,
-      recentEvents: pastEvents.slice(-20).map(mapEvent),
-      upcomingEvents: futureEvents.slice(0, 15).map(mapEvent),
+      recentEvents: pastEvents.slice(-30).map(mapEvent),
+      upcomingEvents: futureEvents.slice(0, 25).map(mapEvent),
+      personalEvents,
     };
   } catch (e) {
     console.warn(`[profile-builder] Calendar scan failed:`, (e as Error).message);
-    return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [] };
+    return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [], personalEvents: [] };
+  }
+}
+
+// Microsoft token helpers are imported from ../shared/gmail-helpers.ts
+// (refreshMicrosoftAccessToken, getAllMicrosoftAccountTokens)
+
+// ── Outlook Deep Scan (Microsoft Graph) ─────────────────────
+
+async function deepScanOutlookEmails(
+  accessToken: string,
+  userEmail: string,
+): Promise<{
+  topContacts: Array<{ name: string; email: string; count: number }>;
+  sentEmails: EmailMessage[];
+  receivedEmails: EmailMessage[];
+  allMessages: EmailMessage[];
+}> {
+  // Microsoft Graph uses $search or $filter for querying mail
+  // We use a mix of folder-based and keyword-based queries to replicate Gmail scan coverage
+  const searches = [
+    // ── Work & general ──
+    { folder: "sentitems", filter: "", top: 60, label: "sent" },
+    { folder: "inbox", filter: "", top: 60, label: "inbox" },
+
+    // ── Travel & bookings ──
+    { folder: null, search: "flight OR boarding pass OR itinerary OR e-ticket", top: 20, label: "travel-flights" },
+    { folder: null, search: "hotel OR airbnb OR booking.com OR vrbo", top: 15, label: "travel-hotels" },
+    { folder: null, search: "first class OR business class OR lounge access OR seat upgrade", top: 10, label: "travel-class" },
+    { folder: null, search: "loyalty OR frequent flyer OR points OR miles OR status", top: 10, label: "travel-loyalty" },
+
+    // ── Spending & purchases ──
+    { folder: null, search: "invoice OR receipt OR order confirmation OR payment received", top: 25, label: "purchases" },
+    { folder: null, search: "subscription OR membership OR renewal OR billing", top: 20, label: "subscriptions" },
+    { folder: null, search: "amazon OR ebay OR etsy OR order shipped OR tracking number", top: 20, label: "shopping" },
+    { folder: null, search: "uber OR lyft OR doordash OR ubereats OR deliveroo OR grubhub", top: 15, label: "delivery" },
+
+    // ── Fashion & clothing ──
+    { folder: null, search: "ASOS OR Zara OR Uniqlo OR Nike OR Adidas OR Lululemon OR Patagonia", top: 10, label: "fashion" },
+
+    // ── Property & housing ──
+    { folder: null, search: "rent OR lease OR tenancy OR landlord OR property manager OR real estate OR zillow", top: 10, label: "housing" },
+    { folder: null, search: "mortgage OR home loan OR settlement OR strata OR council rates", top: 10, label: "mortgage" },
+    { folder: null, search: "electricity OR gas OR water OR internet OR broadband bill OR statement", top: 10, label: "utilities" },
+    { folder: null, search: "insurance OR contents insurance OR home insurance OR car insurance", top: 10, label: "insurance" },
+
+    // ── Side projects & tech ──
+    { folder: null, search: "github OR gitlab OR vercel OR netlify OR heroku OR railway OR fly.io", top: 15, label: "tech" },
+    { folder: null, search: "aws OR digitalocean OR cloudflare OR stripe OR twilio OR sendgrid", top: 10, label: "cloud" },
+    { folder: null, search: "domain registration OR SSL OR hosting OR deploy OR production", top: 10, label: "hosting" },
+
+    // ── Sports, fitness, hobbies ──
+    { folder: null, search: "strava OR garmin OR fitbit OR peloton OR gym OR crossfit OR yoga", top: 10, label: "fitness" },
+    { folder: null, search: "marathon OR half marathon OR parkrun OR triathlon OR race registration", top: 10, label: "races" },
+    { folder: null, search: "golf OR tennis OR cricket OR football OR soccer OR basketball OR rugby OR surfing OR skiing", top: 10, label: "sports" },
+
+    // ── Entertainment & subscriptions ──
+    { folder: null, search: "spotify OR netflix OR disney OR apple tv OR hulu OR HBO OR youtube premium", top: 10, label: "streaming" },
+    { folder: null, search: "eventbrite OR meetup OR tickets OR concert OR festival OR theatre", top: 10, label: "events" },
+
+    // ── Family & personal ──
+    { folder: null, search: "mum OR mom OR dad OR brother OR sister OR family OR parents", top: 10, label: "family" },
+    { folder: null, search: "surprise OR secret OR birthday party OR engagement OR anniversary", top: 5, label: "secrets" },
+
+    // ── Health & wellness ──
+    { folder: null, search: "doctor OR dentist OR physio OR therapist OR appointment confirmation", top: 5, label: "health" },
+
+    // ── Pets ──
+    { folder: null, search: "pet OR vet OR veterinary OR dog OR cat OR pet insurance", top: 5, label: "pets" },
+
+    // ── Learning & education ──
+    { folder: null, search: "course OR udemy OR coursera OR masterclass OR certification OR bootcamp", top: 10, label: "learning" },
+
+    // ── Community ──
+    { folder: null, search: "club OR association OR volunteer OR charity OR donation OR community", top: 10, label: "community" },
+
+    // ── Cars & transport ──
+    { folder: null, search: "car service OR registration OR mechanic OR parking OR toll OR public transport", top: 5, label: "transport" },
+  ];
+
+  const seenIds = new Set<string>();
+  const allMessages: EmailMessage[] = [];
+  const sixMonthsAgo = new Date(Date.now() - 180 * 86400000).toISOString();
+
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < searches.length; i += BATCH_SIZE) {
+    const batch = searches.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.allSettled(
+      batch.map(async (query) => {
+        let url: string;
+        if (query.folder) {
+          // Folder-based: get recent messages from specific folder
+          url = `https://graph.microsoft.com/v1.0/me/mailFolders/${query.folder}/messages?` +
+            `$top=${query.top}&$orderby=receivedDateTime desc` +
+            `&$filter=receivedDateTime ge ${sixMonthsAgo}` +
+            `&$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime`;
+        } else {
+          // Search-based: search across all folders
+          url = `https://graph.microsoft.com/v1.0/me/messages?` +
+            `$top=${query.top}&$search="${encodeURIComponent(query.search!)}"` +
+            `&$select=id,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime`;
+        }
+
+        const resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+
+        if (!resp.ok) {
+          console.warn(`[profile-builder] Outlook query '${query.label}' failed: ${resp.status}`);
+          return [];
+        }
+
+        const data = await resp.json();
+        const messages = data.value ?? [];
+        const results: EmailMessage[] = [];
+
+        for (const msg of messages) {
+          if (seenIds.has(msg.id)) continue;
+          seenIds.add(msg.id);
+
+          const fromAddr = msg.from?.emailAddress?.address ?? "";
+          const fromName = msg.from?.emailAddress?.name ?? "";
+          const fromStr = fromName ? `${fromName} <${fromAddr}>` : fromAddr;
+
+          const toAddrs = (msg.toRecipients ?? [])
+            .map((r: any) => r.emailAddress?.name ? `${r.emailAddress.name} <${r.emailAddress.address}>` : r.emailAddress?.address ?? "")
+            .join(", ");
+
+          const ccAddrs = (msg.ccRecipients ?? [])
+            .map((r: any) => r.emailAddress?.name ? `${r.emailAddress.name} <${r.emailAddress.address}>` : r.emailAddress?.address ?? "")
+            .join(", ");
+
+          const isSent = fromAddr.toLowerCase() === userEmail.toLowerCase() ||
+            query.folder === "sentitems";
+
+          // Use bodyPreview (up to 255 chars) for snippet, body content for full
+          const bodyContent = msg.body?.content ?? "";
+          // Strip HTML tags for plain text
+          const plainBody = bodyContent.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 2000);
+
+          results.push({
+            from: fromStr,
+            to: toAddrs,
+            cc: ccAddrs,
+            subject: msg.subject ?? "",
+            snippet: msg.bodyPreview ?? "",
+            body: plainBody || msg.bodyPreview || "",
+            date: msg.receivedDateTime ?? msg.sentDateTime ?? "",
+            is_sent: isSent,
+            labels: [query.label],
+          });
+        }
+        return results;
+      }),
+    );
+
+    for (const r of batchResults) {
+      if (r.status === "fulfilled") allMessages.push(...r.value);
+    }
+  }
+
+  console.log(`[profile-builder] Outlook scan: ${allMessages.length} unique emails across ${searches.length} queries`);
+
+  const sentEmails = allMessages.filter((m) => m.is_sent);
+  const receivedEmails = allMessages.filter((m) => !m.is_sent);
+
+  // Count contacts
+  const contactCounts = new Map<string, { name: string; email: string; count: number }>();
+  const skipPatterns = /noreply|no-reply|mailer-daemon|notifications@|updates@|marketing@|support@|info@|hello@|team@|billing@|donotreply|bounce/i;
+  for (const msg of allMessages) {
+    const addresses = [msg.from, msg.to, msg.cc].join(", ");
+    const emailMatches = addresses.match(/[\w.-]+@[\w.-]+/g) ?? [];
+    for (const email of emailMatches) {
+      const lower = email.toLowerCase();
+      if (lower === userEmail.toLowerCase()) continue;
+      if (skipPatterns.test(lower)) continue;
+      const existing = contactCounts.get(lower);
+      if (existing) {
+        existing.count++;
+      } else {
+        const nameMatch = addresses.match(new RegExp(`([^<,]+?)\\s*<${email.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}>`));
+        contactCounts.set(lower, {
+          name: nameMatch?.[1]?.trim() ?? lower.split("@")[0],
+          email: lower,
+          count: 1,
+        });
+      }
+    }
+  }
+
+  const topContacts = [...contactCounts.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 30);
+
+  return { topContacts, sentEmails, receivedEmails, allMessages };
+}
+
+// ── Outlook Calendar Deep Scan (Microsoft Graph) ────────────
+
+async function deepScanOutlookCalendar(
+  accessToken: string,
+): Promise<{
+  meetingFrequency: string | null;
+  recurringMeetings: string[];
+  keyCollaborators: string[];
+  recentEvents: Array<{ title: string; date: string; attendees: string[] }>;
+  upcomingEvents: Array<{ title: string; date: string; attendees: string[] }>;
+  personalEvents: Array<{ title: string; date: string }>;
+}> {
+  const now = new Date();
+  const sixMonthsAgo = new Date(now.getTime() - 180 * 86400000);
+  const threeMonthsAhead = new Date(now.getTime() + 90 * 86400000);
+
+  try {
+    const resp = await fetch(
+      `https://graph.microsoft.com/v1.0/me/calendarView?` +
+      `startDateTime=${sixMonthsAgo.toISOString()}&endDateTime=${threeMonthsAhead.toISOString()}` +
+      `&$top=500&$orderby=start/dateTime` +
+      `&$select=subject,start,end,attendees,isAllDay,organizer`,
+      { headers: { Authorization: `Bearer ${accessToken}`, Prefer: 'outlook.timezone="UTC"' } },
+    );
+
+    if (!resp.ok) {
+      console.warn(`[profile-builder] Outlook Calendar API error: ${resp.status}`);
+      return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [], personalEvents: [] };
+    }
+
+    const data = await resp.json();
+    const events = data.value ?? [];
+
+    const pastEvents = events.filter((e: any) => new Date(e.start?.dateTime ?? e.start?.date) < now);
+    const futureEvents = events.filter((e: any) => new Date(e.start?.dateTime ?? e.start?.date) >= now);
+
+    const weeks = Math.max(1, Math.round(pastEvents.length > 0 ? (now.getTime() - sixMonthsAgo.getTime()) / (7 * 86400000) : 1));
+    const weeklyRate = pastEvents.length > 0 ? Math.round(pastEvents.length / weeks) : null;
+    const meetingFrequency = weeklyRate
+      ? weeklyRate > 20 ? "very heavy (20+ per week)"
+      : weeklyRate > 10 ? "heavy (10-20 per week)"
+      : weeklyRate > 5 ? "moderate (5-10 per week)"
+      : "light (under 5 per week)"
+      : null;
+
+    const titleCounts = new Map<string, number>();
+    for (const e of events) {
+      const title = e.subject?.trim();
+      if (title) titleCounts.set(title, (titleCounts.get(title) ?? 0) + 1);
+    }
+    const recurringMeetings = [...titleCounts.entries()]
+      .filter(([_, count]) => count >= 2)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([title, count]) => `${title} (${count}x in 9 months)`);
+
+    const attendeeCounts = new Map<string, number>();
+    for (const e of events) {
+      for (const a of e.attendees ?? []) {
+        const email = a.emailAddress?.address;
+        if (!email) continue;
+        attendeeCounts.set(email, (attendeeCounts.get(email) ?? 0) + 1);
+      }
+    }
+    const keyCollaborators = [...attendeeCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([email]) => email);
+
+    const mapEvent = (e: any) => ({
+      title: e.subject ?? "(no title)",
+      date: e.start?.dateTime ?? "",
+      attendees: (e.attendees ?? []).map((a: any) => a.emailAddress?.address).filter(Boolean).slice(0, 5),
+    });
+
+    const personalKeywords = /gym|workout|run|yoga|pilates|surf|golf|tennis|swim|basketball|football|cricket|dinner|lunch|drinks|birthday|anniversary|date night|movie|cinema|concert|festival|doctor|dentist|physio|vet|haircut|massage|meditation|class|lesson|training|game|match|practice|personal|family|mum|dad|brother|sister/i;
+    const personalEvents = events
+      .filter((e: any) => {
+        const title = (e.subject ?? "").toLowerCase();
+        const noAttendees = !e.attendees || e.attendees.length <= 1;
+        return noAttendees || personalKeywords.test(title);
+      })
+      .map((e: any) => ({
+        title: e.subject ?? "(no title)",
+        date: e.start?.dateTime ?? "",
+      }));
+
+    return {
+      meetingFrequency,
+      recurringMeetings,
+      keyCollaborators,
+      recentEvents: pastEvents.slice(-30).map(mapEvent),
+      upcomingEvents: futureEvents.slice(0, 25).map(mapEvent),
+      personalEvents,
+    };
+  } catch (e) {
+    console.warn(`[profile-builder] Outlook calendar scan failed:`, (e as Error).message);
+    return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [], personalEvents: [] };
   }
 }
 
@@ -289,12 +706,7 @@ async function searchWeb(query: string): Promise<string | null> {
     const resp = await fetch("https://api.tavily.com/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: tavilyApiKey,
-        query,
-        max_results: 3,
-        search_depth: "basic",
-      }),
+      body: JSON.stringify({ api_key: tavilyApiKey, query, max_results: 3, search_depth: "basic" }),
     });
     if (resp.ok) {
       const data = await resp.json();
@@ -326,7 +738,6 @@ async function synthesiseProfile(
     topContacts: Array<{ name: string; email: string; count: number }>;
     sentEmails: EmailMessage[];
     receivedEmails: EmailMessage[];
-    travelEmails: EmailMessage[];
     allMessages: EmailMessage[];
   },
   calendarData: {
@@ -335,24 +746,20 @@ async function synthesiseProfile(
     keyCollaborators: string[];
     recentEvents: Array<{ title: string; date: string; attendees: string[] }>;
     upcomingEvents: Array<{ title: string; date: string; attendees: string[] }>;
+    personalEvents: Array<{ title: string; date: string }>;
   },
   linkedinInfo: string | null,
 ): Promise<Record<string, any>> {
   if (!openaiApiKey) return {};
 
-  // Build rich context from actual email bodies
   const sentBodies = emailData.sentEmails
-    .slice(0, 20)
+    .slice(0, 40)
     .map((m) => `[SENT ${m.date}] To: ${m.to}\nSubject: ${m.subject}\n${m.body}`)
     .join("\n---\n");
 
   const receivedSummary = emailData.receivedEmails
-    .slice(0, 20)
+    .slice(0, 40)
     .map((m) => `[RECEIVED ${m.date}] From: ${m.from}\nSubject: ${m.subject}\n${m.snippet}`)
-    .join("\n---\n");
-
-  const travelSummary = emailData.travelEmails
-    .map((m) => `[${m.date}] ${m.subject}\n${m.body}`)
     .join("\n---\n");
 
   const calendarSummary = [
@@ -360,53 +767,117 @@ async function synthesiseProfile(
     ...calendarData.upcomingEvents.map((e) => `[UPCOMING] ${e.date}: ${e.title} (${e.attendees.join(", ")})`),
   ].join("\n");
 
-  const weeklyVolume = emailData.allMessages.filter((m) => {
-    return Date.now() - new Date(m.date).getTime() < 7 * 86400000;
-  }).length;
+  const personalCalendarSummary = calendarData.personalEvents
+    .map((e) => `${e.date}: ${e.title}`)
+    .join("\n");
+
+  const weeklyVolume = emailData.allMessages.filter((m) =>
+    Date.now() - new Date(m.date).getTime() < 7 * 86400000,
+  ).length;
 
   const context = [
     `User: ${name} (${email})`,
     pdlContext ? `\n── PROFESSIONAL PROFILE (PDL) ──\n${pdlContext}` : "",
     companyInfo ? `\n── COMPANY ──\n${companyInfo}` : "",
     linkedinInfo ? `\n── WEB/LINKEDIN ──\n${linkedinInfo}` : "",
-    `\n── SENT EMAILS (their actual words) ──\n${sentBodies || "(none found)"}`,
-    `\n── RECEIVED EMAILS ──\n${receivedSummary || "(none found)"}`,
-    travelSummary ? `\n── TRAVEL/BOOKINGS ──\n${travelSummary}` : "",
-    `\n── CALENDAR (6 weeks) ──\n${calendarSummary || "(none found)"}`,
+    `\n── SENT EMAILS (their actual words, 6-12 months) ──\n${sentBodies || "(none found)"}`,
+    `\n── RECEIVED EMAILS (6-12 months) ──\n${receivedSummary || "(none found)"}`,
+    `\n── CALENDAR (9 months) ──\n${calendarSummary || "(none found)"}`,
+    personalCalendarSummary ? `\n── PERSONAL CALENDAR EVENTS (non-work) ──\n${personalCalendarSummary}` : "",
     `\n── CONTACTS ──\n${emailData.topContacts.map((c) => `${c.name} <${c.email}> (${c.count} emails)`).join("\n")}`,
-    `\n── STATS ──\nWeekly email volume: ~${weeklyVolume} emails/week\nMeeting load: ${calendarData.meetingFrequency ?? "unknown"}\nRecurring meetings: ${calendarData.recurringMeetings.join(", ") || "none detected"}`,
+    `\n── STATS ──\nTotal emails scanned: ${emailData.allMessages.length}\nWeekly email volume: ~${weeklyVolume} emails/week\nMeeting load: ${calendarData.meetingFrequency ?? "unknown"}\nRecurring meetings: ${calendarData.recurringMeetings.join(", ") || "none detected"}`,
   ].filter(Boolean).join("\n");
 
-  console.log(`[profile-builder] LLM context: ${context.length} chars, sent emails: ${emailData.sentEmails.length}, received: ${emailData.receivedEmails.length}`);
+  const MAX_CONTEXT_CHARS = 120_000;
+  let finalContext = context;
+  if (finalContext.length > MAX_CONTEXT_CHARS) {
+    console.warn(`[profile-builder] Context too large (${finalContext.length} chars), truncating to ${MAX_CONTEXT_CHARS}`);
+    finalContext = finalContext.slice(0, MAX_CONTEXT_CHARS) + "\n\n[... truncated for length]";
+  }
 
-  const systemPrompt = `You are building a deep psychological and professional profile of a user for their AI assistant. The assistant will use this to anticipate needs, match communication style, and feel like it truly knows them.
+  console.log(`[profile-builder] LLM context: ${finalContext.length} chars (original: ${context.length}), ${emailData.allMessages.length} emails, ${calendarData.recentEvents.length + calendarData.upcomingEvents.length} cal events`);
 
-Analyse EVERYTHING provided, especially their SENT emails (their actual voice) and calendar patterns.
+  const systemPrompt = `You are building the most comprehensive profile possible of a real person for their personal AI assistant. The assistant needs to know this person as well as a close friend would — their habits, quirks, relationships, ambitions, stresses, lifestyle, and the things they'd never expect an AI to notice.
 
-Return a JSON object with these exact keys:
+You have access to 6-12 months of their email and calendar data. Your job is to be a forensic detective. Cross-reference everything. A receipt from ASOS + a calendar event "suit fitting" = they care about how they dress. An email to "kate@lidgett.net" + a booking CC'd to the same address = likely sibling or partner. A mortgage statement = they own property. Rent receipts = they rent. Utility bills reveal where they live. Flight class reveals lifestyle tier.
+
+Return a JSON object with ALL of these keys (use empty arrays/null if no evidence, NEVER fabricate):
 
 {
   "email_themes": ["5-10 specific work topics they deal with regularly"],
-  "tone_markers": ["5-8 phrases/patterns that characterise how they write, e.g. 'starts emails with Hey', 'uses Australian slang', 'signs off with Cheers', 'uses emoji sparingly', 'tends to be direct and brief'"],
-  "industry_jargon": ["5-10 industry-specific terms or acronyms they use regularly, e.g. 'WBR', 'CDS audit', 'fleet ops', 'SLA', 'NPS'"],
-  "frustrations": ["3-5 things that seem to frustrate or stress them based on email tone, repeated issues, complaints, or things they chase up on"],
-  "preferences": ["3-5 things they clearly prefer or value, e.g. 'prefers brief updates over long reports', 'likes to schedule things early', 'values punctuality'"],
-  "values": ["3-5 core values evident from their behaviour, e.g. 'team player', 'detail-oriented', 'efficiency-focused'"],
-  "communication_style": "2-3 sentences describing their overall communication personality. Are they formal or casual? Verbose or terse? Do they use humour? How do they handle conflict?",
-  "decision_making": "1-2 sentences on how they seem to make decisions: fast/slow, data-driven/intuitive, collaborative/independent",
-  "hobbies": ["any hobbies, sports, fitness activities, creative pursuits detected from emails, calendar, or subscriptions"],
-  "travel": ["any trips, destinations, flights, or travel plans detected, include dates if available"],
-  "upcoming_events": ["any notable upcoming personal or professional events: conferences, trips, deadlines, celebrations"],
-  "personal_commitments": ["any personal life signals: wedding planning, family events, health appointments, etc."],
-  "writing_style": "One detailed sentence about their writing style for emails specifically",
-  "typical_day": "3-4 sentences painting a picture of what a typical day looks like for this person",
-  "contact_relationships": [{"name": "contact name", "email": "email", "relationship": "brief description e.g. 'direct report', 'manager', 'external client', 'friend'"}],
-  "summary": "A rich 5-7 sentence profile summary. Write it as if you're briefing someone who needs to deeply understand this person: their role, how they work, what drives them, what frustrates them, their personality, and what their life looks like outside work. Be specific, vivid, and human. No generic filler."
+  "tone_markers": ["5-8 phrases/patterns that characterise how they write"],
+  "industry_jargon": ["5-10 industry-specific terms or acronyms they use"],
+  "frustrations": ["3-5 things that frustrate or stress them"],
+  "preferences": ["3-5 things they clearly prefer or value"],
+  "values": ["3-5 core values evident from behaviour"],
+  "communication_style": "2-3 sentences on their communication personality",
+  "decision_making": "1-2 sentences on how they make decisions",
+  "writing_style": "One detailed sentence about their email writing style",
+  "typical_day": "3-4 sentences painting their typical day (work + personal)",
+
+  "job_in_context": "2-3 sentences analysing what their job title + company + behaviour reveals about them as a person. What does it say that someone with this background is also doing X, Y, Z on the side? What tensions or ambitions does this reveal? This should be insightful, not just restating their title.",
+
+  "housing_situation": "What's their living situation? Own or rent? House or apartment? Evidence: mortgage emails = owns, rent/lease/tenancy emails = rents, strata/body corporate = apartment/unit, council rates = house. State clearly what the evidence suggests.",
+  "housing_location": "Where exactly do they live? Look at utility bills, property emails, delivery addresses, council names. Be as specific as possible (suburb, city, country).",
+  "housing_signals": ["specific evidence: 'mortgage statement from ANZ', 'rent payment to Ray White', 'electricity bill for 42 Smith St Ashburton', 'NBN connection at Richmond address'"],
+
+  "family_members": [{"name": "person name", "relationship": "specific: 'brother', 'sister', 'mum', 'dad', 'partner', 'wife', 'husband', 'son', 'daughter'", "context": "evidence: 'shares @lidgett.net email domain', 'CC'd on family holiday booking', 'calendar event: Dinner with Mum'"}],
+  "family_structure": "1-2 sentences: do they have siblings? Parents they're in touch with? Kids? Partner? What does the family picture look like?",
+  "family_signals": ["specific evidence for each family connection detected"],
+
+  "side_projects": ["EVERY side project, business, startup, freelance gig, or creative endeavour. Be exhaustive. Look for: domain registrations, hosting emails, business registration, app store emails, GitHub/Vercel/Stripe notifications, incorporation documents. Include the project name, what it appears to be, and evidence."],
+  "sports_and_fitness": ["specific sports, fitness routines, races, teams. e.g. 'member of F45 Richmond', 'ran Melbourne Marathon Oct 2025 (3:42)', 'plays Thursday night basketball at MSAC'"],
+  "subscriptions_and_memberships": ["EVERY subscription and membership detected. Streaming, fitness, software, coworking, clubs, professional associations. Include tier/plan if visible."],
+  "food_and_dining": ["food delivery patterns, favourite restaurants/cuisines, dietary signals, cooking interests"],
+  "guilty_pleasures": ["things they spend time/money on that they might not broadcast"],
+  "secrets_and_surprises": ["anything being planned secretly: surprise parties, proposals, secret gifts, hidden purchases"],
+  "pets": ["any pets detected: species, name if known, vet visits, pet insurance, pet food orders"],
+  "health_and_wellness": ["health signals: regular appointments, prescriptions, fitness tracking, mental health, supplements"],
+  "learning": ["courses, certifications, languages, skills they're actively learning"],
+
+  "travel_history": ["EVERY trip detected in the last 12 months with dates, destinations, accommodation, and any details"],
+  "travel_style": "How do they travel? First class or economy? Luxury hotels or hostels? Planned or spontaneous? Solo or group? Do they have airline loyalty status? What does their travel say about them?",
+
+  "clothing_brands": ["every clothing/fashion brand detected from order confirmations, receipts, or shopping emails"],
+  "style_signals": ["what their purchases say about their style: 'buys mostly streetwear', 'ordered a tailored suit', 'shops at luxury retailers', 'practical outdoor gear focus'"],
+  "notable_fashion_purchases": ["specific clothing/accessory purchases with details and amounts if visible"],
+
+  "notable_purchases": ["ALL significant purchases detected. Include amounts, dates, and what was bought. Everything from electronics to furniture to gifts to experiences."],
+  "spending_patterns": ["overall spending behaviour analysis: frugal or generous? Categories they spend most on? Impulse buyer? Budget-conscious?"],
+  "subscription_services": ["comprehensive list of every paid service/subscription with tier/plan if visible"],
+  "lifestyle_tier": "Based on ALL evidence (travel class, hotel choices, clothing brands, spending patterns, car, housing), what lifestyle tier are they? e.g. 'budget-conscious professional', 'comfortable middle-class with occasional splurges', 'high-income with luxury tastes', 'frugal despite high income'. Be specific and evidence-based.",
+
+  "inner_circle": [{"name": "person name", "relationship": "specific relationship", "context": "evidence from emails/calendar"}],
+  "social_style": "1-2 sentences on their social life",
+  "group_memberships": ["clubs, teams, associations, communities, alumni groups, coworking spaces"],
+
+  "hobbies": ["comprehensive list of ALL hobbies and interests"],
+  "upcoming_events": ["all notable upcoming events detected"],
+  "personal_commitments": ["ongoing commitments: house hunting, wedding planning, study, family care, etc."],
+  "interests": ["broader interests and passions inferred from all data"],
+
+  "hidden_gems": ["5-8 of the most surprising, specific, 'wow how does it know that' insights. These should be things that would genuinely impress the user. Cross-reference data points. Be specific with names, dates, amounts, patterns."],
+
+  "contact_relationships": [{"name": "name", "email": "email", "relationship": "specific description"}],
+  "summary": "A rich 10-12 sentence profile summary. This should read like a character study written by someone who knows them well. Cover: who they are professionally, what they're building on the side, their personality and communication style, their family situation, where and how they live, how they spend their money, what they do for fun, what's currently on their mind, what stresses them, and what makes them tick. Be vivid, specific, and reference actual evidence. No generic filler."
 }
 
-Be specific. Use actual evidence from the emails. Don't guess: if you can't determine something, omit it. But where evidence exists, go deep.`;
+DETECTIVE RULES:
+- Cross-reference EVERYTHING. Same surname in email addresses = likely family. Hotel booking + flight = trip. Recurring calendar event + no attendees = personal routine.
+- Receipts are the most honest data source. People's spending reveals their true priorities.
+- Look at email domains: shared family domains (e.g. multiple @lidgett.net addresses) reveal family members.
+- Flight confirmations reveal travel class (economy, premium economy, business, first). Hotel bookings reveal budget preferences.
+- Utility bills and property emails reveal housing situation (rent vs own) and exact location.
+- Clothing brand order confirmations reveal style and lifestyle tier.
+- Side projects are often hidden in plain sight: hosting notifications, domain emails, business registration, app store emails, payment processor notifications.
+- Calendar events with no attendees or personal keywords are gold for understanding their real life.
+- The GAP between their job title and their side activities is often the most interesting insight.
+- NEVER fabricate. Empty array is better than a guess. But where evidence exists, go DEEP.`;
 
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -414,16 +885,19 @@ Be specific. Use actual evidence from the emails. Don't guess: if you can't dete
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-4.1",
-        max_tokens: 3000,
+        model: "gpt-5.2",
+        max_completion_tokens: 10000,
         temperature: 0.3,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: context },
+          { role: "user", content: finalContext },
         ],
       }),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     if (!resp.ok) {
       const errBody = await resp.text().catch(() => "");
@@ -433,13 +907,40 @@ Be specific. Use actual evidence from the emails. Don't guess: if you can't dete
 
     const data = await resp.json();
     const content = data.choices?.[0]?.message?.content ?? "{}";
-    console.log(`[profile-builder] LLM response length: ${content.length} chars, finish_reason: ${data.choices?.[0]?.finish_reason}`);
-    return JSON.parse(content);
+    const finishReason = data.choices?.[0]?.finish_reason ?? "unknown";
+    const usage = data.usage ?? {};
+    console.log(`[profile-builder] LLM: ${content.length} chars, finish=${finishReason}, tokens: in=${usage.prompt_tokens ?? "?"} out=${usage.completion_tokens ?? "?"}`);
+
+    if (finishReason === "length") {
+      console.warn(`[profile-builder] Response truncated at max_completion_tokens`);
+    }
+
+    try {
+      const parsed = JSON.parse(content);
+      console.log(`[profile-builder] Parsed ${Object.keys(parsed).length} keys`);
+      return parsed;
+    } catch (parseErr) {
+      console.error(`[profile-builder] JSON parse failed: ${(parseErr as Error).message}. Start: ${content.slice(0, 300)}`);
+      return {};
+    }
   } catch (e) {
     console.error(`[profile-builder] Synthesis failed:`, (e as Error).message);
     return {};
   }
 }
+
+// ── Helpers ──────────────────────────────────────────────────
+
+const arr = (v: unknown): string[] => {
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === "string" && v.trim()) return [v];
+  return [];
+};
+const str = (v: unknown): string | null => {
+  if (typeof v === "string" && v.trim()) return v;
+  if (Array.isArray(v)) return v.join("; ");
+  return null;
+};
 
 // ── Main Handler ────────────────────────────────────────────
 
@@ -451,22 +952,28 @@ Deno.serve(async (req: Request) => {
   const start = Date.now();
 
   let userId: string;
+  let provider: string = "google";
   try {
     const body = await req.json();
     userId = body.user_id;
+    provider = body.provider ?? "google";
   } catch {
     return json({ error: "invalid_json" }, 400);
   }
 
   if (!userId) return json({ error: "missing_user_id" }, 400);
 
-  console.log(`[profile-builder] Starting deep profile build for ${userId}`);
+  const isMicrosoft = provider === "azure" || provider === "microsoft";
+  console.log(`[profile-builder] Starting v4 deep profile build for ${userId} (provider: ${provider})`);
 
   try {
-    const accounts = await getAllAccountTokens(admin, userId);
+    // Get account tokens based on provider
+    const googleAccounts = await getAllAccountTokens(admin, userId).catch(() => [] as AccountToken[]);
+    const microsoftAccounts = await getAllMicrosoftAccountTokens(admin, userId).catch(() => [] as AccountToken[]);
+    const accounts = [...googleAccounts, ...microsoftAccounts];
 
     if (accounts.length === 0) {
-      return json({ error: "no_google_accounts", detail: "User has no connected Google accounts" }, 400);
+      return json({ error: "no_accounts", detail: "User has no connected Google or Microsoft accounts" }, 400);
     }
 
     const { data: imsgUser } = await admin
@@ -480,38 +987,44 @@ Deno.serve(async (req: Request) => {
     const name = imsgUser?.display_name ?? "Unknown";
     const phone = imsgUser?.phone_number ?? null;
 
-    // Find the best company domain across all accounts
     const companyDomains = accounts
       .map((a) => lookupCompanyDomain(a.email))
       .filter(Boolean) as string[];
     const companyDomain = companyDomains[0] ?? null;
 
-    console.log(`[profile-builder] User: ${name} | Accounts: ${accounts.map((a) => a.email).join(", ")}`);
+    const googleEmails = new Set(googleAccounts.map((a) => a.email));
+    console.log(`[profile-builder] User: ${name} | Google: ${googleAccounts.map((a) => a.email).join(", ") || "none"} | Microsoft: ${microsoftAccounts.map((a) => a.email).join(", ") || "none"}`);
 
-    // Scan ALL connected accounts in parallel
+    // Scan ALL connected accounts in parallel (using appropriate API per provider)
     const perAccountScans = await Promise.all(
       accounts.map(async (acct) => {
-        console.log(`[profile-builder] Scanning ${acct.email}...`);
+        const isGoogleAcct = googleEmails.has(acct.email);
+        console.log(`[profile-builder] Scanning ${acct.email} (${isGoogleAcct ? "Google" : "Microsoft"})...`);
         const [emails, calendar] = await Promise.all([
-          deepScanEmails(acct.accessToken, acct.email).catch((e) => {
+          (isGoogleAcct
+            ? deepScanEmails(acct.accessToken, acct.email)
+            : deepScanOutlookEmails(acct.accessToken, acct.email)
+          ).catch((e) => {
             console.warn(`[profile-builder] Email scan failed for ${acct.email}:`, (e as Error).message);
-            return { topContacts: [], sentEmails: [], receivedEmails: [], travelEmails: [], allMessages: [] } as Awaited<ReturnType<typeof deepScanEmails>>;
+            return { topContacts: [], sentEmails: [], receivedEmails: [], allMessages: [] } as Awaited<ReturnType<typeof deepScanEmails>>;
           }),
-          deepScanCalendar(acct.accessToken).catch((e) => {
+          (isGoogleAcct
+            ? deepScanCalendar(acct.accessToken)
+            : deepScanOutlookCalendar(acct.accessToken)
+          ).catch((e) => {
             console.warn(`[profile-builder] Calendar scan failed for ${acct.email}:`, (e as Error).message);
-            return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [] } as Awaited<ReturnType<typeof deepScanCalendar>>;
+            return { meetingFrequency: null, recurringMeetings: [], keyCollaborators: [], recentEvents: [], upcomingEvents: [], personalEvents: [] } as Awaited<ReturnType<typeof deepScanCalendar>>;
           }),
         ]);
         return { acct, emails, calendar };
       }),
     );
 
-    // Merge email data across all accounts
+    // Merge email data
     const mergedEmailData = {
       topContacts: [] as Array<{ name: string; email: string; count: number }>,
       sentEmails: [] as EmailMessage[],
       receivedEmails: [] as EmailMessage[],
-      travelEmails: [] as EmailMessage[],
       allMessages: [] as EmailMessage[],
     };
 
@@ -519,28 +1032,25 @@ Deno.serve(async (req: Request) => {
     for (const { emails } of perAccountScans) {
       mergedEmailData.sentEmails.push(...emails.sentEmails);
       mergedEmailData.receivedEmails.push(...emails.receivedEmails);
-      mergedEmailData.travelEmails.push(...emails.travelEmails);
       mergedEmailData.allMessages.push(...emails.allMessages);
       for (const c of emails.topContacts) {
         const existing = contactAgg.get(c.email);
-        if (existing) {
-          existing.count += c.count;
-        } else {
-          contactAgg.set(c.email, { ...c });
-        }
+        if (existing) existing.count += c.count;
+        else contactAgg.set(c.email, { ...c });
       }
     }
     mergedEmailData.topContacts = [...contactAgg.values()]
       .sort((a, b) => b.count - a.count)
-      .slice(0, 20);
+      .slice(0, 30);
 
-    // Merge calendar data across all accounts
+    // Merge calendar data
     const mergedCalendarData = {
       meetingFrequency: null as string | null,
       recurringMeetings: [] as string[],
       keyCollaborators: [] as string[],
       recentEvents: [] as Array<{ title: string; date: string; attendees: string[] }>,
       upcomingEvents: [] as Array<{ title: string; date: string; attendees: string[] }>,
+      personalEvents: [] as Array<{ title: string; date: string }>,
     };
 
     const seenRecurring = new Set<string>();
@@ -550,11 +1060,9 @@ Deno.serve(async (req: Request) => {
     for (const { calendar } of perAccountScans) {
       mergedCalendarData.recentEvents.push(...calendar.recentEvents);
       mergedCalendarData.upcomingEvents.push(...calendar.upcomingEvents);
+      mergedCalendarData.personalEvents.push(...calendar.personalEvents);
       for (const r of calendar.recurringMeetings) {
-        if (!seenRecurring.has(r)) {
-          seenRecurring.add(r);
-          mergedCalendarData.recurringMeetings.push(r);
-        }
+        if (!seenRecurring.has(r)) { seenRecurring.add(r); mergedCalendarData.recurringMeetings.push(r); }
       }
       for (const c of calendar.keyCollaborators) {
         collabCounts.set(c, (collabCounts.get(c) ?? 0) + 1);
@@ -566,30 +1074,24 @@ Deno.serve(async (req: Request) => {
     }
 
     mergedCalendarData.keyCollaborators = [...collabCounts.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 15)
-      .map(([email]) => email);
-
-    mergedCalendarData.meetingFrequency = totalWeeklyMeetings > 20
-      ? "very heavy (20+ per week)"
+      .sort((a, b) => b[1] - a[1]).slice(0, 15).map(([e]) => e);
+    mergedCalendarData.meetingFrequency = totalWeeklyMeetings > 20 ? "very heavy (20+ per week)"
       : totalWeeklyMeetings > 10 ? "heavy (10-20 per week)"
       : totalWeeklyMeetings > 5 ? "moderate (5-10 per week)"
-      : totalWeeklyMeetings > 0 ? "light (under 5 per week)"
-      : null;
-
-    // Sort events by date
+      : totalWeeklyMeetings > 0 ? "light (under 5 per week)" : null;
     mergedCalendarData.recentEvents.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
     mergedCalendarData.upcomingEvents.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
     const emailData = mergedEmailData;
     const calendarData = mergedCalendarData;
 
+    console.log(`[profile-builder] Total: ${emailData.allMessages.length} emails (${emailData.sentEmails.length} sent), ${calendarData.recentEvents.length + calendarData.upcomingEvents.length} cal events (${calendarData.personalEvents.length} personal)`);
+
     // PDL + company info (parallel)
     const [pdlProfile, companyInfo] = await Promise.all([
       (async (): Promise<PDLProfile | null> => {
         const cached = imsgUser?.pdl_profile as PDLProfile | null;
         if (cached?.job_title) return cached;
-        // Try work email first, then personal
         for (const acct of accounts) {
           const domain = lookupCompanyDomain(acct.email);
           if (domain) {
@@ -604,30 +1106,25 @@ Deno.serve(async (req: Request) => {
         : Promise.resolve(null),
     ]);
 
-    // LinkedIn/web lookup needs PDL result (sequential)
     const webInfo = pdlProfile?.linkedin_url
       ? await searchWeb(`${name} ${pdlProfile.job_title ?? ""} ${pdlProfile.job_company_name ?? ""} professional background`)
       : name && companyDomain
       ? await searchWeb(`${name} ${companyDomain} professional background`)
       : null;
 
-    console.log(`[profile-builder] Scanned: ${emailData.allMessages.length} emails (${emailData.sentEmails.length} sent) across ${accounts.length} accounts, ${calendarData.recentEvents.length + calendarData.upcomingEvents.length} calendar events`);
-
-    // Deep LLM synthesis
+    // LLM synthesis
     const pdlContext = pdlProfile ? profileToContext(pdlProfile) : null;
-    const synthesis = await synthesiseProfile(
-      name, email, pdlContext, companyInfo,
-      emailData, calendarData, webInfo,
-    );
+    console.log(`[profile-builder] Starting LLM synthesis...`);
+    const synthesisStart = Date.now();
+    const s = await synthesiseProfile(name, email, pdlContext, companyInfo, emailData, calendarData, webInfo);
+    console.log(`[profile-builder] LLM synthesis took ${Date.now() - synthesisStart}ms, ${Object.keys(s).length} keys`);
 
     // Build profile
     const profile: UserProfile = {
       built_at: new Date().toISOString(),
-      version: 2,
+      version: 4,
       identity: {
-        name,
-        email,
-        phone,
+        name, email, phone,
         location: pdlProfile?.location_name ?? null,
         linkedin_url: pdlProfile?.linkedin_url ?? null,
       },
@@ -645,60 +1142,91 @@ Deno.serve(async (req: Request) => {
           .map((e) => ({
             title: e.title!,
             company: e.company_name!,
-            duration: e.start_date && e.end_date
-              ? `${e.start_date} – ${e.end_date}`
-              : e.start_date ?? "unknown",
+            duration: e.start_date && e.end_date ? `${e.start_date} – ${e.end_date}` : e.start_date ?? "unknown",
           })),
+        job_in_context: str(s.job_in_context),
       },
       communication: {
-        top_contacts: (synthesis.contact_relationships ?? emailData.topContacts.slice(0, 10)).map((c: any) => ({
-          name: c.name,
-          email: c.email,
+        top_contacts: (Array.isArray(s.contact_relationships) ? s.contact_relationships : emailData.topContacts.slice(0, 10)).map((c: any) => ({
+          name: c.name ?? "unknown", email: c.email ?? "",
           frequency: c.count ? (c.count > 10 ? "very frequent" : c.count > 5 ? "frequent" : "occasional") : "unknown",
           relationship: c.relationship ?? "unknown",
         })),
-        email_themes: synthesis.email_themes ?? [],
-        writing_style: synthesis.writing_style ?? null,
+        email_themes: arr(s.email_themes),
+        writing_style: str(s.writing_style),
         typical_email_volume: emailData.allMessages.length > 0
           ? (() => {
               const week = emailData.allMessages.filter((m) => Date.now() - new Date(m.date).getTime() < 7 * 86400000).length;
               return week > 50 ? "very high" : week > 20 ? "high" : week > 10 ? "moderate" : "low";
             })()
           : null,
-        tone_markers: synthesis.tone_markers ?? [],
-        industry_jargon: synthesis.industry_jargon ?? [],
+        tone_markers: arr(s.tone_markers),
+        industry_jargon: arr(s.industry_jargon),
       },
       schedule: {
         meeting_frequency: calendarData.meetingFrequency,
         recurring_meetings: calendarData.recurringMeetings,
-        typical_day_shape: synthesis.typical_day ?? null,
+        typical_day_shape: str(s.typical_day),
         key_collaborators: calendarData.keyCollaborators.slice(0, 10),
       },
       personality: {
-        frustrations: synthesis.frustrations ?? [],
-        preferences: synthesis.preferences ?? [],
-        values: synthesis.values ?? [],
-        communication_style: synthesis.communication_style ?? null,
-        decision_making: synthesis.decision_making ?? null,
+        frustrations: arr(s.frustrations),
+        preferences: arr(s.preferences),
+        values: arr(s.values),
+        communication_style: str(s.communication_style),
+        decision_making: str(s.decision_making),
+      },
+      housing: {
+        situation: str(s.housing_situation),
+        location_details: str(s.housing_location),
+        signals: arr(s.housing_signals),
+      },
+      family: {
+        members: Array.isArray(s.family_members) ? s.family_members : [],
+        family_structure: str(s.family_structure),
+        signals: arr(s.family_signals),
       },
       life: {
-        hobbies: synthesis.hobbies ?? [],
-        travel: synthesis.travel ?? [],
-        upcoming_events: synthesis.upcoming_events ?? [],
-        personal_commitments: synthesis.personal_commitments ?? [],
+        hobbies: arr(s.hobbies),
+        travel: arr(s.travel_history),
+        travel_style: str(s.travel_style),
+        upcoming_events: arr(s.upcoming_events),
+        personal_commitments: arr(s.personal_commitments),
+        side_projects: arr(s.side_projects),
+        sports_and_fitness: arr(s.sports_and_fitness),
+        subscriptions_and_memberships: arr(s.subscriptions_and_memberships),
+        food_and_dining: arr(s.food_and_dining),
+        guilty_pleasures: arr(s.guilty_pleasures),
+        secrets_and_surprises: arr(s.secrets_and_surprises),
+        pets: arr(s.pets),
+        health_and_wellness: arr(s.health_and_wellness),
+        learning: arr(s.learning),
       },
-      interests: [...(synthesis.hobbies ?? []), ...(synthesis.interests ?? [])],
-      summary: synthesis.summary ?? "",
+      fashion_and_style: {
+        clothing_brands: arr(s.clothing_brands),
+        style_signals: arr(s.style_signals),
+        notable_fashion_purchases: arr(s.notable_fashion_purchases),
+      },
+      financial: {
+        spending_patterns: arr(s.spending_patterns),
+        notable_purchases: arr(s.notable_purchases),
+        subscriptions: arr(s.subscription_services),
+        lifestyle_tier: str(s.lifestyle_tier),
+      },
+      social: {
+        inner_circle: Array.isArray(s.inner_circle) ? s.inner_circle : [],
+        social_style: str(s.social_style),
+        group_memberships: arr(s.group_memberships),
+      },
+      interests: [...arr(s.hobbies), ...arr(s.interests)],
+      hidden_gems: arr(s.hidden_gems),
+      summary: str(s.summary) ?? "",
     };
 
     // Save
     const { error: updateErr } = await admin
       .from("imessage_users")
-      .update({
-        user_profile: profile,
-        profile_built_at: profile.built_at,
-        updated_at: new Date().toISOString(),
-      })
+      .update({ user_profile: profile, profile_built_at: profile.built_at, updated_at: new Date().toISOString() })
       .eq("user_id", userId);
 
     if (updateErr) {
@@ -707,10 +1235,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const elapsed = Date.now() - start;
-    console.log(`[profile-builder] ✓ Deep profile built for ${name} in ${elapsed}ms`);
-    console.log(`[profile-builder] Summary: ${(synthesis.summary ?? "").slice(0, 300)}`);
-    console.log(`[profile-builder] Frustrations: ${(synthesis.frustrations ?? []).join(", ")}`);
-    console.log(`[profile-builder] Jargon: ${(synthesis.industry_jargon ?? []).join(", ")}`);
+    console.log(`[profile-builder] ✓ Profile v4 built for ${name} in ${elapsed}ms | ${emailData.allMessages.length} emails | ${Object.keys(s).length} synthesis keys`);
 
     return json({ success: true, profile, elapsed_ms: elapsed });
   } catch (e) {

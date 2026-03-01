@@ -82,7 +82,7 @@ async def _run() -> None:
     )
 
     # Trigger checker: polls v2-trigger every 60s for upcoming meeting preps
-    trigger_checker = TriggerChecker(config)
+    trigger_checker = TriggerChecker(config, state=state)
     trigger_task = asyncio.create_task(
         trigger_checker.run(),
         name="trigger_checker",

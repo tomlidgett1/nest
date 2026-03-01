@@ -102,8 +102,10 @@ export default function AddAccountCallback() {
           providerToken = hashParams.provider_token ?? ''
           providerRefreshToken = hashParams.provider_refresh_token ?? ''
 
+          console.log('[add-account] Hash flow: provider_token=', providerToken ? 'present' : 'MISSING', 'provider_refresh_token=', providerRefreshToken ? 'present' : 'MISSING')
+          console.log('[add-account] Hash keys:', Object.keys(hashParams).join(', '))
+
           if (at && rt) {
-            // Temporarily set session to extract tokens
             await supabase.auth.setSession({ access_token: at, refresh_token: rt })
           }
         }
@@ -118,6 +120,7 @@ export default function AddAccountCallback() {
           }
           providerToken = data.session?.provider_token ?? ''
           providerRefreshToken = data.session?.provider_refresh_token ?? ''
+          console.log('[add-account] PKCE flow: provider_token=', providerToken ? 'present' : 'MISSING', 'provider_refresh_token=', providerRefreshToken ? 'present' : 'MISSING')
         }
 
         // Last resort: check current session
@@ -125,17 +128,26 @@ export default function AddAccountCallback() {
           const { data } = await supabase.auth.getSession()
           providerToken = data.session?.provider_token ?? ''
           providerRefreshToken = data.session?.provider_refresh_token ?? ''
+          console.log('[add-account] Session fallback: provider_token=', providerToken ? 'present' : 'MISSING', 'provider_refresh_token=', providerRefreshToken ? 'present' : 'MISSING')
         }
+
+        console.log('[add-account] Final tokens: provider_token=', providerToken ? `present (${providerToken.length}c)` : 'MISSING', 'provider_refresh_token=', providerRefreshToken ? `present (${providerRefreshToken.length}c)` : 'MISSING')
 
         if (!providerToken) {
           setStatus('error')
-          setErrorMessage('Could not get Google account tokens. Please try again.')
+          setErrorMessage('Could not get account tokens. Please try again.')
           return
         }
 
         if (cancelled) return
 
-        const res = await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts/add-callback`, {
+        // Detect provider from the session that was just established
+        const { data: sessionData } = await supabase.auth.getSession()
+        const authProvider = sessionData.session?.user?.app_metadata?.provider ?? 'google'
+        const isMicrosoft = authProvider === 'azure'
+        const callbackPath = isMicrosoft ? 'add-microsoft-callback' : 'add-callback'
+
+        const res = await fetch(`${SUPABASE_URL}/functions/v1/manage-google-accounts/${callbackPath}`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -155,10 +167,10 @@ export default function AddAccountCallback() {
         if (!data.success) {
           if (data.error === 'email_conflict') {
             setStatus('error')
-            setErrorMessage(data.detail ?? 'This Google account is already linked to a different Nest user.')
+            setErrorMessage(data.detail ?? 'This account is already linked to a different Nest user.')
           } else if (data.error === 'no_refresh_token') {
             setStatus('error')
-            setErrorMessage('Google did not provide a refresh token. Revoke Nest access at myaccount.google.com and try again.')
+            setErrorMessage(data.hint ?? 'Provider did not issue a refresh token. Please revoke Nest access and try again.')
           } else {
             setStatus('error')
             setErrorMessage(data.error ?? 'Failed to link account.')
@@ -227,7 +239,7 @@ export default function AddAccountCallback() {
                 animate={{ opacity: 1 }}
                 transition={{ duration: 0.4, delay: 0.2 }}
               >
-                Connecting your additional Google account.
+                Connecting your additional account.
               </motion.p>
             </motion.div>
           )}

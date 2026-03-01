@@ -11,7 +11,7 @@ import { Calendar, Users, Plane, Sparkles, Bell, Zap, ChevronRight } from 'lucid
 const ONBOARD_URL = import.meta.env.VITE_ONBOARD_FUNCTION_URL
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 
-const SCOPES = [
+const GOOGLE_SCOPES = [
   'email',
   'profile',
   'https://www.googleapis.com/auth/calendar',
@@ -21,6 +21,8 @@ const SCOPES = [
   'https://www.googleapis.com/auth/contacts.readonly',
   'https://www.googleapis.com/auth/contacts.other.readonly',
 ].join(' ')
+
+const MS_SCOPES = 'openid email offline_access User.Read Calendars.ReadWrite Mail.ReadWrite Mail.Send Contacts.Read Files.Read.All'
 
 const springSnappy = { type: 'spring' as const, stiffness: 500, damping: 35 }
 
@@ -165,7 +167,31 @@ export default function Welcome() {
   const [mobileTyping, setMobileTyping] = useState(false)
   const [desktopTyping, setDesktopTyping] = useState(false)
   const [contactAdded, setContactAdded] = useState(false)
+  const [showSignInSheet, setShowSignInSheet] = useState(false)
+  const [sheetMounted, setSheetMounted] = useState(false)
+  const [sheetVisible, setSheetVisible] = useState(false)
   const chatScrollRef = useRef<HTMLDivElement>(null)
+
+  // Native bottom sheet: mount first at translateY(100%), then animate in on next frame
+  useEffect(() => {
+    if (showSignInSheet) {
+      setSheetMounted(true)
+      // Wait for mount paint, then trigger the CSS transition
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setSheetVisible(true)
+        })
+      })
+    } else {
+      setSheetVisible(false)
+    }
+  }, [showSignInSheet])
+
+  const handleSheetTransitionEnd = useCallback(() => {
+    if (!showSignInSheet) {
+      setSheetMounted(false)
+    }
+  }, [showSignInSheet])
 
   useEffect(() => {
     if (chatScrollRef.current) {
@@ -270,13 +296,20 @@ export default function Welcome() {
       provider: 'google',
       options: {
         redirectTo: `${window.location.origin}/callback`,
-        // New users from iMessage need full API scopes for Google Workspace access.
-        // Returning users (no token) only need basic login scopes — their
-        // Google API tokens are already stored from original onboarding.
-        scopes: token ? SCOPES : 'email profile',
-        queryParams: token
-          ? { access_type: 'offline', prompt: 'consent' }
-          : {},
+        scopes: GOOGLE_SCOPES,
+        queryParams: { access_type: 'offline', prompt: 'consent' },
+      },
+    })
+  }, [token])
+
+  const handleMicrosoftLogin = useCallback(async () => {
+    if (token) sessionStorage.setItem('nest_imessage_token', token)
+    await supabase.auth.signInWithOAuth({
+      provider: 'azure',
+      options: {
+        redirectTo: `${window.location.origin}/callback`,
+        scopes: token ? MS_SCOPES : 'email offline_access User.Read',
+        queryParams: { prompt: 'consent' },
       },
     })
   }, [token])
@@ -424,13 +457,23 @@ export default function Welcome() {
                   <h1 className="text-[24px] font-semibold tracking-tight leading-[1.15] text-gray-900 mb-1">
                     Verify you're human
                   </h1>
-                  <p className="text-[15px] text-gray-500 mb-4">Quick Google sign-in so Nest can access your calendar, emails, and contacts.</p>
-                  <button
-                    onClick={handleLogin}
-                    className="flex items-center justify-center gap-2.5 w-full bg-[#007AFF] text-white rounded-full py-3.5 text-[17px] font-semibold tracking-wide shadow-[0_4px_14px_rgba(0,122,255,0.3)] hover:opacity-90 active:scale-[0.98] transition-all"
-                  >
-                    Verify
-                  </button>
+                  <p className="text-[15px] text-gray-500 mb-4">Quick sign-in so Nest can access your calendar, emails, and contacts.</p>
+                  <div className="flex flex-col gap-2.5">
+                    <button
+                      onClick={handleLogin}
+                      className="flex items-center justify-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-4 text-[16px] font-semibold shadow-sm active:scale-[0.98] transition-all"
+                    >
+                      <img src="/google-icon.png" alt="" className="h-5 w-5" />
+                      Continue with Google
+                    </button>
+                    <button
+                      onClick={handleMicrosoftLogin}
+                      className="flex items-center justify-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-4 text-[16px] font-semibold shadow-sm active:scale-[0.98] transition-all"
+                    >
+                      <img src="/microsoft-icon.svg" alt="" className="h-5 w-5" />
+                      Continue with Microsoft
+                    </button>
+                  </div>
                 </motion.div>
               )}
             </AnimatePresence>
@@ -462,7 +505,7 @@ export default function Welcome() {
                 Open in iMessage
               </a>
               <button
-                onClick={handleLogin}
+                onClick={() => setShowSignInSheet(true)}
                 className="mt-2 w-full text-[13px] text-gray-400 hover:text-gray-600 transition-colors"
               >
                 Already have an account? Sign in
@@ -470,6 +513,67 @@ export default function Welcome() {
             </>
           )}
         </div>
+
+        {/* ── Sign-in bottom sheet (mobile) — pure CSS transitions for 60fps ── */}
+        {sheetMounted && (
+          <>
+            <div
+              className="fixed inset-0 z-[60]"
+              style={{
+                backgroundColor: 'rgba(0,0,0,0.3)',
+                opacity: sheetVisible ? 1 : 0,
+                transition: 'opacity 0.3s ease-out',
+                willChange: 'opacity',
+              }}
+              onClick={() => setShowSignInSheet(false)}
+            />
+            <div
+              className="fixed bottom-0 left-0 right-0 z-[70] bg-white rounded-t-[28px] pb-[max(env(safe-area-inset-bottom,0px),16px)] px-6 pt-3"
+              style={{
+                transform: sheetVisible ? 'translateY(0)' : 'translateY(100%)',
+                transition: 'transform 0.4s cubic-bezier(0.32, 0.72, 0, 1)',
+                willChange: 'transform',
+              }}
+              onTransitionEnd={handleSheetTransitionEnd}
+            >
+              {/* Handle */}
+              <div className="flex justify-center mb-5">
+                <div className="w-9 h-[5px] rounded-full bg-gray-300" />
+              </div>
+
+              <h2 className="text-[22px] font-bold tracking-tight text-gray-900 text-center mb-1">
+                Welcome back
+              </h2>
+              <p className="text-[14px] text-gray-400 text-center mb-6">
+                Sign in with your account
+              </p>
+
+              <div className="flex flex-col gap-3">
+                <button
+                  onClick={() => { setShowSignInSheet(false); handleLogin() }}
+                  className="flex items-center justify-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-4 text-[16px] font-semibold shadow-sm active:scale-[0.98] transition-all"
+                >
+                  <img src="/google-icon.png" alt="" className="h-5 w-5" />
+                  Continue with Google
+                </button>
+                <button
+                  onClick={() => { setShowSignInSheet(false); handleMicrosoftLogin() }}
+                  className="flex items-center justify-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-4 text-[16px] font-semibold shadow-sm active:scale-[0.98] transition-all"
+                >
+                  <img src="/microsoft-icon.svg" alt="" className="h-5 w-5" />
+                  Continue with Microsoft
+                </button>
+              </div>
+
+              <button
+                onClick={() => setShowSignInSheet(false)}
+                className="w-full mt-4 mb-2 text-[14px] text-gray-400 hover:text-gray-600 transition-colors py-2"
+              >
+                Cancel
+              </button>
+            </div>
+          </>
+        )}
       </div>
 
       {/* DESKTOP VIEW */}
@@ -494,16 +598,42 @@ export default function Welcome() {
             Nest
           </motion.span>
         </div>
-        <motion.button
-          onClick={handleLogin}
-          className="rounded-full bg-gray-900 px-5 py-2 text-sm font-medium text-white shadow-sm hover:bg-black transition-colors"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.5, delay: 0.2 }}
-          whileTap={{ scale: 0.96 }}
-        >
-          Sign up
-        </motion.button>
+        <div className="relative">
+          <motion.button
+            onClick={() => setShowSignInSheet((v) => !v)}
+            className="rounded-full bg-gray-900 px-5 py-2 text-sm font-medium text-white shadow-sm hover:bg-black transition-colors"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ duration: 0.5, delay: 0.2 }}
+            whileTap={{ scale: 0.96 }}
+          >
+            Sign up
+          </motion.button>
+          <AnimatePresence>
+            {showSignInSheet && (
+              <motion.div
+                initial={{ opacity: 0, y: 8, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 8, scale: 0.96 }}
+                transition={{ duration: 0.18, ease: 'easeOut' }}
+                className="absolute right-0 top-12 z-50 w-64 rounded-2xl border border-gray-200 bg-white p-2 shadow-xl"
+              >
+                <button
+                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                  onClick={() => { setShowSignInSheet(false); handleLogin() }}
+                >
+                  <img src="/google-icon.png" alt="" className="h-4 w-4" /> Continue with Google
+                </button>
+                <button
+                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                  onClick={() => { setShowSignInSheet(false); handleMicrosoftLogin() }}
+                >
+                  <img src="/microsoft-icon.svg" alt="" className="h-4 w-4" /> Continue with Microsoft
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </header>
 
       <main className="pt-24 pb-24 lg:pt-32">
@@ -549,21 +679,33 @@ export default function Welcome() {
               </motion.p>
 
               <motion.div
-                className="flex items-center gap-4"
+                className="flex flex-col gap-3"
                 initial={{ opacity: 0, y: 12 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.6, delay: 0.7 }}
               >
-                <motion.button
-                  onClick={handleLogin}
-                  className="flex items-center justify-center gap-3 rounded-full bg-gray-900 px-7 py-3.5 text-[15px] font-medium text-white shadow-lg shadow-gray-900/15 hover:bg-black transition-all"
-                  whileTap={{ scale: 0.97 }}
-                  whileHover={{ scale: 1.02 }}
-                  transition={springSnappy}
-                >
-                  <img src="/google-icon.png" alt="" className="h-5 w-5 bg-white rounded-full p-0.5" />
-                  Get started
-                </motion.button>
+                <div className="flex items-center gap-3">
+                  <motion.button
+                    onClick={handleLogin}
+                    className="flex items-center justify-center gap-2.5 rounded-full bg-gray-900 px-6 py-3.5 text-[15px] font-medium text-white shadow-lg shadow-gray-900/15 hover:bg-black transition-all"
+                    whileTap={{ scale: 0.97 }}
+                    whileHover={{ scale: 1.02 }}
+                    transition={springSnappy}
+                  >
+                    <img src="/google-icon.png" alt="" className="h-5 w-5 bg-white rounded-full p-0.5" />
+                    Google
+                  </motion.button>
+                  <motion.button
+                    onClick={handleMicrosoftLogin}
+                    className="flex items-center justify-center gap-2.5 rounded-full bg-gray-900 px-6 py-3.5 text-[15px] font-medium text-white shadow-lg shadow-gray-900/15 hover:bg-black transition-all"
+                    whileTap={{ scale: 0.97 }}
+                    whileHover={{ scale: 1.02 }}
+                    transition={springSnappy}
+                  >
+                    <img src="/microsoft-icon.svg" alt="" className="h-5 w-5" />
+                    Microsoft
+                  </motion.button>
+                </div>
                 <motion.a
                   href="#features"
                   className="flex items-center gap-1.5 text-[15px] font-medium text-gray-500 hover:text-gray-900 transition-colors"
@@ -681,7 +823,7 @@ export default function Welcome() {
               viewport={{ once: true, margin: '-100px' }}
               transition={{ duration: 0.6, delay: 0.1 }}
             >
-              Nest connects to your Google workspace, learns your world, and handles the rest. No app to open, no interface to learn.
+              Nest connects to your Google or Microsoft workspace, learns your world, and handles the rest. No app to open, no interface to learn.
             </motion.p>
           </div>
 
@@ -722,7 +864,7 @@ export default function Welcome() {
             <div className="hidden sm:block absolute top-8 left-[15%] right-[15%] h-[2px] bg-gray-100 -z-10" />
             
             {[
-              { step: '1', title: 'Connect Google', desc: 'Sign in with your Google account to give Nest secure access.' },
+              { step: '1', title: 'Connect Account', desc: 'Sign in with Google or Microsoft to give Nest secure access.' },
               { step: '2', title: 'Add to Contacts', desc: 'Save Nest as a contact so messages arrive cleanly.' },
               { step: '3', title: 'Start Chatting', desc: 'Text Nest anything. Like having a brilliant assistant.' }
             ].map((s, i) => (
@@ -758,17 +900,30 @@ export default function Welcome() {
               Ready to meet your chief of staff?
             </h2>
             <p className="text-lg text-gray-300 mb-10 max-w-xl mx-auto relative z-10">
-              Connect your Google account and start chatting in iMessage. It takes less than 30 seconds.
+              Connect your Google or Microsoft account and start chatting in iMessage. It takes less than 30 seconds.
             </p>
-            <motion.button
-              onClick={handleLogin}
-              className="inline-flex items-center justify-center gap-3 rounded-full bg-white px-8 py-4 text-base font-medium text-gray-900 shadow-xl hover:bg-gray-50 transition-colors relative z-10"
-              whileTap={{ scale: 0.97 }}
-              whileHover={{ scale: 1.02 }}
-              transition={springSnappy}
-            >
-              Get Started Free
-            </motion.button>
+            <div className="flex items-center justify-center gap-3 relative z-10">
+              <motion.button
+                onClick={handleLogin}
+                className="inline-flex items-center justify-center gap-2.5 rounded-full bg-white px-7 py-4 text-base font-medium text-gray-900 shadow-xl hover:bg-gray-50 transition-colors"
+                whileTap={{ scale: 0.97 }}
+                whileHover={{ scale: 1.02 }}
+                transition={springSnappy}
+              >
+                <img src="/google-icon.png" alt="" className="h-5 w-5" />
+                Google
+              </motion.button>
+              <motion.button
+                onClick={handleMicrosoftLogin}
+                className="inline-flex items-center justify-center gap-2.5 rounded-full bg-white px-7 py-4 text-base font-medium text-gray-900 shadow-xl hover:bg-gray-50 transition-colors"
+                whileTap={{ scale: 0.97 }}
+                whileHover={{ scale: 1.02 }}
+                transition={springSnappy}
+              >
+                <img src="/microsoft-icon.svg" alt="" className="h-5 w-5" />
+                Microsoft
+              </motion.button>
+            </div>
           </motion.div>
         </section>
       </main>

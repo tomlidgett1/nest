@@ -12,6 +12,7 @@ import httpx
 
 from ..config import Config
 from ..sender.imessage import send_imessage
+from ..state import BridgeState
 
 logger = logging.getLogger("imessage_bridge.watcher.trigger_checker")
 
@@ -22,8 +23,9 @@ REQUEST_TIMEOUT = 30.0
 class TriggerChecker:
     """Periodically checks for meeting triggers and sends prep via iMessage."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, state: BridgeState | None = None) -> None:
         self.config = config
+        self.state = state
         self._http = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
         self._fired_event_ids: dict[str, set[str]] = {}  # user_id -> set of event_ids
         self._user_phone_cache: dict[str, str] = {}  # user_id -> phone_number
@@ -96,8 +98,13 @@ class TriggerChecker:
             for entry in messages:
                 user_id = entry.get("user_id", "")
                 message = entry.get("message", "")
+                msg_id = entry.get("message_id", "")
                 if not user_id or not message or not message.strip():
                     continue
+
+                # Register the DB message ID so the Realtime Listener skips it
+                if msg_id and self.state:
+                    self.state.sent_message_ids.add(msg_id)
 
                 phone = await self._resolve_phone(user_id)
                 if not phone:
@@ -110,6 +117,8 @@ class TriggerChecker:
                 sent = await send_imessage(phone, message)
                 if sent:
                     logger.info("Reminder sent to %s (user %s)", phone, user_id[:8])
+                    if self.state:
+                        self.state.save()
                 else:
                     logger.error("Failed to send reminder to %s", phone)
                 await asyncio.sleep(1.5)
@@ -221,6 +230,7 @@ class TriggerChecker:
             data = resp.json()
             messages: list[str] = data.get("messages", [])
             event_ids: list[str] = data.get("event_ids", [])
+            message_ids: list[str] = data.get("message_ids", [])
 
             if not messages:
                 return
@@ -233,6 +243,12 @@ class TriggerChecker:
             for eid in event_ids:
                 fired.add(eid)
 
+            # Register DB message IDs so the Realtime Listener skips them
+            if self.state:
+                for mid in message_ids:
+                    if mid:
+                        self.state.sent_message_ids.add(mid)
+
             # Prune old event IDs
             if len(fired) > 100:
                 overflow = len(fired) - 50
@@ -244,6 +260,8 @@ class TriggerChecker:
                     sent = await send_imessage(phone, msg)
                     if sent:
                         logger.info("Meeting prep sent to %s", phone)
+                        if self.state:
+                            self.state.save()
                     else:
                         logger.error("Failed to send meeting prep to %s", phone)
                     await asyncio.sleep(2.0)

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Prompt Studio</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>Prompt Studio, V2 Agent</h1>
+        <p>Only v2 agent prompts from <code>orchestrator.ts</code> and <code>personality-agent.ts</code>.</p>
+      </div>
+      <button id="refreshBtn" class="btn">Refresh</button>
+    </header>
+
+    <section class="toolbar card">
+      <input id="searchInput" class="input" placeholder="Search prompt name, file, or content..." />
+      <div class="chips">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="testing">Testing</button>
+        <button class="chip" data-filter="normal">Normal</button>
+      </div>
+      <div id="countText" class="count">0 prompts</div>
+    </section>
+
+    <main class="layout">
+      <aside class="list card">
+        <div id="promptList"></div>
+      </aside>
+
+      <section class="editor card">
+        <div class="meta">
+          <div>
+            <div id="metaName" class="meta-name">Select a prompt</div>
+            <div id="metaFile" class="meta-file"></div>
+          </div>
+          <div class="meta-actions">
+            <span id="metaVariant" class="badge"></span>
+            <button id="saveBtn" class="btn" disabled>Save</button>
+          </div>
+        </div>
+        <textarea id="editorArea" class="textarea" placeholder="Select a prompt to edit..." disabled></textarea>
+      </section>
+
+      <section class="diff card">
+        <div class="diff-header">
+          <div id="diffTitle">Testing vs Non-testing Diff</div>
+        </div>
+        <pre id="diffView" class="diff-view">Select a prompt to view pair diff.</pre>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

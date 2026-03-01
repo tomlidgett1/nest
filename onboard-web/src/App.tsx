@@ -7,6 +7,8 @@ import AddAccountCallback from './pages/AddAccountCallback'
 import Privacy from './pages/Privacy'
 import Terms from './pages/Terms'
 import DebugDashboard from './pages/DebugDashboard'
+import DeleteAccount from './pages/DeleteAccount'
+import Support from './pages/Support'
 
 export default function App() {
   const location = useLocation()
@@ -21,6 +23,8 @@ export default function App() {
         <Route path="/privacy" element={<Privacy />} />
         <Route path="/terms" element={<Terms />} />
         <Route path="/debug" element={<DebugDashboard />} />
+        <Route path="/support" element={<Support />} />
+        <Route path="/delete-account" element={<DeleteAccount />} />
       </Routes>
     </AnimatePresence>
   )

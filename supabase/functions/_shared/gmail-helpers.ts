@@ -481,6 +481,155 @@ export async function fetchCalendarTimezone(accessToken: string): Promise<string
   }
 }
 
+// ══════════════════════════════════════════════════════════════
+// MICROSOFT / OUTLOOK TOKEN HELPERS
+// ══════════════════════════════════════════════════════════════
+
+const microsoftClientId = Deno.env.get("MICROSOFT_CLIENT_ID") ?? "";
+const microsoftClientSecret = Deno.env.get("MICROSOFT_CLIENT_SECRET") ?? "";
+
+export async function refreshMicrosoftAccessToken(
+  refreshToken: string,
+): Promise<{ token: string; _newRefreshToken?: string }> {
+  const body = new URLSearchParams({
+    client_id: microsoftClientId,
+    client_secret: microsoftClientSecret,
+    refresh_token: refreshToken,
+    grant_type: "refresh_token",
+    scope: "openid email offline_access User.Read Calendars.ReadWrite Mail.ReadWrite Mail.Send Contacts.Read Files.Read.All",
+  });
+
+  const response = await fetch(
+    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body },
+  );
+
+  if (!response.ok) {
+    const detail = await response.text();
+    console.error(`[ms-token] Refresh failed (${response.status}): client_id=${microsoftClientId ? microsoftClientId.slice(0, 8) + "..." : "EMPTY"} detail=${detail.slice(0, 500)}`);
+    if (response.status === 400 && /invalid_grant/i.test(detail)) {
+      throw new Error(
+        `MICROSOFT_REAUTH_REQUIRED: Microsoft refresh token is invalid or revoked (${detail.slice(0, 300)})`,
+      );
+    }
+    throw new Error(`Microsoft token refresh failed (${response.status}): ${detail.slice(0, 300)}`);
+  }
+
+  const payload = await response.json();
+  const accessToken = payload.access_token as string;
+  if (!accessToken) {
+    throw new Error("Microsoft token refresh returned no access_token");
+  }
+
+  return {
+    token: accessToken,
+    _newRefreshToken: payload.refresh_token ?? undefined,
+  };
+}
+
+/**
+ * Get fresh access tokens for ALL linked Microsoft accounts.
+ * Mirrors getAllAccountTokens() for Google.
+ */
+export async function getAllMicrosoftAccountTokens(
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<AccountToken[]> {
+  const { data: accounts } = await supabase
+    .from("user_microsoft_accounts")
+    .select("id, microsoft_email, refresh_token, is_primary")
+    .eq("user_id", userId)
+    .order("is_primary", { ascending: false });
+
+  if (!accounts?.length) return [];
+
+  const results = await Promise.allSettled(
+    accounts.map(async (acct: any) => {
+      const result = await refreshMicrosoftAccessToken(acct.refresh_token);
+      if (result._newRefreshToken && result._newRefreshToken !== acct.refresh_token) {
+        await supabase
+          .from("user_microsoft_accounts")
+          .update({ refresh_token: result._newRefreshToken, updated_at: new Date().toISOString() })
+          .eq("id", acct.id);
+      }
+      return {
+        accountId: acct.id,
+        email: acct.microsoft_email,
+        accessToken: result.token,
+        isPrimary: !!acct.is_primary,
+      } as AccountToken;
+    }),
+  );
+
+  const tokens = results
+    .filter((r): r is PromiseFulfilledResult<AccountToken> => r.status === "fulfilled")
+    .map((r) => r.value);
+
+  for (const r of results) {
+    if (r.status === "rejected") {
+      console.warn(`[gmail-helpers] Microsoft token refresh failed for one account: ${(r.reason as Error).message}`);
+    }
+  }
+
+  return tokens;
+}
+
+/**
+ * Get a fresh access token for a specific Microsoft account by email.
+ */
+export async function getMicrosoftTokenForEmail(
+  supabase: SupabaseClient,
+  userId: string,
+  accountEmail: string,
+): Promise<{ accessToken: string; email: string } | null> {
+  const { data: acct } = await supabase
+    .from("user_microsoft_accounts")
+    .select("id, microsoft_email, refresh_token")
+    .eq("user_id", userId)
+    .eq("microsoft_email", accountEmail)
+    .maybeSingle();
+
+  if (!acct?.refresh_token) return null;
+
+  const result = await refreshMicrosoftAccessToken(acct.refresh_token);
+  if (result._newRefreshToken && result._newRefreshToken !== acct.refresh_token) {
+    await supabase
+      .from("user_microsoft_accounts")
+      .update({ refresh_token: result._newRefreshToken, updated_at: new Date().toISOString() })
+      .eq("id", acct.id);
+  }
+  return { accessToken: result.token, email: acct.microsoft_email };
+}
+
+/**
+ * Determine whether an account email belongs to a Microsoft account.
+ * Returns the provider type so callers can route to the correct API.
+ */
+export async function detectAccountProvider(
+  supabase: SupabaseClient,
+  userId: string,
+  accountEmail: string,
+): Promise<"google" | "microsoft" | null> {
+  const { data: msAcct } = await supabase
+    .from("user_microsoft_accounts")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("microsoft_email", accountEmail)
+    .maybeSingle();
+
+  if (msAcct) return "microsoft";
+
+  const { data: gAcct } = await supabase
+    .from("user_google_accounts")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("google_email", accountEmail)
+    .maybeSingle();
+
+  if (gAcct) return "google";
+  return null;
+}
+
 // ── Raw email encoding (RFC 2822 compliant) ─────────────────
 
 function plainTextToHtml(text: string): string {

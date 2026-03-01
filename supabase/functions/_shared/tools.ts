@@ -29,6 +29,9 @@ import {
   createGmailReplyDraft,
   listGmailMessages,
   getGmailMessage,
+  getAllMicrosoftAccountTokens,
+  getMicrosoftTokenForEmail,
+  detectAccountProvider,
   type AccountToken,
 } from "./gmail-helpers.ts";
 
@@ -44,6 +47,7 @@ const CALENDAR_API = "https://www.googleapis.com/calendar/v3";
 const PEOPLE_API = "https://people.googleapis.com/v1";
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
+const GRAPH_API = "https://graph.microsoft.com/v1.0/me";
 
 const FETCH_TIMEOUT_MS = 10_000;
 const DEFAULT_TZ = "Australia/Sydney";
@@ -175,6 +179,13 @@ export async function executeTool(
       });
     }
 
+    if (isMicrosoftAuthError(msg)) {
+      return JSON.stringify({
+        error: "Microsoft account access expired. Please reconnect in Settings > Accounts.",
+        error_type: "microsoft_auth",
+      });
+    }
+
     return JSON.stringify({
       error: msg,
       hint: "Tell the user you couldn't pull this up and offer to retry.",
@@ -188,6 +199,15 @@ function isGoogleAuthError(msg: string): boolean {
     msg.includes("invalid_grant") ||
     msg.includes("Google token refresh failed") ||
     msg.includes("Token has been expired or revoked")
+  );
+}
+
+function isMicrosoftAuthError(msg: string): boolean {
+  return (
+    msg.includes("MICROSOFT_REAUTH_REQUIRED") ||
+    msg.includes("Microsoft token refresh failed") ||
+    msg.includes("AADSTS") ||
+    msg.includes("InvalidAuthenticationToken")
   );
 }
 
@@ -246,6 +266,29 @@ async function resolveToken(
   return { accessToken: token, email: "primary" };
 }
 
+/**
+ * Resolve a token for an account that could be Google or Microsoft.
+ * Detects the provider from the account email, then returns the token + provider.
+ */
+async function resolveAnyToken(
+  userId: string,
+  supabase: SupabaseClient,
+  accountEmail?: string,
+): Promise<{ accessToken: string; email: string; provider: "google" | "microsoft" }> {
+  if (accountEmail) {
+    const provider = await detectAccountProvider(supabase, userId, accountEmail);
+    if (provider === "microsoft") {
+      const result = await getMicrosoftTokenForEmail(supabase, userId, accountEmail);
+      if (result) return { ...result, provider: "microsoft" };
+      throw new Error(`Microsoft account ${accountEmail} not found`);
+    }
+    const result = await getTokenForEmail(supabase, userId, accountEmail);
+    return { ...result, provider: "google" };
+  }
+  const token = await getGoogleAccessToken(supabase, userId);
+  return { accessToken: token, email: "primary", provider: "google" };
+}
+
 // ══════════════════════════════════════════════════════════════
 // CALENDAR
 // ══════════════════════════════════════════════════════════════
@@ -255,13 +298,18 @@ async function calendarLookup(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accounts = await getAllAccountTokens(supabase, userId);
   const tz = (args.time_zone as string) ?? DEFAULT_TZ;
   const { timeMin, timeMax } = resolveTimeRange(args.range as string, tz);
   const maxResults = (args.max_results as number) ?? 15;
   const query = (args.query as string)?.toLowerCase();
 
-  const params = new URLSearchParams({
+  // Query Google and Microsoft accounts in parallel
+  const [googleAccounts, msAccounts] = await Promise.all([
+    getAllAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+    getAllMicrosoftAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+  ]);
+
+  const googleParams = new URLSearchParams({
     timeMin,
     timeMax,
     maxResults: String(maxResults),
@@ -270,11 +318,11 @@ async function calendarLookup(
     timeZone: tz,
   });
 
-  const perAccount = await Promise.all(
-    accounts.map(async (acct) => {
+  const googleResults = Promise.all(
+    googleAccounts.map(async (acct) => {
       try {
         const resp = await retryFetch(
-          `${CALENDAR_API}/calendars/primary/events?${params}`,
+          `${CALENDAR_API}/calendars/primary/events?${googleParams}`,
           { headers: { Authorization: `Bearer ${acct.accessToken}` } },
         );
         if (!resp.ok) {
@@ -285,6 +333,7 @@ async function calendarLookup(
         return (data.items ?? []).map((e: any) => ({
           ...formatCalendarEvent(e, tz),
           account: acct.email,
+          provider: "google",
         }));
       } catch (e) {
         console.warn(`[tools] calendar_lookup error for ${acct.email}: ${(e as Error).message}`);
@@ -293,8 +342,41 @@ async function calendarLookup(
     }),
   );
 
+  const msResults = Promise.all(
+    msAccounts.map(async (acct) => {
+      try {
+        const msParams = new URLSearchParams({
+          startDateTime: timeMin,
+          endDateTime: timeMax,
+          $top: String(maxResults),
+          $orderby: "start/dateTime",
+          $select: "id,subject,start,end,location,body,attendees,organizer,isAllDay,webLink,recurrence,onlineMeeting,onlineMeetingUrl,isOnlineMeeting",
+        });
+        const resp = await retryFetch(
+          `${GRAPH_API}/calendarView?${msParams}`,
+          { headers: { Authorization: `Bearer ${acct.accessToken}`, Prefer: `outlook.timezone="${tz}"` } },
+        );
+        if (!resp.ok) {
+          console.warn(`[tools] calendar_lookup (MS) failed for ${acct.email} (${resp.status})`);
+          return [];
+        }
+        const data = await resp.json();
+        return (data.value ?? []).map((e: any) => ({
+          ...formatMicrosoftCalendarEvent(e, tz),
+          account: acct.email,
+          provider: "microsoft",
+        }));
+      } catch (e) {
+        console.warn(`[tools] calendar_lookup (MS) error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
+
+  const [gResults, mResults] = await Promise.all([googleResults, msResults]);
+
   const seen = new Set<string>();
-  let events = perAccount.flat().filter((e: any) => {
+  let events = [...gResults.flat(), ...mResults.flat()].filter((e: any) => {
     if (seen.has(e.event_id)) return false;
     seen.add(e.event_id);
     return true;
@@ -326,6 +408,61 @@ async function calendarLookup(
       return { ...e, status };
     })
     .sort((a: any, b: any) => new Date(a.start_iso).getTime() - new Date(b.start_iso).getTime());
+}
+
+function formatMicrosoftCalendarEvent(e: any, tz?: string): Record<string, unknown> {
+  const isAllDay = !!e.isAllDay;
+  const startRaw = isAllDay ? e.start?.dateTime?.split("T")[0] : e.start?.dateTime;
+  const endRaw = isAllDay ? e.end?.dateTime?.split("T")[0] : e.end?.dateTime;
+  const eventTz = tz ?? e.start?.timeZone ?? "UTC";
+
+  let startLocal = startRaw;
+  let endLocal = endRaw;
+  let dayLabel: string | null = null;
+
+  if (!isAllDay && startRaw) {
+    const sd = new Date(startRaw);
+    const ed = new Date(endRaw);
+    startLocal = sd.toLocaleString("en-AU", {
+      weekday: "short", day: "numeric", month: "short", year: "numeric",
+      hour: "numeric", minute: "2-digit", hour12: true,
+      timeZone: eventTz,
+    });
+    endLocal = ed.toLocaleString("en-AU", {
+      hour: "numeric", minute: "2-digit", hour12: true,
+      timeZone: eventTz,
+    });
+    dayLabel = sd.toLocaleDateString("en-AU", {
+      weekday: "long", day: "numeric", month: "long", year: "numeric",
+      timeZone: eventTz,
+    });
+  }
+
+  const attendees = (e.attendees ?? []).map((a: any) => a.emailAddress?.address).filter(Boolean);
+
+  const result: Record<string, unknown> = {
+    event_id: e.id,
+    title: e.subject ?? "(no title)",
+    start: startLocal,
+    end: endLocal,
+    start_iso: startRaw,
+    end_iso: endRaw,
+    all_day: isAllDay,
+    day: dayLabel,
+    timezone: eventTz,
+    location: e.location?.displayName ?? null,
+    description: e.body?.content ? e.body.content.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300) : null,
+    attendees,
+    organizer: e.organizer?.emailAddress?.address ?? null,
+    html_link: e.webLink ?? null,
+    recurring: !!e.recurrence,
+    response_status: null,
+  };
+
+  const meetLink = e.onlineMeetingUrl || e.onlineMeeting?.joinUrl;
+  if (meetLink) result.meet_link = meetLink;
+
+  return result;
 }
 
 /**
@@ -509,9 +646,13 @@ async function calendarCreate(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const { accessToken, email: acctEmail } = await resolveToken(userId, supabase, args.account as string | undefined);
+  const { accessToken, email: acctEmail, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
   const tz = (args.time_zone as string) ?? DEFAULT_TZ;
   const isAllDay = !!(args.all_day);
+
+  if (provider === "microsoft") {
+    return calendarCreateMicrosoft(accessToken, acctEmail, args, tz, isAllDay);
+  }
 
   const event: Record<string, unknown> = {
     summary: args.title,
@@ -522,7 +663,6 @@ async function calendarCreate(
   if (args.location) event.location = args.location;
   if (args.attendees) event.attendees = (args.attendees as string[]).map((e) => ({ email: e }));
   if (args.recurrence) event.recurrence = args.recurrence;
-  // Always add Google Meet link to calendar events
   event.conferenceData = {
     createRequest: { requestId: crypto.randomUUID(), conferenceSolutionKey: { type: "hangoutsMeet" } },
   };
@@ -555,15 +695,101 @@ async function calendarCreate(
   return result;
 }
 
+async function calendarCreateMicrosoft(
+  accessToken: string,
+  acctEmail: string,
+  args: Record<string, unknown>,
+  tz: string,
+  isAllDay: boolean,
+): Promise<unknown> {
+  const event: Record<string, unknown> = {
+    subject: args.title,
+    start: isAllDay
+      ? { dateTime: `${args.start_time}T00:00:00`, timeZone: tz }
+      : { dateTime: args.start_time, timeZone: tz },
+    end: isAllDay
+      ? { dateTime: `${args.end_time}T00:00:00`, timeZone: tz }
+      : { dateTime: args.end_time, timeZone: tz },
+    isAllDay,
+    isOnlineMeeting: true,
+    onlineMeetingProvider: "teamsForBusiness",
+  };
+  if (args.description) event.body = { contentType: "text", content: args.description };
+  if (args.location) event.location = { displayName: args.location };
+  if (args.attendees) {
+    event.attendees = (args.attendees as string[]).map((email) => ({
+      emailAddress: { address: email },
+      type: "required",
+    }));
+  }
+
+  const resp = await retryFetch(
+    `${GRAPH_API}/events`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(event),
+    },
+  );
+  if (!resp.ok) throw new Error(`Microsoft calendar create failed (${resp.status})`);
+
+  const created = await resp.json();
+  const result: Record<string, unknown> = {
+    event_id: created.id,
+    status: "created",
+    title: created.subject,
+    html_link: created.webLink ?? null,
+    account: acctEmail,
+    provider: "microsoft",
+    _confirmation: `Calendar event "${created.subject}" created successfully. Confirm this to the user.`,
+  };
+  const meetLink = created.onlineMeeting?.joinUrl;
+  if (meetLink) result.meet_link = meetLink;
+  return result;
+}
+
 async function calendarUpdate(
   userId: string,
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
+  const { accessToken, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
   const tz = (args.time_zone as string) ?? DEFAULT_TZ;
-  const patch: Record<string, unknown> = {};
 
+  if (provider === "microsoft") {
+    const msPatch: Record<string, unknown> = {};
+    if (args.title) msPatch.subject = args.title;
+    if (args.description) msPatch.body = { contentType: "text", content: args.description };
+    if (args.location) msPatch.location = { displayName: args.location };
+    if (args.start_time) msPatch.start = { dateTime: args.start_time, timeZone: tz };
+    if (args.end_time) msPatch.end = { dateTime: args.end_time, timeZone: tz };
+    if (args.attendees) {
+      msPatch.attendees = (args.attendees as string[]).map((email) => ({
+        emailAddress: { address: email }, type: "required",
+      }));
+    }
+
+    const resp = await retryFetch(
+      `${GRAPH_API}/events/${encodeURIComponent(args.event_id as string)}`,
+      {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify(msPatch),
+      },
+    );
+    if (!resp.ok) throw new Error(`Microsoft calendar update failed (${resp.status})`);
+    const updated = await resp.json();
+    const result: Record<string, unknown> = {
+      event_id: updated.id, status: "updated", title: updated.subject, html_link: updated.webLink ?? null,
+      provider: "microsoft",
+      _confirmation: `Calendar event "${updated.subject}" updated successfully. Confirm this to the user.`,
+    };
+    const meetLink = updated.onlineMeeting?.joinUrl;
+    if (meetLink) result.meet_link = meetLink;
+    return result;
+  }
+
+  const patch: Record<string, unknown> = {};
   if (args.title) patch.summary = args.title;
   if (args.description) patch.description = args.description;
   if (args.location) patch.location = args.location;
@@ -610,7 +836,17 @@ async function calendarDelete(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
+  const { accessToken, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
+
+  if (provider === "microsoft") {
+    const resp = await retryFetch(
+      `${GRAPH_API}/events/${encodeURIComponent(args.event_id as string)}`,
+      { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}` } },
+    );
+    if (!resp.ok && resp.status !== 404) throw new Error(`Microsoft calendar delete failed (${resp.status})`);
+    return { event_id: args.event_id, status: "deleted", provider: "microsoft", _confirmation: "Calendar event deleted successfully. Confirm this to the user." };
+  }
+
   const calId = (args.calendar_id as string) ?? "primary";
   const qp = new URLSearchParams();
   if (args.send_updates) qp.set("sendUpdates", args.send_updates as string);
@@ -1026,21 +1262,25 @@ async function contactsSearch(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accounts = await getAllAccountTokens(supabase, userId);
   const query = (args.query as string) ?? "";
   const limit = (args.limit as number) ?? 10;
   const readMask = "names,emailAddresses,phoneNumbers,organizations";
 
-  for (const acct of accounts) {
+  const [googleAccounts, msAccounts] = await Promise.all([
+    getAllAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+    getAllMicrosoftAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+  ]);
+
+  for (const acct of googleAccounts) {
     ensureContactsWarmup(acct.accessToken, `${userId}:${acct.accountId}`);
   }
-  const anyPending = accounts.some(
+  const anyPending = googleAccounts.some(
     (acct) => contactsWarmupState.get(`${userId}:${acct.accountId}`) === "pending",
   );
   if (anyPending) await new Promise((r) => setTimeout(r, 1200));
 
-  const perAccount = await Promise.all(
-    accounts.map(async (acct) => {
+  const googleResults = Promise.all(
+    googleAccounts.map(async (acct) => {
       try {
         const resp = await retryFetch(
           `${PEOPLE_API}/people:searchContacts?query=${encodeURIComponent(query)}&readMask=${readMask}&pageSize=${limit}`,
@@ -1054,6 +1294,7 @@ async function contactsSearch(
         return (data.results ?? []).map((r: any) => ({
           ...formatContact(r.person),
           account: acct.email,
+          provider: "google",
         }));
       } catch (e) {
         console.warn(`[tools] contacts_search error for ${acct.email}: ${(e as Error).message}`);
@@ -1062,8 +1303,44 @@ async function contactsSearch(
     }),
   );
 
+  const msResults = Promise.all(
+    msAccounts.map(async (acct) => {
+      try {
+        const params = new URLSearchParams({
+          $search: `"${query}"`,
+          $top: String(limit),
+          $select: "id,displayName,emailAddresses,phones,companyName,jobTitle",
+        });
+        const resp = await retryFetch(
+          `${GRAPH_API}/contacts?${params}`,
+          { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+        );
+        if (!resp.ok) {
+          console.warn(`[tools] contacts_search (MS) failed for ${acct.email} (${resp.status})`);
+          return [];
+        }
+        const data = await resp.json();
+        return (data.value ?? []).map((c: any) => ({
+          resource_name: c.id,
+          name: c.displayName ?? null,
+          email: c.emailAddresses?.[0]?.address ?? null,
+          phone: c.phones?.[0]?.number ?? null,
+          organization: c.companyName ?? null,
+          job_title: c.jobTitle ?? null,
+          account: acct.email,
+          provider: "microsoft",
+        }));
+      } catch (e) {
+        console.warn(`[tools] contacts_search (MS) error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
+
+  const [gResults, mResults] = await Promise.all([googleResults, msResults]);
+
   const seen = new Set<string>();
-  return perAccount.flat().filter((c: any) => {
+  return [...gResults.flat(), ...mResults.flat()].filter((c: any) => {
     const key = c.email?.toLowerCase() ?? c.name?.toLowerCase() ?? JSON.stringify(c);
     if (seen.has(key)) return false;
     seen.add(key);
@@ -1076,8 +1353,12 @@ async function contactsManage(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
+  const { accessToken, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
   const action = args.action as string;
+
+  if (provider === "microsoft") {
+    return contactsManageMicrosoft(accessToken, action, args);
+  }
 
   switch (action) {
     case "get": {
@@ -1130,6 +1411,97 @@ async function contactsManage(
   }
 }
 
+async function contactsManageMicrosoft(
+  accessToken: string,
+  action: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  switch (action) {
+    case "get": {
+      const contactId = args.resource_name as string;
+      const resp = await retryFetch(
+        `${GRAPH_API}/contacts/${encodeURIComponent(contactId)}?$select=id,displayName,emailAddresses,phones,companyName,jobTitle,homeAddress,businessAddress,birthday,personalNotes`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+      if (!resp.ok) throw new Error(`Microsoft contact get failed (${resp.status})`);
+      const c = await resp.json();
+      return {
+        resource_name: c.id,
+        name: c.displayName ?? null,
+        email: c.emailAddresses?.[0]?.address ?? null,
+        phone: c.phones?.[0]?.number ?? null,
+        organization: c.companyName ?? null,
+        job_title: c.jobTitle ?? null,
+        all_emails: (c.emailAddresses ?? []).map((e: any) => e.address),
+        all_phones: (c.phones ?? []).map((p: any) => p.number),
+        addresses: [c.homeAddress?.street, c.businessAddress?.street].filter(Boolean),
+        birthday: c.birthday ?? null,
+        bio: c.personalNotes ?? null,
+        urls: [],
+        provider: "microsoft",
+      };
+    }
+
+    case "list": {
+      const pageSize = (args.limit as number) ?? 20;
+      const resp = await retryFetch(
+        `${GRAPH_API}/contacts?$top=${pageSize}&$orderby=lastModifiedDateTime desc&$select=id,displayName,emailAddresses,phones,companyName,jobTitle`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+      if (!resp.ok) throw new Error(`Microsoft contacts list failed (${resp.status})`);
+      const data = await resp.json();
+      const contacts = (data.value ?? []).map((c: any) => ({
+        resource_name: c.id,
+        name: c.displayName ?? null,
+        email: c.emailAddresses?.[0]?.address ?? null,
+        phone: c.phones?.[0]?.number ?? null,
+        organization: c.companyName ?? null,
+        job_title: c.jobTitle ?? null,
+        provider: "microsoft",
+      }));
+      return { contacts, total: contacts.length };
+    }
+
+    case "create": {
+      const body: Record<string, unknown> = {};
+      if (args.given_name) body.givenName = args.given_name;
+      if (args.family_name) body.surname = args.family_name;
+      if (args.given_name || args.family_name) {
+        body.displayName = [args.given_name, args.family_name].filter(Boolean).join(" ");
+      }
+      if (args.emails) {
+        body.emailAddresses = (args.emails as string[]).map((e) => ({ address: e }));
+      }
+      if (args.phones) {
+        body.phones = (args.phones as string[]).map((p) => ({ number: p, type: "mobile" }));
+      }
+      if (args.organization) body.companyName = args.organization;
+      if (args.job_title) body.jobTitle = args.job_title;
+
+      const resp = await retryFetch(
+        `${GRAPH_API}/contacts`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!resp.ok) throw new Error(`Microsoft contact create failed (${resp.status})`);
+      const created = await resp.json();
+      return {
+        status: "created",
+        resource_name: created.id,
+        name: created.displayName ?? null,
+        email: created.emailAddresses?.[0]?.address ?? null,
+        provider: "microsoft",
+      };
+    }
+
+    default:
+      return { error: `Unknown contacts action: ${action}` };
+  }
+}
+
 function formatContact(person: any): Record<string, unknown> {
   const name = person.names?.[0];
   const email = person.emailAddresses?.[0]?.value;
@@ -1166,21 +1538,26 @@ async function gmailSearch(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accounts = await getAllAccountTokens(supabase, userId);
   const maxResults = Math.min((args.max_results as number) ?? 10, 20);
-  const perAccountMax = Math.max(Math.ceil(maxResults / accounts.length), 5);
+  const searchTz = (args.time_zone as string) ?? DEFAULT_TZ;
 
-  const perAccount = await Promise.all(
-    accounts.map(async (acct) => {
+  const [googleAccounts, msAccounts] = await Promise.all([
+    getAllAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+    getAllMicrosoftAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+  ]);
+
+  const allAccounts = googleAccounts.length + msAccounts.length;
+  const perAccountMax = Math.max(Math.ceil(maxResults / Math.max(allAccounts, 1)), 5);
+
+  const googleResults = Promise.all(
+    googleAccounts.map(async (acct) => {
       try {
         const messages = await listGmailMessages(acct.accessToken, args.query as string, perAccountMax);
         if (!messages.length) return [];
         const details = await Promise.all(
           messages.map((m: any) => getGmailMessage(acct.accessToken, m.id)),
         );
-        const searchTz = (args.time_zone as string) ?? DEFAULT_TZ;
         return details.map((d: any) => {
-          // Convert email date to user's local timezone for clarity
           let dateLocal = d.date;
           try {
             const parsed = d.internalDate ? new Date(d.internalDate) : new Date(d.date);
@@ -1199,6 +1576,7 @@ async function gmailSearch(
             body_preview: d.bodyPreview,
             has_attachments: (d.attachmentCount ?? 0) > 0,
             account: acct.email,
+            provider: "google",
           };
         });
       } catch (e) {
@@ -1208,8 +1586,20 @@ async function gmailSearch(
     }),
   );
 
-  const allResults = perAccount
-    .flat()
+  const msResults = Promise.all(
+    msAccounts.map(async (acct) => {
+      try {
+        return await searchOutlookMessages(acct.accessToken, acct.email, args.query as string, perAccountMax, searchTz);
+      } catch (e) {
+        console.warn(`[tools] gmail_search (MS) error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
+
+  const [gResults, mResults] = await Promise.all([googleResults, msResults]);
+
+  const allResults = [...gResults.flat(), ...mResults.flat()]
     .sort((a: any, b: any) => {
       const da = new Date(a.date || 0).getTime();
       const db = new Date(b.date || 0).getTime();
@@ -1224,18 +1614,77 @@ async function gmailSearch(
   return { results: allResults, count: allResults.length };
 }
 
-/**
- * FIX #6: Full email retrieval for reply context.
- * gmail_search returns snippets; this returns full body + headers.
- */
+async function searchOutlookMessages(
+  accessToken: string,
+  accountEmail: string,
+  query: string,
+  maxResults: number,
+  tz: string,
+): Promise<any[]> {
+  const params = new URLSearchParams({
+    $search: `"${query}"`,
+    $top: String(maxResults),
+    $orderby: "receivedDateTime desc",
+    $select: "id,conversationId,from,toRecipients,ccRecipients,subject,receivedDateTime,bodyPreview,body,hasAttachments",
+  });
+
+  const resp = await retryFetch(
+    `${GRAPH_API}/messages?${params}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!resp.ok) {
+    console.warn(`[tools] outlook search failed for ${accountEmail} (${resp.status})`);
+    return [];
+  }
+
+  const data = await resp.json();
+  return (data.value ?? []).map((m: any) => {
+    let dateLocal = m.receivedDateTime ?? "";
+    try {
+      const parsed = new Date(m.receivedDateTime);
+      if (!isNaN(parsed.getTime())) {
+        dateLocal = parsed.toLocaleString("en-AU", {
+          weekday: "short", day: "numeric", month: "short", year: "numeric",
+          hour: "numeric", minute: "2-digit", hour12: true,
+          timeZone: tz,
+        });
+      }
+    } catch { /* keep raw */ }
+
+    const toAddrs = (m.toRecipients ?? []).map((r: any) => r.emailAddress?.address).filter(Boolean).join(", ");
+    const ccAddrs = (m.ccRecipients ?? []).map((r: any) => r.emailAddress?.address).filter(Boolean).join(", ");
+
+    return {
+      message_id: m.id,
+      thread_id: m.conversationId ?? m.id,
+      from: m.from?.emailAddress ? `${m.from.emailAddress.name ?? ""} <${m.from.emailAddress.address}>` : "",
+      to: toAddrs,
+      cc: ccAddrs,
+      subject: m.subject ?? "",
+      date: dateLocal,
+      snippet: (m.bodyPreview ?? "").slice(0, 200),
+      body_preview: (m.bodyPreview ?? "").slice(0, 2000),
+      has_attachments: !!m.hasAttachments,
+      account: accountEmail,
+      provider: "microsoft",
+    };
+  });
+}
+
 async function getEmail(
   userId: string,
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
   const messageId = args.message_id as string;
   if (!messageId) return { error: "message_id is required" };
+
+  const { accessToken, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
+  const emailTz = (args.time_zone as string) ?? DEFAULT_TZ;
+
+  if (provider === "microsoft") {
+    return getOutlookEmail(accessToken, messageId, emailTz);
+  }
 
   const resp = await retryFetch(
     `${GMAIL_API}/messages/${encodeURIComponent(messageId)}?format=full`,
@@ -1248,7 +1697,6 @@ async function getEmail(
   const getHeader = (name: string) =>
     headers.find((h: any) => h.name.toLowerCase() === name.toLowerCase())?.value ?? null;
 
-  // Extract body: prefer text/plain, fall back to text/html (stripped)
   let body = "";
   const parts = flattenParts(msg.payload);
 
@@ -1274,8 +1722,6 @@ async function getEmail(
     .filter((p: any) => p.filename && p.body?.attachmentId)
     .map((p: any) => ({ filename: p.filename, mime_type: p.mimeType, size: p.body.size }));
 
-  // Convert email date to user's timezone
-  const emailTz = (args.time_zone as string) ?? DEFAULT_TZ;
   let dateLocal = getHeader("Date") ?? "";
   try {
     const internalMs = parseInt(msg.internalDate ?? "0", 10);
@@ -1297,6 +1743,60 @@ async function getEmail(
   };
 }
 
+async function getOutlookEmail(
+  accessToken: string,
+  messageId: string,
+  tz: string,
+): Promise<unknown> {
+  const resp = await retryFetch(
+    `${GRAPH_API}/messages/${encodeURIComponent(messageId)}?$select=id,conversationId,from,toRecipients,ccRecipients,subject,receivedDateTime,body,hasAttachments,attachments`,
+    { headers: { Authorization: `Bearer ${accessToken}` } },
+  );
+  if (!resp.ok) throw new Error(`Get Outlook email failed (${resp.status})`);
+
+  const m = await resp.json();
+
+  let body = "";
+  if (m.body?.contentType === "text") {
+    body = m.body.content ?? "";
+  } else if (m.body?.content) {
+    body = m.body.content.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  let dateLocal = m.receivedDateTime ?? "";
+  try {
+    const parsed = new Date(m.receivedDateTime);
+    if (!isNaN(parsed.getTime())) {
+      dateLocal = parsed.toLocaleString("en-AU", {
+        weekday: "short", day: "numeric", month: "short", year: "numeric",
+        hour: "numeric", minute: "2-digit", hour12: true,
+        timeZone: tz,
+      });
+    }
+  } catch { /* keep raw */ }
+
+  const toAddrs = (m.toRecipients ?? []).map((r: any) => r.emailAddress?.address).filter(Boolean).join(", ");
+  const ccAddrs = (m.ccRecipients ?? []).map((r: any) => r.emailAddress?.address).filter(Boolean).join(", ");
+
+  const attachments = (m.attachments ?? [])
+    .filter((a: any) => a.name)
+    .map((a: any) => ({ filename: a.name, mime_type: a.contentType, size: a.size }));
+
+  return {
+    message_id: m.id,
+    thread_id: m.conversationId ?? m.id,
+    from: m.from?.emailAddress ? `${m.from.emailAddress.name ?? ""} <${m.from.emailAddress.address}>` : "",
+    to: toAddrs,
+    cc: ccAddrs,
+    subject: m.subject ?? "",
+    date: dateLocal,
+    body,
+    attachments,
+    labels: [],
+    provider: "microsoft",
+  };
+}
+
 /** Recursively flatten MIME parts (handles nested multipart) */
 function flattenParts(payload: any): any[] {
   if (!payload) return [];
@@ -1312,10 +1812,6 @@ function base64Decode(data: string): string {
   return atob(data.replace(/-/g, "+").replace(/_/g, "/"));
 }
 
-/**
- * Create a draft email for user review.
- * FIX #10: reply_all exposed as parameter.
- */
 async function sendDraft(
   userId: string,
   supabase: SupabaseClient,
@@ -1330,7 +1826,11 @@ async function sendDraft(
     };
   }
 
-  const { accessToken, email: acctEmail } = await resolveToken(userId, supabase, args.account as string | undefined);
+  const { accessToken, email: acctEmail, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
+
+  if (provider === "microsoft") {
+    return createOutlookDraft(accessToken, acctEmail, args);
+  }
 
   let result: any;
   if (args.reply_to_thread_id) {
@@ -1362,20 +1862,112 @@ async function sendDraft(
   };
 }
 
-/**
- * FIX #1: Send a previously approved draft via Gmail API.
- * Inline implementation — doesn't require gmail-helpers update.
- */
+async function createOutlookDraft(
+  accessToken: string,
+  acctEmail: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const toList = Array.isArray(args.to) ? args.to : [args.to as string];
+  const ccList = args.cc ? (Array.isArray(args.cc) ? args.cc : [args.cc as string]) : [];
+
+  const htmlBody = (args.body as string ?? "").includes("<br") || (args.body as string ?? "").includes("<p")
+    ? (args.body as string)
+    : (args.body as string ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>\n");
+
+  const message: Record<string, unknown> = {
+    subject: args.subject,
+    body: { contentType: "html", content: htmlBody },
+    toRecipients: toList.map((email: string) => ({ emailAddress: { address: email } })),
+  };
+  if (ccList.length) {
+    message.ccRecipients = ccList.map((email: string) => ({ emailAddress: { address: email } }));
+  }
+
+  if (args.reply_to_thread_id) {
+    const replyResp = await retryFetch(
+      `${GRAPH_API}/messages/${encodeURIComponent(args.reply_to_thread_id as string)}/createReply`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ comment: "" }),
+      },
+    );
+    if (replyResp.ok) {
+      const replyDraft = await replyResp.json();
+      await retryFetch(
+        `${GRAPH_API}/messages/${encodeURIComponent(replyDraft.id)}`,
+        {
+          method: "PATCH",
+          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ body: { contentType: "html", content: htmlBody } }),
+        },
+      );
+      return {
+        draft_id: replyDraft.id,
+        status: "draft_created",
+        to: args.to, subject: args.subject,
+        is_reply: true,
+        reply_all: !!args.reply_all,
+        account: acctEmail,
+        provider: "microsoft",
+        _confirmation: "Email draft created successfully. Show the draft to the user and ask for confirmation before sending.",
+      };
+    }
+  }
+
+  const resp = await retryFetch(
+    `${GRAPH_API}/messages`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify(message),
+    },
+  );
+  if (!resp.ok) throw new Error(`Outlook create draft failed (${resp.status})`);
+
+  const draft = await resp.json();
+  return {
+    draft_id: draft.id,
+    status: "draft_created",
+    to: args.to, subject: args.subject,
+    is_reply: false,
+    reply_all: false,
+    account: acctEmail,
+    provider: "microsoft",
+    _confirmation: "Email draft created successfully. Show the draft to the user and ask for confirmation before sending.",
+  };
+}
+
 async function sendEmail(
   userId: string,
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const { accessToken } = await resolveToken(userId, supabase, args.account as string | undefined);
+  const { accessToken, provider } = await resolveAnyToken(userId, supabase, args.account as string | undefined);
   const draftId = args.draft_id as string;
 
   if (!draftId) {
     throw new Error("draft_id is required. Create a draft with send_draft first.");
+  }
+
+  if (provider === "microsoft") {
+    const resp = await retryFetch(
+      `${GRAPH_API}/messages/${encodeURIComponent(draftId)}/send`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      },
+    );
+    if (!resp.ok && resp.status !== 202) {
+      const detail = await resp.text();
+      throw new Error(`Outlook send email failed (${resp.status}): ${detail.slice(0, 200)}`);
+    }
+    return {
+      status: "sent",
+      message_id: draftId,
+      provider: "microsoft",
+      _confirmation: "Email sent successfully. Confirm this to the user.",
+    };
   }
 
   const resp = await retryFetch(
@@ -1873,11 +2465,15 @@ async function documentSearch(
   supabase: SupabaseClient,
   args: Record<string, unknown>,
 ): Promise<unknown> {
-  const accounts = await getAllAccountTokens(supabase, userId);
   const query = args.query as string;
   const fileType = (args.file_type as string) ?? "any";
   const sharedBy = args.shared_by as string;
   const maxResults = (args.max_results as number) ?? 10;
+
+  const [googleAccounts, msAccounts] = await Promise.all([
+    getAllAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+    getAllMicrosoftAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
+  ]);
 
   const mimeTypes: Record<string, string> = {
     document: "application/vnd.google-apps.document",
@@ -1890,8 +2486,8 @@ async function documentSearch(
   const escaped = query.replace(/'/g, "\\'");
   const fields = "files(id,name,mimeType,modifiedTime,owners,sharingUser,webViewLink,size)";
 
-  const perAccount = await Promise.all(
-    accounts.map(async (acct) => {
+  const googleResults = Promise.all(
+    googleAccounts.map(async (acct) => {
       try {
         const [fullTextResp, nameResp] = await Promise.all([
           retryFetch(
@@ -1928,6 +2524,7 @@ async function documentSearch(
           link: f.webViewLink,
           size: f.size ? `${Math.round(parseInt(f.size) / 1024)}KB` : null,
           account: acct.email,
+          provider: "google",
         }));
       } catch (e) {
         console.warn(`[tools] document_search error for ${acct.email}: ${(e as Error).message}`);
@@ -1936,8 +2533,41 @@ async function documentSearch(
     }),
   );
 
+  const msResults = Promise.all(
+    msAccounts.map(async (acct) => {
+      try {
+        const resp = await retryFetch(
+          `${GRAPH_API}/drive/root/search(q='${encodeURIComponent(query)}')?$top=${maxResults}&$select=id,name,file,lastModifiedDateTime,createdBy,webUrl,size`,
+          { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+        );
+        if (!resp.ok) {
+          console.warn(`[tools] document_search (OneDrive) failed for ${acct.email} (${resp.status})`);
+          return [];
+        }
+        const data = await resp.json();
+        return (data.value ?? []).map((f: any) => ({
+          file_id: f.id,
+          name: f.name,
+          type: f.file?.mimeType ?? "unknown",
+          modified: f.lastModifiedDateTime,
+          owner: f.createdBy?.user?.displayName ?? null,
+          shared_by: null,
+          link: f.webUrl,
+          size: f.size ? `${Math.round(f.size / 1024)}KB` : null,
+          account: acct.email,
+          provider: "microsoft",
+        }));
+      } catch (e) {
+        console.warn(`[tools] document_search (OneDrive) error for ${acct.email}: ${(e as Error).message}`);
+        return [];
+      }
+    }),
+  );
+
+  const [gResults, mResults] = await Promise.all([googleResults, msResults]);
+
   const seen = new Set<string>();
-  let results = perAccount.flat().filter((f: any) => {
+  let results = [...gResults.flat(), ...mResults.flat()].filter((f: any) => {
     if (seen.has(f.file_id)) return false;
     seen.add(f.file_id);
     return true;
@@ -2053,11 +2683,21 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
     key: GOOGLE_MAPS_API_KEY,
   });
 
+  if (mode === "transit") {
+    params.set("alternatives", "true");
+  }
+
   if (departureTime) {
-    const epochSec = Math.floor(new Date(departureTime).getTime() / 1000);
-    if (!isNaN(epochSec) && epochSec > Math.floor(Date.now() / 1000)) {
-      params.set("departure_time", String(epochSec));
-      params.set("traffic_model", "best_guess");
+    if (departureTime === "now") {
+      params.set("departure_time", "now");
+    } else {
+      const epochSec = Math.floor(new Date(departureTime).getTime() / 1000);
+      if (!isNaN(epochSec) && epochSec > Math.floor(Date.now() / 1000)) {
+        params.set("departure_time", String(epochSec));
+        if (mode !== "transit") params.set("traffic_model", "best_guess");
+      } else {
+        params.set("departure_time", "now");
+      }
     }
   } else {
     params.set("departure_time", "now");
@@ -2067,11 +2707,31 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
     const resp = await fetchWithTimeout(`${DIRECTIONS_API}?${params}`, {}, FETCH_TIMEOUT_MS);
     const data = await resp.json();
 
+    if (data.status === "ZERO_RESULTS" || (data.status !== "OK" && mode === "transit")) {
+      console.log(`[tools] transit directions returned ${data.status} (error: ${data.error_message ?? "none"}), falling back to web_search`);
+      const transitQuery = `${origin} to ${destination} train schedule departure time today`;
+      const fallback = await webSearch({ query: transitQuery });
+      if (typeof fallback === "object" && fallback !== null) {
+        (fallback as Record<string, unknown>)._transit_fallback = true;
+        (fallback as Record<string, unknown>)._google_status = data.status;
+        (fallback as Record<string, unknown>).origin = origin;
+        (fallback as Record<string, unknown>).destination = destination;
+        (fallback as Record<string, unknown>).mode = "transit";
+        (fallback as Record<string, unknown>)._format = "MANDATORY: Present using <nest-content> card even though this is web search data. Lead with short conversational line. Use 🚆 for trains. Show service names in bold, typical duration, frequency, fare if available. Format: 🚆 **Line Name** → Destination, 📍 From STATION → STATION, ⏱ ~DURATION · Runs every X min, 💴 ~FARE. Show multiple options if available.";
+        (fallback as Record<string, unknown>)._time_note = "CRITICAL INSTRUCTION: This is timetable data. Times shown are in LOCAL TIME at the destination (e.g. JST for Japan). These are RECURRING DAILY schedules, not past events. You MUST present this data using the <nest-content> card format. Do NOT say 'couldn't confirm' or 'want me to re-check'. Show the train services, frequency, duration, and fare. The user needs this info NOW.";
+      }
+      return fallback;
+    }
+
     if (data.status !== "OK" || !data.routes?.length) {
       return {
         error: `Google Maps returned: ${data.status}`,
         hint: data.error_message ?? "Check origin/destination spelling.",
       };
+    }
+
+    if (mode === "transit") {
+      return parseTransitRoutes(data.routes, origin, destination);
     }
 
     const route = data.routes[0];
@@ -2092,7 +2752,7 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
       result.duration_seconds = leg.duration?.value;
     }
 
-    if (departureTime) {
+    if (departureTime && departureTime !== "now") {
       result.departure_time = departureTime;
       const arrivalSec = (leg.duration_in_traffic?.value ?? leg.duration?.value ?? 0);
       const depMs = new Date(departureTime).getTime();
@@ -2101,49 +2761,79 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
       }
     }
 
-    if (mode === "transit") {
-      const transitSteps = (leg.steps ?? [])
-        .filter((s: any) => s.travel_mode === "TRANSIT" || s.travel_mode === "WALKING")
-        .slice(0, 8)
-        .map((s: any) => {
-          const step: Record<string, unknown> = {
-            mode: s.travel_mode?.toLowerCase(),
-            instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
-            distance: s.distance?.text,
-            duration: s.duration?.text,
-          };
-          if (s.transit_details) {
-            const td = s.transit_details;
-            step.line_name = td.line?.short_name || td.line?.name;
-            step.vehicle_type = td.line?.vehicle?.type?.toLowerCase();
-            step.num_stops = td.num_stops;
-            step.departure_stop = td.departure_stop?.name;
-            step.arrival_stop = td.arrival_stop?.name;
-            if (td.departure_time?.text) step.departs_at = td.departure_time.text;
-            if (td.arrival_time?.text) step.arrives_at = td.arrival_time.text;
-            if (td.headsign) step.direction = td.headsign;
-          }
-          return step;
-        });
-      if (transitSteps.length) result.transit_steps = transitSteps;
-
-      if (leg.departure_time?.text) result.depart_at = leg.departure_time.text;
-      if (leg.arrival_time?.text) result.arrive_at = leg.arrival_time.text;
-    } else {
-      const steps = leg.steps?.slice(0, 5).map((s: any) => ({
-        instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
-        distance: s.distance?.text,
-        duration: s.duration?.text,
-      }));
-      if (steps?.length) result.route_summary = steps;
-    }
+    const steps = leg.steps?.slice(0, 5).map((s: any) => ({
+      instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
+      distance: s.distance?.text,
+      duration: s.duration?.text,
+    }));
+    if (steps?.length) result.route_summary = steps;
 
     return result;
   } catch (e) {
     console.error("[tools] travel_time error:", (e as Error).message);
-    const query = `travel time from ${origin} to ${destination} by ${mode}`;
-    return webSearch({ query });
+    const query = mode === "transit"
+      ? `${origin} to ${destination} train schedule departure time today`
+      : `travel time from ${origin} to ${destination} by ${mode}`;
+    const fallback = await webSearch({ query });
+    if (mode === "transit" && typeof fallback === "object" && fallback !== null) {
+      (fallback as Record<string, unknown>)._transit_fallback = true;
+      (fallback as Record<string, unknown>).origin = origin;
+      (fallback as Record<string, unknown>).destination = destination;
+      (fallback as Record<string, unknown>).mode = "transit";
+      (fallback as Record<string, unknown>)._format = "MANDATORY: Present using <nest-content> card even though this is web search data. Use 🚆 for trains. Show service names in bold, typical duration, frequency, fare if available.";
+    }
+    return fallback;
   }
+}
+
+function parseTransitRoutes(routes: any[], origin: string, destination: string): unknown {
+  const options = routes.slice(0, 3).map((route: any, idx: number) => {
+    const leg = route.legs[0];
+    const option: Record<string, unknown> = {
+      option: idx + 1,
+      origin: leg.start_address,
+      destination: leg.end_address,
+      duration: leg.duration?.text,
+      duration_seconds: leg.duration?.value,
+      depart_at: leg.departure_time?.text,
+      arrive_at: leg.arrival_time?.text,
+    };
+
+    const transitSteps = (leg.steps ?? [])
+      .filter((s: any) => s.travel_mode === "TRANSIT" || s.travel_mode === "WALKING")
+      .slice(0, 8)
+      .map((s: any) => {
+        const step: Record<string, unknown> = {
+          mode: s.travel_mode?.toLowerCase(),
+          instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
+          distance: s.distance?.text,
+          duration: s.duration?.text,
+        };
+        if (s.transit_details) {
+          const td = s.transit_details;
+          step.line_name = td.line?.short_name || td.line?.name;
+          step.vehicle_type = td.line?.vehicle?.type?.toLowerCase();
+          step.num_stops = td.num_stops;
+          step.departure_stop = td.departure_stop?.name;
+          step.arrival_stop = td.arrival_stop?.name;
+          if (td.departure_time?.text) step.departs_at = td.departure_time.text;
+          if (td.arrival_time?.text) step.arrives_at = td.arrival_time.text;
+          if (td.headsign) step.direction = td.headsign;
+        }
+        return step;
+      });
+    if (transitSteps.length) option.transit_steps = transitSteps;
+
+    return option;
+  });
+
+  return {
+    mode: "transit",
+    origin: options[0]?.origin ?? origin,
+    destination: options[0]?.destination ?? destination,
+    options,
+    _format: "MANDATORY: Present using <nest-content> card. Lead with short conversational line. Use emoji per leg: 🚆train 🚃metro 🚌bus 🚊tram ⛴ferry 🚶walk. Each leg: emoji **Line Name** → Direction, 🕐 Departs TIME from STOP, 🏁 Arrives TIME at STOP, ⏱ DURATION. Show alternatives as compact one-liners at bottom.",
+  };
 }
 
 // ══════════════════════════════════════════════════════════════

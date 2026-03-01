@@ -58,12 +58,19 @@ Deno.serve(async (req: Request) => {
   const errors: string[] = [];
 
   // 1. Delete from tables that DON'T have ON DELETE CASCADE from auth.users
-  //    (imessage_users has ON DELETE SET NULL — we want full row removal)
+  //    Some have ON DELETE SET NULL, some have no FK at all, and
+  //    v2_daily_briefing has a FK without CASCADE — all must be cleaned first.
   const manualTables = [
     "v2_triggers",
     "v2_chat_messages",
     "v2_agents",
+    "v2_daily_briefing",
+    "v2_user_memory",
+    "v2_user_todos",
+    "v2_user_learnings",
+    "v2_debug_logs",
     "imessage_users",
+    "sms_users",
   ];
 
   for (const table of manualTables) {

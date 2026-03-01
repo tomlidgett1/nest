@@ -141,6 +141,7 @@ async function handleMeetingPrep(
 
     const messages: string[] = [];
     const eventIds: string[] = [];
+    const messageIds: string[] = [];
 
     for (const event of events) {
       const eventId = event.metadata?.event_id || event.id;
@@ -154,11 +155,12 @@ async function handleMeetingPrep(
         messages.push(prepMessage);
 
         // Also save to v2_chat_messages for the app
-        await supabaseAdmin.from("v2_chat_messages").insert({
+        const { data: inserted } = await supabaseAdmin.from("v2_chat_messages").insert({
           user_id: userId,
           role: "assistant",
           content: prepMessage,
-        });
+        }).select("id").single();
+        if (inserted?.id) messageIds.push(inserted.id);
 
         appendToConversation(supabaseAdmin, [
           { role: "assistant", content: prepMessage, ts: new Date().toISOString() },
@@ -172,7 +174,7 @@ async function handleMeetingPrep(
       `[v2-trigger] Meeting prep: ${messages.length} message(s) generated (${elapsed}ms)`
     );
 
-    return jsonResponse({ messages, event_ids: eventIds }, 200);
+    return jsonResponse({ messages, event_ids: eventIds, message_ids: messageIds }, 200);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "unknown";
     console.error("[v2-trigger] Meeting prep error:", msg);
@@ -730,13 +732,17 @@ async function handleCronReminders(): Promise<Response> {
         const message = await generateReminderMessage(trigger.action_description);
 
         if (message) {
-          allMessages.push({ user_id: trigger.user_id, message });
-
           // Store in chat history so the agent has context if user replies
-          await supabaseAdmin.from("v2_chat_messages").insert({
+          const { data: inserted } = await supabaseAdmin.from("v2_chat_messages").insert({
             user_id: trigger.user_id,
             role: "assistant",
             content: message,
+          }).select("id").single();
+
+          allMessages.push({
+            user_id: trigger.user_id,
+            message,
+            message_id: inserted?.id ?? null,
           });
         }
 

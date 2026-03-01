@@ -41,15 +41,20 @@ Deno.serve(async (req: Request) => {
 
   // If active, check tokens are actually stored. If not, allow re-auth.
   if (user.status === "active" && user.user_id) {
-    const { data: accounts } = await admin
+    const { data: gAccounts } = await admin
       .from("user_google_accounts")
       .select("id")
       .eq("user_id", user.user_id)
       .limit(1);
-    if (accounts && accounts.length > 0) {
+    const { data: msAccounts } = await admin
+      .from("user_microsoft_accounts")
+      .select("id")
+      .eq("user_id", user.user_id)
+      .limit(1);
+    if ((gAccounts && gAccounts.length > 0) || (msAccounts && msAccounts.length > 0)) {
       return page("Nest", donePage());
     }
-    console.log(`[onboard] User ${user.user_id} is active but has no google accounts — allowing re-auth`);
+    console.log(`[onboard] User ${user.user_id} is active but has no accounts — allowing re-auth`);
   }
 
   // ── Callback after Google auth ────────────────────────
@@ -85,6 +90,43 @@ async function fetchGoogleProfile(accessToken: string): Promise<{ email: string;
   }
 }
 
+async function fetchMicrosoftProfile(accessToken: string): Promise<{ email: string; name: string; picture: string } | null> {
+  try {
+    const res = await fetch("https://graph.microsoft.com/v1.0/me", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const email = data.mail ?? data.userPrincipalName ?? "";
+    const name = data.displayName ?? "";
+    // Microsoft Graph photo requires a separate call; use empty string as fallback
+    let picture = "";
+    try {
+      const photoRes = await fetch("https://graph.microsoft.com/v1.0/me/photo/$value", {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (photoRes.ok) {
+        const blob = await photoRes.arrayBuffer();
+        const bytes = new Uint8Array(blob);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64 = btoa(binary);
+        picture = `data:image/jpeg;base64,${base64}`;
+        console.log(`[onboard] Microsoft photo extracted: ${bytes.length} bytes`);
+      } else {
+        console.log(`[onboard] Microsoft photo not available: ${photoRes.status}`);
+      }
+    } catch (e) {
+      console.warn(`[onboard] Microsoft photo fetch failed:`, (e as Error).message);
+    }
+    return { email, name, picture };
+  } catch {
+    return null;
+  }
+}
+
 async function handlePost(req: Request) {
   try {
     const body = await req.json();
@@ -93,6 +135,9 @@ async function handlePost(req: Request) {
     const provider_token: string | undefined = body.provider_token;
     const provider_refresh_token: string | undefined = body.provider_refresh_token;
     const user_id: string | undefined = body.user_id;
+    const provider: string = body.provider ?? "google"; // "google" or "azure"
+    const isMicrosoft = provider === "azure";
+    console.log(`[onboard] Provider: ${provider}${isMicrosoft ? " (Microsoft)" : " (Google)"}`);
 
     if (!access_token) return json({ error: "missing fields" }, 400);
 
@@ -160,19 +205,21 @@ async function handlePost(req: Request) {
       if (linked) imessageRowId = linked.id;
     }
 
-    // Legacy single-token table (keep for backwards compat)
-    if (provider_refresh_token) {
+    // Legacy single-token table (keep for backwards compat — Google only)
+    if (provider_refresh_token && !isMicrosoft) {
       await admin.from("google_oauth_tokens").upsert(
         { user_id: uid, refresh_token: provider_refresh_token, updated_at: new Date().toISOString() },
         { onConflict: "user_id" },
       );
     }
 
-    // Resolve Google profile: try provider_token → Supabase getUser → admin getUserById
+    // Resolve profile: try provider_token → Supabase getUser → admin getUserById
     let profile: { email: string; name: string; picture: string } | null = null;
 
     if (provider_token) {
-      profile = await fetchGoogleProfile(provider_token);
+      profile = isMicrosoft
+        ? await fetchMicrosoftProfile(provider_token)
+        : await fetchGoogleProfile(provider_token);
     }
 
     if (!profile) {
@@ -203,38 +250,44 @@ async function handlePost(req: Request) {
 
     console.log(`[onboard] Profile resolved: email=${profile?.email ?? "NONE"}, name=${profile?.name ?? "NONE"}`);
 
-    // Guard: check if this Google email is already linked to a different user
+    // Guard: check if this email is already linked to a different user
     if (profile?.email) {
+      const accountTable = isMicrosoft ? "user_microsoft_accounts" : "user_google_accounts";
+      const emailCol = isMicrosoft ? "microsoft_email" : "google_email";
+
       const { data: existingAccount } = await admin
-        .from("user_google_accounts")
-        .select("user_id, google_email, is_primary")
-        .eq("google_email", profile.email)
+        .from(accountTable)
+        .select(`user_id, ${emailCol}, is_primary`)
+        .eq(emailCol, profile.email)
         .neq("user_id", uid)
         .maybeSingle();
 
       if (existingAccount) {
         const { data: primaryAccount } = await admin
-          .from("user_google_accounts")
-          .select("google_email")
+          .from(accountTable)
+          .select(emailCol)
           .eq("user_id", existingAccount.user_id)
           .eq("is_primary", true)
           .maybeSingle();
 
+        const primaryEmail = primaryAccount?.[emailCol] as string | undefined;
         console.log(`[onboard] Email conflict: ${profile.email} already belongs to user ${existingAccount.user_id}`);
 
         return json({
           error: "email_conflict",
-          detail: "This Google account is already linked to another Nest account.",
-          hint: primaryAccount?.google_email
-            ? `Sign in with ${maskEmail(primaryAccount.google_email)} instead.`
+          detail: `This ${isMicrosoft ? "Microsoft" : "Google"} account is already linked to another Nest account.`,
+          hint: primaryEmail
+            ? `Sign in with ${maskEmail(primaryEmail)} instead.`
             : "Sign in with the account you originally used.",
         }, 409);
       }
     }
 
-    // Resolve refresh token: POST body → legacy table → existing user_google_accounts
+    // Resolve refresh token
     let refreshToken = provider_refresh_token;
-    if (!refreshToken) {
+
+    if (!refreshToken && !isMicrosoft) {
+      // Google-only: check legacy table
       const { data: legacy } = await admin
         .from("google_oauth_tokens")
         .select("refresh_token")
@@ -246,10 +299,11 @@ async function handlePost(req: Request) {
       }
     }
 
-    // Fallback: check user_google_accounts for existing refresh token (returning user)
+    // Fallback: check existing accounts table for refresh token (returning user)
     if (!refreshToken) {
+      const table = isMicrosoft ? "user_microsoft_accounts" : "user_google_accounts";
       const { data: existingAccount } = await admin
-        .from("user_google_accounts")
+        .from(table)
         .select("refresh_token")
         .eq("user_id", uid)
         .not("refresh_token", "is", null)
@@ -258,40 +312,66 @@ async function handlePost(req: Request) {
         .maybeSingle();
       if (existingAccount?.refresh_token) {
         refreshToken = existingAccount.refresh_token;
-        console.log(`[onboard] Using existing refresh token from user_google_accounts for ${uid}`);
+        console.log(`[onboard] Using existing refresh token from ${table} for ${uid}`);
       }
     }
 
     if (!refreshToken) {
-      console.error(`[onboard] No Google refresh token for ${uid}. Aborting — user must re-authenticate.`);
+      const providerName = isMicrosoft ? "Microsoft" : "Google";
+      console.error(`[onboard] No ${providerName} refresh token for ${uid}. Aborting — user must re-authenticate.`);
       return json({
         error: "missing_refresh_token",
-        detail: "Google did not provide a refresh token. Please try signing in again.",
-        hint: "Make sure you grant all permissions when Google asks.",
+        detail: `${providerName} did not provide a refresh token. Please try signing in again.`,
+        hint: "Make sure you grant all permissions when asked.",
       }, 400);
     }
 
     if (!profile?.email) {
-      console.error(`[onboard] No Google email resolved for ${uid}. Aborting.`);
+      console.error(`[onboard] No email resolved for ${uid}. Aborting.`);
       return json({
         error: "missing_profile",
-        detail: "Could not determine your Google email. Please try again.",
+        detail: "Could not determine your email. Please try again.",
       }, 400);
     }
 
-    await admin.from("user_google_accounts").upsert(
-      {
-        user_id: uid,
-        google_email: profile.email,
-        google_name: profile.name,
-        google_avatar_url: profile.picture,
-        refresh_token: refreshToken,
-        is_primary: true,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id,google_email" },
-    );
-    console.log(`[onboard] Stored account ${profile.email} in user_google_accounts`);
+    // Store account in the appropriate provider table
+    if (isMicrosoft) {
+      const { error: msUpsertErr } = await admin.from("user_microsoft_accounts").upsert(
+        {
+          user_id: uid,
+          microsoft_email: profile.email,
+          microsoft_name: profile.name,
+          microsoft_avatar_url: profile.picture,
+          refresh_token: refreshToken,
+          is_primary: true,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,microsoft_email" },
+      );
+      if (msUpsertErr) {
+        console.error(`[onboard] Failed to store Microsoft account:`, msUpsertErr.message);
+        return json({ error: "account_store_failed", detail: msUpsertErr.message }, 500);
+      }
+      console.log(`[onboard] Stored account ${profile.email} in user_microsoft_accounts`);
+    } else {
+      const { error: gUpsertErr } = await admin.from("user_google_accounts").upsert(
+        {
+          user_id: uid,
+          google_email: profile.email,
+          google_name: profile.name,
+          google_avatar_url: profile.picture,
+          refresh_token: refreshToken,
+          is_primary: true,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id,google_email" },
+      );
+      if (gUpsertErr) {
+        console.error(`[onboard] Failed to store Google account:`, gUpsertErr.message);
+        return json({ error: "account_store_failed", detail: gUpsertErr.message }, 500);
+      }
+      console.log(`[onboard] Stored account ${profile.email} in user_google_accounts`);
+    }
 
     if (imessageRowId && (profile?.name || profile?.email)) {
       const patch: Record<string, string> = { updated_at: new Date().toISOString() };
@@ -318,29 +398,47 @@ async function handlePost(req: Request) {
       }
     }
 
-    console.log(`[onboard] Account created for ${uid}${token ? " (iMessage)" : " (direct)"}`);
-    // Ingestion is triggered automatically by the DB trigger on user_google_accounts INSERT
-    // (via pg_net → ingest-pipeline). No fire-and-forget needed here.
+    console.log(`[onboard] Account created for ${uid}${token ? " (iMessage)" : " (direct)"} via ${provider}`);
 
     // ── PDL enrichment + auto-welcome + profile build ─────────
-    // Must await welcome — Deno edge functions terminate after response.
-    // Profile builder runs in parallel (non-blocking for the welcome).
-    const profileBuildPromise = triggerProfileBuild(uid!);
+    // Return success immediately — background work continues via
+    // EdgeRuntime.waitUntil (keeps function alive after response).
+    // This takes onboarding from ~40s down to ~2-3s for the user.
 
-    try {
-      await sendPostSignupWelcome(uid!, profile, imessageRowId);
-    } catch (e) {
-      console.error("[onboard] Post-signup welcome failed:", e);
-    }
+    const backgroundWork = (async () => {
+      try {
+        // Fire profile builder (long-running: mail scan, calendar, LLM synthesis)
+        const profileBuildPromise = triggerProfileBuild(uid!, provider);
 
-    // Wait for profile build to finish (best-effort, don't block response too long)
-    try {
-      await Promise.race([
-        profileBuildPromise,
-        new Promise((resolve) => setTimeout(resolve, 25000)),
-      ]);
-    } catch (e) {
-      console.error("[onboard] Profile build failed (non-blocking):", e);
+        // PDL enrichment + welcome iMessage
+        try {
+          await sendPostSignupWelcome(uid!, profile, imessageRowId);
+        } catch (e) {
+          console.error("[onboard] Post-signup welcome failed:", e);
+        }
+
+        // Wait for profile build (best-effort, 90s max)
+        try {
+          await Promise.race([
+            profileBuildPromise,
+            new Promise((resolve) => setTimeout(resolve, 90000)),
+          ]);
+        } catch (e) {
+          console.error("[onboard] Profile build failed (non-blocking):", e);
+        }
+      } catch (e) {
+        console.error("[onboard] Background work failed:", e);
+      }
+    })();
+
+    // Keep the function alive for background work after response is sent
+    // @ts-ignore — Deno Deploy EdgeRuntime global
+    if (typeof EdgeRuntime !== "undefined" && EdgeRuntime.waitUntil) {
+      // @ts-ignore
+      EdgeRuntime.waitUntil(backgroundWork);
+    } else {
+      // Fallback: just let the promise run (Deno will keep alive briefly)
+      backgroundWork.catch((e) => console.error("[onboard] Background fallback error:", e));
     }
 
     return json({ success: true, uid }, 200);
@@ -359,7 +457,7 @@ function delay(ms: number) {
 
 async function sendPostSignupWelcome(
   uid: string,
-  googleProfile: { email: string; name: string; picture: string } | null,
+  userProfile: { email: string; name: string; picture: string } | null,
   imessageRowId: string | null,
 ) {
   // Resolve phone number
@@ -385,27 +483,36 @@ async function sendPostSignupWelcome(
     return;
   }
 
-  // Fetch ALL connected Google accounts for this user
-  const { data: allAccounts } = await admin
+  // Fetch ALL connected accounts (Google + Microsoft) for this user
+  const { data: googleAccounts } = await admin
     .from("user_google_accounts")
     .select("google_email, google_name")
     .eq("user_id", uid);
+  const { data: msAccounts } = await admin
+    .from("user_microsoft_accounts")
+    .select("microsoft_email, microsoft_name")
+    .eq("user_id", uid);
 
-  const accounts = allAccounts ?? [];
-  const displayName = googleProfile?.name || accounts[0]?.google_name || "there";
+  // Normalise into a unified list of { email, name }
+  const allEmails: { email: string; name: string }[] = [
+    ...(googleAccounts ?? []).map((a) => ({ email: a.google_email, name: a.google_name ?? "" })),
+    ...(msAccounts ?? []).map((a) => ({ email: a.microsoft_email, name: a.microsoft_name ?? "" })),
+  ];
+
+  const displayName = userProfile?.name || allEmails[0]?.name || "there";
 
   // Try each email, prioritising work emails over personal ones
-  const sorted = [...accounts].sort((a, b) => {
-    const aPersonal = a.google_email?.match(/@(gmail|hotmail|outlook|yahoo|icloud)\./i) ? 1 : 0;
-    const bPersonal = b.google_email?.match(/@(gmail|hotmail|outlook|yahoo|icloud)\./i) ? 1 : 0;
+  const sorted = [...allEmails].sort((a, b) => {
+    const aPersonal = a.email?.match(/@(gmail|hotmail|outlook|yahoo|icloud|live)\./i) ? 1 : 0;
+    const bPersonal = b.email?.match(/@(gmail|hotmail|outlook|yahoo|icloud|live)\./i) ? 1 : 0;
     return aPersonal - bPersonal;
   });
 
   let bestProfile: PDLProfile | null = null;
   for (const acct of sorted) {
-    console.log(`[onboard] Trying PDL with ${acct.google_email}`);
+    console.log(`[onboard] Trying PDL with ${acct.email}`);
     const profile = await enrichByIdentity({
-      email: acct.google_email ?? undefined,
+      email: acct.email ?? undefined,
       name: displayName,
       phone: phoneNumber,
     });
@@ -462,9 +569,9 @@ async function sendPostSignupWelcome(
 // "verified" messages. PDL intel reveal happens on first real question
 // via the personality agent, not in the welcome message.
 
-async function triggerProfileBuild(userId: string): Promise<void> {
+async function triggerProfileBuild(userId: string, provider = "google"): Promise<void> {
   const url = `${supabaseUrl}/functions/v1/profile-builder`;
-  console.log(`[onboard] Triggering profile-builder for ${userId}`);
+  console.log(`[onboard] Triggering profile-builder for ${userId} (provider: ${provider})`);
   try {
     const resp = await fetch(url, {
       method: "POST",
@@ -473,7 +580,7 @@ async function triggerProfileBuild(userId: string): Promise<void> {
         "Content-Type": "application/json",
         apikey: serviceRoleKey,
       },
-      body: JSON.stringify({ user_id: userId }),
+      body: JSON.stringify({ user_id: userId, provider }),
     });
     if (resp.ok) {
       const data = await resp.json();
