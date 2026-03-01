@@ -27,6 +27,7 @@ import {
   type OpenAILogContext,
 } from "./orchestrator.ts";
 import { executeTool } from "./tools.ts";
+import { TimezoneHolder } from "./timezone-resolver.ts";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -84,6 +85,8 @@ export interface NestContext {
   recallPitchStatus?: string | null;
   /** Number of today's calendar events that have video meeting links */
   videoMeetingCount?: number | null;
+  /** Mutable timezone holder — allows update_user_timezone to take effect mid-request */
+  timezoneHolder?: TimezoneHolder;
 }
 
 // ── Identity Model Type ──────────────────────────────────────
@@ -1437,8 +1440,15 @@ async function executePrefetch(
 // This is the entire tool execution layer — 3 lines.
 
 function buildToolExecutor(ctx: NestContext) {
+  const tzHolder = ctx.timezoneHolder;
   return (name: string, args: Record<string, unknown>): Promise<string> =>
-    executeTool(name, args, ctx.userId, ctx.supabase, ctx.user.timezone);
+    executeTool(
+      name, args, ctx.userId, ctx.supabase,
+      // Use the mutable timezone holder if available, otherwise fall back to static user.timezone
+      tzHolder ? tzHolder.tz : ctx.user.timezone,
+      // When update_user_timezone fires, update the holder so subsequent tools use the new tz
+      tzHolder ? (newTz: string) => tzHolder.update(newTz) : undefined,
+    );
 }
 
 // ── Output Formatter ─────────────────────────────────────────

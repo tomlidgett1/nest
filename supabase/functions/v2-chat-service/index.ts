@@ -21,6 +21,7 @@ import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { appendToConversation } from "../_shared/conversation-store.ts";
 import { serverSideRAG } from "../_shared/server-rag.ts";
 import { getGoogleAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
+import { resolveTimezone, TimezoneHolder } from "../_shared/timezone-resolver.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
@@ -60,6 +61,8 @@ Deno.serve(async (req: Request) => {
     is_group?: boolean;
     group_context?: Array<{ role: string; content: string; name?: string }>;
     _qa_variation?: string;
+    /** Client-provided IANA timezone (e.g. "Asia/Tokyo"). Takes priority over DB timezone. */
+    timezone?: string;
   };
   try {
     payload = await req.json();
@@ -257,14 +260,15 @@ Deno.serve(async (req: Request) => {
       const accounts = googleAccounts;
 
       const primaryAccount = accounts.find((a: any) => a.is_primary) ?? accounts[0];
-      userTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
+      let dbTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
 
+      // Backfill from Google Calendar if missing in DB
       if (!primaryAccount?.timezone && primaryAccount) {
         try {
           const accessToken = await getGoogleAccessToken(supabaseAdmin, userId);
           const tz = await fetchCalendarTimezone(accessToken);
           if (tz) {
-            userTimezone = tz;
+            dbTimezone = tz;
             supabaseAdmin.from("user_google_accounts")
               .update({ timezone: tz })
               .eq("user_id", userId)
@@ -288,6 +292,21 @@ Deno.serve(async (req: Request) => {
         timesReinforced: l.times_reinforced as number,
         emotionalWeight: (l.emotional_weight as string) ?? "medium",
       }));
+
+      // ── Three-layer timezone resolution ──
+      // Priority: 1) client payload  2) context inference  3) database
+      const tzResult = await resolveTimezone({
+        dbTimezone,
+        clientTimezone: payload.timezone,
+        recentMessages: [...recentChat, { role: "user", content: message }],
+        learnings: userLearnings,
+        userId,
+        supabase: supabaseAdmin,
+      });
+      userTimezone = tzResult.timezone;
+      if (tzResult.changed) {
+        console.log(`[chat] Timezone resolved: ${tzResult.timezone} (source: ${tzResult.source}, was: ${dbTimezone})`);
+      }
 
       console.log(`[chat] Rich profile loaded: ${richProfile ? `v${(richProfile as any).version ?? 1}, ${((richProfile as any).summary ?? "").length}c summary` : "NONE"}`);
     }
@@ -335,6 +354,13 @@ Deno.serve(async (req: Request) => {
         }))
       : null;
 
+    // Mutable timezone holder — allows update_user_timezone to take effect mid-request
+    const timezoneHolder = new TimezoneHolder(userTimezone, (newTz) => {
+      // When timezone changes mid-request, update the NestUser so subsequent
+      // system prompt rebuilds (if any) reflect the new timezone.
+      nestUser.timezone = newTz;
+    });
+
     const ctx: NestContext = {
       userId,
       user: nestUser,
@@ -347,6 +373,7 @@ Deno.serve(async (req: Request) => {
       dailyBriefing: isGroup ? null : (dailyBriefingData?.data?.briefing as string ?? null),
       activeCommitments: isGroup ? null : (activeCommitments && activeCommitments.length > 0 ? activeCommitments : null),
       recallPitchStatus: isGroup ? null : (userMemory?.recallPitchStatus ?? null),
+      timezoneHolder,
       ...(payload._qa_variation ? { _qa_variation: payload._qa_variation } : {}),
     };
 

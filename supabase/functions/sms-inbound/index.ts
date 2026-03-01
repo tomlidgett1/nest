@@ -18,6 +18,7 @@ import { appendToConversation } from "../_shared/conversation-store.ts";
 import { serverSideRAG } from "../_shared/server-rag.ts";
 import { sendSmsResponse, sendQuickSms } from "../_shared/sms-sender.ts";
 import { getGoogleAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
+import { resolveTimezone, TimezoneHolder } from "../_shared/timezone-resolver.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -254,7 +255,7 @@ async function processAndSend(
   const primaryAccount = googleAccounts.find((a: any) => a.is_primary) ?? googleAccounts[0];
   const userName = primaryAccount?.google_name ?? displayName ?? "there";
   const userEmail = primaryAccount?.google_email ?? "";
-  let userTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
+  let dbTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
 
   // Timezone backfill (aligned with v2-chat-service)
   if (!primaryAccount?.timezone && primaryAccount) {
@@ -262,7 +263,7 @@ async function processAndSend(
       const accessToken = await getGoogleAccessToken(supabaseAdmin, userId);
       const tz = await fetchCalendarTimezone(accessToken);
       if (tz) {
-        userTimezone = tz;
+        dbTimezone = tz;
         supabaseAdmin.from("user_google_accounts")
           .update({ timezone: tz })
           .eq("user_id", userId)
@@ -280,6 +281,19 @@ async function processAndSend(
     confidence: l.confidence as number, timesReinforced: l.times_reinforced as number,
     emotionalWeight: (l.emotional_weight as string) ?? "medium",
   }));
+
+  // ── Three-layer timezone resolution ──
+  const tzResult = await resolveTimezone({
+    dbTimezone,
+    recentMessages: [...recentChat, { role: "user", content: message }],
+    learnings: userLearnings,
+    userId,
+    supabase: supabaseAdmin,
+  });
+  let userTimezone = tzResult.timezone;
+  if (tzResult.changed) {
+    console.log(`[sms] Timezone resolved: ${tzResult.timezone} (source: ${tzResult.source}, was: ${dbTimezone})`);
+  }
 
   const richProfileData = (richProfileResult?.data?.user_profile as Record<string, unknown>) ?? null;
   const locationCity = richProfileData
@@ -317,6 +331,10 @@ async function processAndSend(
   const realMessageCount = recentChat.length;
   const profileIsNew = !!richProfileData && realMessageCount < 16;
 
+  const timezoneHolder = new TimezoneHolder(userTimezone, (newTz) => {
+    nestUser.timezone = newTz;
+  });
+
   const ctx: NestContext = {
     userId, user: nestUser, supabase: supabaseAdmin,
     memory: memory ?? null,
@@ -326,6 +344,7 @@ async function processAndSend(
     dailyBriefing: (briefingResult?.data?.briefing as string) ?? null,
     activeCommitments: activeCommitments && activeCommitments.length > 0 ? activeCommitments : null,
     recallPitchStatus: memory?.recallPitchStatus ?? null,
+    timezoneHolder,
   };
 
   // Pass recentChat to routeMessage (aligned with v2-chat-service)
