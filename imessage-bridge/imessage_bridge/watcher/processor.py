@@ -103,23 +103,45 @@ _ACK_FALLBACKS = [
 
 # Patterns that indicate the user is talking to Nest in a group chat.
 # Case-insensitive. Checked against the start of the message.
-_NEST_MENTION_PATTERNS: list[re.Pattern[str]] = [
+_NEST_MENTION_PREFIX: list[re.Pattern[str]] = [
     re.compile(r"^@?nest\b[,:]?\s*", re.IGNORECASE),
     re.compile(r"^hey nest\b[,:]?\s*", re.IGNORECASE),
     re.compile(r"^yo nest\b[,:]?\s*", re.IGNORECASE),
 ]
+
+_NEST_MENTION_SUFFIX: list[re.Pattern[str]] = [
+    re.compile(r"[,;]?\s+@?nest[.!?\s]*$", re.IGNORECASE),
+]
+
+_NEST_MENTION_ANYWHERE = re.compile(r"(?:^|\s)@nest(?:\s|$)", re.IGNORECASE)
 
 
 def _extract_nest_mention(text: str) -> str | None:
     """If the message is addressed to Nest, return the text with the mention stripped.
 
     Returns None if Nest is not mentioned (message should be ignored in group chats).
+    Handles: "nest do X", "hey nest do X", "do X nest", "do X @nest", "@nest do X"
     """
-    for pattern in _NEST_MENTION_PATTERNS:
+    # 1. Prefix patterns: "nest ...", "hey nest ...", "@nest ..."
+    for pattern in _NEST_MENTION_PREFIX:
         m = pattern.match(text)
         if m:
             remainder = text[m.end():].strip()
             return remainder if remainder else text.strip()
+
+    # 2. Suffix patterns: "... nest", "... @nest"
+    for pattern in _NEST_MENTION_SUFFIX:
+        m = pattern.search(text)
+        if m:
+            remainder = text[:m.start()].strip()
+            return remainder if remainder else text.strip()
+
+    # 3. @nest anywhere mid-sentence
+    m = _NEST_MENTION_ANYWHERE.search(text)
+    if m:
+        remainder = (text[:m.start()] + " " + text[m.end():]).strip()
+        return remainder if remainder else text.strip()
+
     return None
 
 
