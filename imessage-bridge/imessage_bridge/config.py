@@ -51,3 +51,7 @@ class Config:
     @property
     def v2_onboard_chat_url(self) -> str:
         return f"{self.supabase_url}/functions/v1/v2-onboard-chat"
+
+    @property
+    def v2_group_should_respond_url(self) -> str:
+        return f"{self.supabase_url}/functions/v1/v2-group-should-respond"

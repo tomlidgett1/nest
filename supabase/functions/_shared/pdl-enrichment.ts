@@ -247,7 +247,7 @@ export async function enrichByPhone(
     return null;
   }
 
-  const params = new URLSearchParams({ phone: cleaned, country });
+  const params = new URLSearchParams({ phone: cleaned, country, location_country: "australia" });
   return callPDL(params, `phone ${cleaned.slice(0, 6)}***`);
 }
 
@@ -262,6 +262,7 @@ export async function enrichByIdentity(opts: {
   if (opts.phone) params.set("phone", opts.phone.replace(/\s+/g, ""));
   if (opts.name) params.set("name", opts.name);
   params.set("country", opts.country ?? "australia");
+  params.set("location_country", "australia");
   params.set("min_likelihood", "5");
 
   const label = opts.email

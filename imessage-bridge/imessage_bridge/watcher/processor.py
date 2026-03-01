@@ -260,34 +260,20 @@ class _GroupChatBuffer:
             self._last_activity.pop(k, None)
 
 
-# ── Chime-in detection ────────────────────────────────────────
-# Patterns where Nest should speak up without being mentioned.
+# ── Chime-in detection (LLM-based) ──────────────────────────
+# Instead of hardcoded patterns, uses a lightweight LLM call to decide
+# if Nest should respond to a group message that didn't mention it.
 
-_CHIME_IN_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"(?:does )?anyone know (?:what|how|where|when)", re.IGNORECASE),
-    re.compile(r"what(?:'s| is) the weather", re.IGNORECASE),
-    re.compile(r"(?:where|what) should we (?:eat|go|do|meet|get)", re.IGNORECASE),
-    re.compile(r"can someone (?:google|look up|find|check|search)", re.IGNORECASE),
-    re.compile(r"(?:what|who) (?:won|is winning|leads|scored)", re.IGNORECASE),
-    re.compile(r"what time (?:is|does|did|will)", re.IGNORECASE),
-    re.compile(r"when (?:is|does|did|will) ", re.IGNORECASE),
-    re.compile(r"how (?:far|long|much) (?:is|does|would|to) ", re.IGNORECASE),
-]
-
-_CHIME_IN_COOLDOWN = 600.0  # max 1 chime-in per group per 10 minutes
+_CHIME_IN_COOLDOWN = 120.0  # max 1 uninvited response per group per 2 minutes
+_CHIME_IN_CHECK_COOLDOWN = 15.0  # don't call the LLM decision endpoint more than once per 15s per group
 _chime_in_timestamps: dict[str, float] = {}
+_chime_in_check_timestamps: dict[str, float] = {}
 
-
-def _should_chime_in(text: str, chat_guid: str) -> bool:
-    """Detect if Nest should speak up without being mentioned."""
-    now = time.monotonic()
-    last = _chime_in_timestamps.get(chat_guid, 0)
-    if now - last < _CHIME_IN_COOLDOWN:
-        return False
-    for pattern in _CHIME_IN_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
+# Quick-reject: messages too short or clearly not for Nest
+_CHIME_IN_SKIP = re.compile(
+    r"^(?:lol|haha+|lmao|lmfao|nice|ok|okay|k|kk|yep|yea|yeah|nah|nope|true|same|omg|wtf|bruh|oof|rip|bet|fr|ikr|smh|tbh|ngl|idk|imo|fyi|gg|ez|w|l|f|dead|mood|slay|word|damn|dang|wow|ooh|ahh|hmm|mhm|hm|ye|ya|no|yes|cheers|thanks|thx|ty|np|sure|aight|ight|facts|cap|nocap|lowkey|highkey|sus|valid|based|lit|fire|goat|simp|vibe|vibes|salty|toxic|cringe|pog|sheesh|bussin|fam|bro|dude|mate|cunt|legend|sick|wicked|mint|ace|top|class)[\s!?.]*$",
+    re.IGNORECASE,
+)
 
 
 # ── Group Participant Tracker ─────────────────────────────────
@@ -376,6 +362,50 @@ class MessageProcessor:
         self._group_buffer = _GroupChatBuffer()
         self._user_cache = _UserCache(ttl=15.0)
         self._participant_tracker = _GroupParticipantTracker(config, self._http)
+
+    async def _should_nest_respond(self, text: str, chat_guid: str) -> bool:
+        """Ask the LLM whether Nest should respond to an unmentioned group message."""
+        now = time.monotonic()
+
+        # Rate limit: don't check too often per group
+        last_check = _chime_in_check_timestamps.get(chat_guid, 0)
+        if now - last_check < _CHIME_IN_CHECK_COOLDOWN:
+            return False
+
+        # Cooldown: don't respond too often per group
+        last_respond = _chime_in_timestamps.get(chat_guid, 0)
+        if now - last_respond < _CHIME_IN_COOLDOWN:
+            return False
+
+        # Quick-reject obvious non-triggers
+        if _CHIME_IN_SKIP.match(text.strip()):
+            return False
+
+        # Too short to be worth an LLM call
+        if len(text.strip()) < 5:
+            return False
+
+        _chime_in_check_timestamps[chat_guid] = now
+
+        try:
+            context = self._group_buffer.get_context(chat_guid)
+            resp = await self._http.post(
+                self.config.v2_group_should_respond_url,
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"messages": context[-8:], "current_message": text},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("respond", False)
+            logger.warning("v2-group-should-respond returned %d", resp.status_code)
+            return False
+        except Exception:
+            logger.warning("LLM chime-in check failed (non-blocking)", exc_info=True)
+            return False
 
     async def on_chat_db_changed(self) -> None:
         global _backoff
@@ -466,14 +496,14 @@ class MessageProcessor:
 
                     stripped = _extract_nest_mention(msg.text)
                     if stripped is None:
-                        # Check for chime-in opportunity
-                        if msg.chat_guid and _should_chime_in(msg.text, msg.chat_guid):
+                        # No explicit mention — ask LLM if Nest should respond
+                        if msg.chat_guid and await self._should_nest_respond(msg.text, msg.chat_guid):
                             _chime_in_timestamps[msg.chat_guid] = time.monotonic()
                             is_chime_in = True
-                            logger.info("Chime-in triggered for group %s: %s", (msg.chat_guid or "")[:20], msg.text[:80])
-                            _dbg(msg.sender, "🗣️ Chime-in triggered (uninvited)")
+                            logger.info("LLM chime-in triggered for group %s: %s", (msg.chat_guid or "")[:20], msg.text[:80])
+                            _dbg(msg.sender, "🗣️ LLM decided Nest should respond (uninvited)")
                         else:
-                            _dbg(msg.sender, "💤 Group message without @nest mention, buffered for context")
+                            _dbg(msg.sender, "💤 Group message, Nest not needed — buffered for context")
                             self.state.last_rowid = msg.rowid
                             self.state.processed_guids.add(msg.guid)
                             self.state.save()
