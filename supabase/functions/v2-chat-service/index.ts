@@ -133,16 +133,75 @@ Deno.serve(async (req: Request) => {
     let isFirstGroupInteraction = false;
 
     if (isGroup) {
-      // Group mode: use conversation context from the bridge (in-memory buffer)
+      // Group mode: load persisted history from DB, supplement with bridge buffer
+      const chatGuidForHistory = payload.chat_guid;
       const groupCtx = payload.group_context ?? [];
 
-      // Format group messages so the LLM knows who said what
-      recentChat = groupCtx.map((m) => {
-        if (m.role === "user" && m.name) {
-          return { role: m.role, content: `[${m.name}]: ${m.content}` };
+      if (chatGuidForHistory) {
+        // Load last 40 messages from DB for this group
+        const { data: dbMessages } = await supabaseAdmin
+          .from("v2_chat_messages")
+          .select("role, content, sender_name, created_at")
+          .eq("chat_guid", chatGuidForHistory)
+          .in("role", ["user", "assistant"])
+          .order("created_at", { ascending: false })
+          .limit(40);
+
+        if (dbMessages && dbMessages.length > 0) {
+          // DB messages are newest-first, reverse to chronological
+          recentChat = dbMessages.reverse().map((m: any) => ({
+            role: m.role,
+            content: m.role === "user" && m.sender_name
+              ? `[${m.sender_name}]: ${m.content}`
+              : m.content,
+            created_at: m.created_at,
+          }));
+        } else {
+          // No DB history yet, use bridge buffer
+          recentChat = groupCtx.map((m: any) => {
+            if (m.role === "user" && m.name) {
+              return { role: m.role, content: `[${m.name}]: ${m.content}` };
+            }
+            return { role: m.role, content: m.content };
+          });
         }
-        return { role: m.role, content: m.content };
-      });
+      } else {
+        // No chat_guid, fall back to bridge buffer
+        recentChat = groupCtx.map((m: any) => {
+          if (m.role === "user" && m.name) {
+            return { role: m.role, content: `[${m.name}]: ${m.content}` };
+          }
+          return { role: m.role, content: m.content };
+        });
+      }
+
+      // ── Persist bridge buffer messages we don't have in DB yet ──
+      // This catches messages between Nest's responses (e.g. group banter)
+      if (chatGuidForHistory && groupCtx.length > 0) {
+        const dbCount = recentChat.length;
+        // If bridge has more messages than DB, the extras are unbuffered context
+        // Bulk-insert them (fire-and-forget, best-effort)
+        if (groupCtx.length > dbCount || dbCount === 0) {
+          const toStore = groupCtx.slice(0, -1); // Exclude current message (stored separately)
+          if (toStore.length > 0) {
+            const rows = toStore
+              .filter((m: any) => m.content && m.content.trim())
+              .map((m: any) => ({
+                user_id: userId,
+                role: m.role === "assistant" ? "assistant" : "user",
+                content: m.content,
+                source: "group",
+                chat_guid: chatGuidForHistory,
+                sender_name: m.name ?? (m.role === "assistant" ? "Nest" : null),
+              }));
+            if (rows.length > 0) {
+              supabaseAdmin.from("v2_chat_messages").insert(rows)
+                .then(() => console.log(`[chat] Bulk-persisted ${rows.length} group context messages`))
+                .catch(() => {});
+            }
+          }
+        }
+      }
 
       // ── Load group enrichment context ──────────────────────
       const senderPhone = payload.sender_phone;
@@ -437,7 +496,20 @@ Deno.serve(async (req: Request) => {
 
     // ── Phase 2: Save user message ───────────────────────────
 
-    if (!isGroup) {
+    if (isGroup) {
+      // Store group message with chat_guid and sender info (fire-and-forget)
+      const chatGuidForSave = payload.chat_guid;
+      if (chatGuidForSave) {
+        supabaseAdmin.from("v2_chat_messages").insert({
+          user_id: userId,
+          role: "user",
+          content: message,
+          source: "group",
+          chat_guid: chatGuidForSave,
+          sender_name: user_name ?? null,
+        }).then(() => {}).catch(() => {});
+      }
+    } else {
       await supabaseAdmin.from("v2_chat_messages").insert({
         user_id: userId,
         role: "user",
@@ -575,13 +647,24 @@ Deno.serve(async (req: Request) => {
               savedContent = `${fullText}\n\n${meta}`;
             }
 
-            const { data: insertedRow } = await supabaseAdmin
-              .from("v2_chat_messages")
-              .insert({ user_id: userId, role: "assistant", content: savedContent })
-              .select("id")
-              .single();
-
-            const responseId = insertedRow?.id ?? null;
+            let responseId: string | null = null;
+            if (isGroup) {
+              // Group: persist with chat_guid (fire-and-forget)
+              const chatGuidStream = payload.chat_guid;
+              if (chatGuidStream) {
+                supabaseAdmin.from("v2_chat_messages").insert({
+                  user_id: userId, role: "assistant", content: response.text,
+                  source: "group", chat_guid: chatGuidStream, sender_name: "Nest",
+                }).then(() => {}).catch(() => {});
+              }
+            } else {
+              const { data: insertedRow } = await supabaseAdmin
+                .from("v2_chat_messages")
+                .insert({ user_id: userId, role: "assistant", content: savedContent })
+                .select("id")
+                .single();
+              responseId = insertedRow?.id ?? null;
+            }
             const totalMs = Date.now() - t0;
 
             console.log(
@@ -690,8 +773,20 @@ Deno.serve(async (req: Request) => {
 
     let responseId: string | null = null;
 
-    // Group chats: don't persist messages or update memory
-    if (!isGroup) {
+    if (isGroup) {
+      // Persist Nest's response for group chat history
+      const chatGuidForSave = payload.chat_guid;
+      if (chatGuidForSave) {
+        supabaseAdmin.from("v2_chat_messages").insert({
+          user_id: userId,
+          role: "assistant",
+          content: response.text,
+          source: "group",
+          chat_guid: chatGuidForSave,
+          sender_name: "Nest",
+        }).then(() => {}).catch(() => {});
+      }
+    } else {
       let savedContent = response.text;
       if (response.pendingActions.length > 0) {
         const meta = response.pendingActions
