@@ -138,14 +138,14 @@ Deno.serve(async (req: Request) => {
       const groupCtx = payload.group_context ?? [];
 
       if (chatGuidForHistory) {
-        // Load last 40 messages from DB for this group
+        // Load last 200 messages from DB — mini is cheap, context is king
         const { data: dbMessages } = await supabaseAdmin
           .from("v2_chat_messages")
           .select("role, content, sender_name, created_at")
           .eq("chat_guid", chatGuidForHistory)
           .in("role", ["user", "assistant"])
           .order("created_at", { ascending: false })
-          .limit(40);
+          .limit(200);
 
         if (dbMessages && dbMessages.length > 0) {
           // DB messages are newest-first, reverse to chronological
