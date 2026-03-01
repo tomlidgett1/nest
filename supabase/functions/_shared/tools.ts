@@ -159,6 +159,8 @@ export async function executeTool(
   userId: string,
   supabase: SupabaseClient,
   userTimezone?: string,
+  /** When provided, update_user_timezone will call this to update the timezone for subsequent tool calls in the same request. */
+  onTimezoneChange?: (newTz: string) => void,
 ): Promise<string> {
   try {
     const tz = userTimezone ?? DEFAULT_TZ;
@@ -167,6 +169,13 @@ export async function executeTool(
       args._userTimezone = tz;
     }
     const result = await dispatch(name, args, userId, supabase);
+
+    // If update_user_timezone succeeded, propagate the change to the current request
+    if (name === "update_user_timezone" && onTimezoneChange && typeof result === "object" && result !== null && (result as any)._confirmation) {
+      const newTz = (result as any).timezone as string;
+      if (newTz) onTimezoneChange(newTz);
+    }
+
     return typeof result === "string" ? result : JSON.stringify(result);
   } catch (e) {
     const msg = (e as Error).message ?? String(e);
