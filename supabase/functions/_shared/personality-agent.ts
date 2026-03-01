@@ -1648,6 +1648,74 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
   return concise.join("\n");
 }
 
+// ── Hallucination Guard ──────────────────────────────────────
+// Post-generation check for common fabrication patterns.
+// Strips hedged fabrications and flags suspicious content.
+
+// Patterns that strongly suggest the model fabricated a detail
+const HALLUCINATION_PHRASES = [
+  /\bfrom memory\b/i,
+  /\bif I recall\b/i,
+  /\bif I remember\b/i,
+  /\bI seem to recall\b/i,
+  /\bI believe (?:it was|the|your|you had)\b/i,
+  /\bI think (?:it was|the|your|you had|you're)\b/i,
+  /\bfrom what I remember\b/i,
+  /\bfrom what I recall\b/i,
+  /\blast time I checked\b/i,
+  /\bI'm pretty sure\b/i,
+  /\bif I'm not mistaken\b/i,
+  /\bI vaguely remember\b/i,
+];
+
+// Suspicious patterns: specific-looking data that might be fabricated
+const SUSPICIOUS_PATTERNS = [
+  // Fake booking refs (random alphanumeric that wasn't in tool results)
+  /\b(?:ref|reference|confirmation|booking)[:\s#]*[A-Z0-9]{6,}\b/i,
+  // Suspiciously specific prices without evidence
+  /\$[\d,]+\.\d{2}/,
+  // Fake flight numbers
+  /\b[A-Z]{2}\d{3,4}\b/,
+];
+
+function applyHallucinationGuard(text: string, toolsUsed: string[], hasEvidence: boolean): string {
+  // If no tools were used and no evidence was provided, the model is flying blind
+  // on factual queries. Check more aggressively.
+  const isUnsourced = toolsUsed.length === 0 && !hasEvidence;
+
+  let cleaned = text;
+
+  // Strip lines that contain hedged fabrication phrases
+  // (e.g. "From memory, your flight is QF430 at 6am" — almost certainly made up)
+  for (const pattern of HALLUCINATION_PHRASES) {
+    if (pattern.test(cleaned)) {
+      // Replace the entire line containing the phrase with nothing
+      const lines = cleaned.split("\n");
+      const filtered = lines.filter(line => !pattern.test(line));
+
+      // If we'd remove everything, just flag it instead
+      if (filtered.length === 0 || filtered.every(l => !l.trim())) {
+        console.warn(`[hallucination-guard] Entire response matched fabrication pattern: ${pattern}`);
+        return "I don't have that info right now. Want me to look it up?";
+      }
+
+      cleaned = filtered.join("\n");
+      console.warn(`[hallucination-guard] Stripped line matching: ${pattern}`);
+    }
+  }
+
+  // Log suspicious patterns (don't strip — could be legitimate from tool results)
+  if (isUnsourced) {
+    for (const pattern of SUSPICIOUS_PATTERNS) {
+      if (pattern.test(cleaned)) {
+        console.warn(`[hallucination-guard] Suspicious unsourced pattern in response: ${pattern}`);
+      }
+    }
+  }
+
+  return cleaned;
+}
+
 // ── Inline Ack (nano, fires in parallel with agent) ─────────
 
 const TOOL_QUERY_SIGNALS = [
@@ -1939,9 +2007,11 @@ export async function handleMessage(
     },
   );
 
-  // 8. Format
+  // 8. Format + hallucination guard
   const rawLlmResponse = result.text;
-  const text = enforceRealtimeDiscipline(message, formatForIMessage(rawLlmResponse), ctx.user.timezone);
+  const formatted = enforceRealtimeDiscipline(message, formatForIMessage(rawLlmResponse), ctx.user.timezone);
+  const hasEvidence = !!(prefetchedEvidence || ragEvidence || ctx.evidence);
+  const text = applyHallucinationGuard(formatted, toolsUsed, hasEvidence);
   const latencyMs = Date.now() - start;
 
   console.log(

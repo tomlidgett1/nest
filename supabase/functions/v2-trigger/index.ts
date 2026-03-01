@@ -377,8 +377,8 @@ Your job: give them a concise, actionable meeting brief they can scan in 30 seco
 - Last message: one sharp tip or good-luck note
 - Bold **names**, **numbers**, **decisions**, **action items**
 - Use Australian English (summarise, analyse, colour)
-- NEVER fabricate information. Only use what's in the provided context.
-- If you have very little context, keep it brief, just the heads-up and attendees
+- NEVER fabricate information. Only use what's in the provided context. NEVER invent attendee names, discussion points, decisions, numbers, or action items that aren't in the context.
+- If you have very little context, keep it brief, just the heads-up and attendees. An honest "don't have much context on this one" is better than invented prep notes.
 - Don't say "Let me know if you need anything" or any filler
 - Be specific. Quote actual data points, decisions, and names from the context.
 - NEVER use emojis.
@@ -452,7 +452,8 @@ Think about:
 - What would a personal assistant need to know to be maximally helpful today?
 
 Output a concise briefing (max 200 words). Be specific with dates, locations,
-and names. No fluff. No formatting. Just plain text.`;
+and names. No fluff. No formatting. Just plain text.
+CRITICAL: Only include facts present in the provided data. Never invent events, people, or details not in the input.`;
 
 async function handleDailyBriefings(): Promise<Response> {
   try {
