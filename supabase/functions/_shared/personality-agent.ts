@@ -87,6 +87,8 @@ export interface NestContext {
   videoMeetingCount?: number | null;
   /** Mutable timezone holder — allows update_user_timezone to take effect mid-request */
   timezoneHolder?: TimezoneHolder;
+  /** True when user is messaging 1:1 for the first time after interacting in a group chat */
+  groupTransition?: boolean;
 }
 
 // ── Identity Model Type ──────────────────────────────────────
@@ -1345,6 +1347,17 @@ function buildConversationHistory(
   // PDL welcome context (first message only, if no rich profile yet)
   if (!isMinimal && needsProfile && ctx.pdlWelcomeContext?.trim() && !ctx.userProfile) {
     contextSections.push(`FIRST MESSAGE INTEL REVEAL: Answer their question first, then casually weave in ONE detail from this profile. Cheeky, not creepy. Don't dump their CV.\n\nPROFILE INTEL:\n${ctx.pdlWelcomeContext}`);
+  }
+
+  // Group-to-private chat transition (one-time acknowledgment)
+  if (ctx.groupTransition) {
+    contextSections.push(
+      `GROUP TO PRIVATE TRANSITION: This user previously interacted with you in a group chat. ` +
+      `This is their first private conversation. Acknowledge it once, naturally: ` +
+      `"good call sliding into the DMs, way more I can do when it's just us" or similar. ` +
+      `Don't explain what's different. Just show them by being more personal and capable. ` +
+      `One-time acknowledgment only, then move on to whatever they need.`,
+    );
   }
 
   // Inject context directly into the first user message as a tagged block.

@@ -118,6 +118,44 @@ def get_max_rowid(chat_db_path: Path) -> int:
         conn.close()
 
 
+def get_group_participants(chat_db_path: Path, chat_guid: str) -> list[str]:
+    """Return all participant phone numbers/handles for a group chat.
+
+    Queries the chat_handle_join table to get every handle associated
+    with this chat.  Read-only, never conflicts with Messages.app.
+    """
+    uri = f"file:{chat_db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA query_only=ON")
+        rows = conn.execute(
+            """
+            SELECT h.id
+            FROM handle h
+            JOIN chat_handle_join chj ON h.ROWID = chj.handle_id
+            JOIN chat c ON c.ROWID = chj.chat_id
+            WHERE c.guid = ?
+            """,
+            (chat_guid,),
+        ).fetchall()
+        participants = [row[0] for row in rows if row[0]]
+        logger.info(
+            "Group %s has %d participants",
+            chat_guid[:30] if chat_guid else "?",
+            len(participants),
+        )
+        return participants
+    except Exception:
+        logger.exception(
+            "Failed to query group participants for %s",
+            chat_guid[:30] if chat_guid else "?",
+        )
+        return []
+    finally:
+        conn.close()
+
+
 def fetch_new_messages(
     chat_db_path: Path,
     target_phone: str | None,

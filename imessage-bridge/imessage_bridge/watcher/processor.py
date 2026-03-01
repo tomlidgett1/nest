@@ -14,7 +14,7 @@ import httpx
 from ..config import Config
 from ..sender.imessage import send_imessage, send_reaction
 from ..state import BridgeState
-from .chat_db import IncomingMessage, fetch_new_messages
+from .chat_db import IncomingMessage, fetch_new_messages, get_group_participants
 
 logger = logging.getLogger("imessage_bridge.watcher.processor")
 _debug_logger = logging.getLogger("imessage_bridge.debug")
@@ -238,6 +238,110 @@ class _GroupChatBuffer:
             self._last_activity.pop(k, None)
 
 
+# ── Chime-in detection ────────────────────────────────────────
+# Patterns where Nest should speak up without being mentioned.
+
+_CHIME_IN_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?:does )?anyone know (?:what|how|where|when)", re.IGNORECASE),
+    re.compile(r"what(?:'s| is) the weather", re.IGNORECASE),
+    re.compile(r"(?:where|what) should we (?:eat|go|do|meet|get)", re.IGNORECASE),
+    re.compile(r"can someone (?:google|look up|find|check|search)", re.IGNORECASE),
+    re.compile(r"(?:what|who) (?:won|is winning|leads|scored)", re.IGNORECASE),
+    re.compile(r"what time (?:is|does|did|will)", re.IGNORECASE),
+    re.compile(r"when (?:is|does|did|will) ", re.IGNORECASE),
+    re.compile(r"how (?:far|long|much) (?:is|does|would|to) ", re.IGNORECASE),
+]
+
+_CHIME_IN_COOLDOWN = 600.0  # max 1 chime-in per group per 10 minutes
+_chime_in_timestamps: dict[str, float] = {}
+
+
+def _should_chime_in(text: str, chat_guid: str) -> bool:
+    """Detect if Nest should speak up without being mentioned."""
+    now = time.monotonic()
+    last = _chime_in_timestamps.get(chat_guid, 0)
+    if now - last < _CHIME_IN_COOLDOWN:
+        return False
+    for pattern in _CHIME_IN_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+# ── Group Participant Tracker ─────────────────────────────────
+
+class _GroupParticipantTracker:
+    """Tracks known groups and triggers participant discovery + enrichment."""
+
+    def __init__(self, config: Config, http: httpx.AsyncClient) -> None:
+        self._config = config
+        self._http = http
+        self._known_groups: dict[str, float] = {}      # chat_guid -> last_scan_time
+        self._known_participants: dict[str, set[str]] = {}  # chat_guid -> phone set
+        self._scan_interval = 3600.0  # re-scan participants every hour
+
+    async def on_group_message(self, chat_guid: str, sender: str) -> None:
+        """Called for every group message. Discovers participants if needed."""
+        now = time.monotonic()
+
+        if chat_guid not in self._known_participants:
+            self._known_participants[chat_guid] = set()
+        sender_is_new = sender not in self._known_participants[chat_guid]
+        self._known_participants[chat_guid].add(sender)
+
+        # Full participant scan if new group or hourly interval elapsed
+        should_scan = (
+            chat_guid not in self._known_groups
+            or now - self._known_groups.get(chat_guid, 0) > self._scan_interval
+        )
+
+        if should_scan:
+            participants = get_group_participants(
+                self._config.chat_db_path, chat_guid
+            )
+            new_phones = set(participants) - self._known_participants.get(chat_guid, set())
+            self._known_participants[chat_guid] = set(participants)
+            self._known_participants[chat_guid].add(sender)  # sender might not be in chat_handle_join yet
+            self._known_groups[chat_guid] = now
+
+            if participants:
+                asyncio.create_task(
+                    self._sync_participants(chat_guid, list(self._known_participants[chat_guid]))
+                )
+                logger.info(
+                    "Group scan: %d participants for %s (%d new)",
+                    len(participants), chat_guid[:20], len(new_phones),
+                )
+        elif sender_is_new:
+            # New sender discovered via messaging
+            asyncio.create_task(self._sync_participants(chat_guid, [sender]))
+
+    async def _sync_participants(self, chat_guid: str, phones: list[str]) -> None:
+        """POST participant phones to v2-group-sync edge function."""
+        try:
+            resp = await self._http.post(
+                f"{self._config.supabase_url}/functions/v1/v2-group-sync",
+                headers={
+                    "Authorization": f"Bearer {self._config.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"chat_guid": chat_guid, "phones": phones},
+                timeout=15.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                logger.info(
+                    "Group sync: %d new, %d existing, %d enriched",
+                    data.get("new_prospects", 0),
+                    data.get("existing_prospects", 0),
+                    data.get("enriched", 0),
+                )
+            else:
+                logger.warning("v2-group-sync returned %d: %s", resp.status_code, resp.text[:200])
+        except Exception:
+            logger.warning("Failed to sync group participants (non-blocking)", exc_info=True)
+
+
 class MessageProcessor:
     """Watches for new iMessages and routes them based on user status."""
 
@@ -249,6 +353,7 @@ class MessageProcessor:
         self._last_send_time: float = 0.0
         self._group_buffer = _GroupChatBuffer()
         self._user_cache = _UserCache(ttl=15.0)
+        self._participant_tracker = _GroupParticipantTracker(config, self._http)
 
     async def on_chat_db_changed(self) -> None:
         global _backoff
@@ -322,7 +427,8 @@ class MessageProcessor:
                 _dbg(msg.sender, "-" * 70)
 
                 # Group chat: always buffer the message for context,
-                # but only respond if Nest is mentioned
+                # track participants, and check for mention or chime-in
+                is_chime_in = False
                 if msg.is_group:
                     if msg.chat_guid:
                         sender_label = msg.sender
@@ -331,23 +437,36 @@ class MessageProcessor:
                             sender_label = cached["display_name"]
                         self._group_buffer.append(msg.chat_guid, "user", msg.text, sender_name=sender_label)
 
+                        # Track participants (async, non-blocking)
+                        asyncio.create_task(
+                            self._participant_tracker.on_group_message(msg.chat_guid, msg.sender)
+                        )
+
                     stripped = _extract_nest_mention(msg.text)
                     if stripped is None:
-                        _dbg(msg.sender, "💤 Group message without @nest mention, buffered for context")
-                        self.state.last_rowid = msg.rowid
-                        self.state.processed_guids.add(msg.guid)
-                        self.state.save()
-                        continue
-                    _dbg(msg.sender, "🏷️ Nest mentioned in group, stripped text: %s", stripped[:100])
-                    msg = IncomingMessage(
-                        rowid=msg.rowid,
-                        guid=msg.guid,
-                        text=stripped,
-                        sender=msg.sender,
-                        timestamp=msg.timestamp,
-                        is_group=msg.is_group,
-                        chat_guid=msg.chat_guid,
-                    )
+                        # Check for chime-in opportunity
+                        if msg.chat_guid and _should_chime_in(msg.text, msg.chat_guid):
+                            _chime_in_timestamps[msg.chat_guid] = time.monotonic()
+                            is_chime_in = True
+                            logger.info("Chime-in triggered for group %s: %s", (msg.chat_guid or "")[:20], msg.text[:80])
+                            _dbg(msg.sender, "🗣️ Chime-in triggered (uninvited)")
+                        else:
+                            _dbg(msg.sender, "💤 Group message without @nest mention, buffered for context")
+                            self.state.last_rowid = msg.rowid
+                            self.state.processed_guids.add(msg.guid)
+                            self.state.save()
+                            continue
+                    else:
+                        _dbg(msg.sender, "🏷️ Nest mentioned in group, stripped text: %s", stripped[:100])
+                        msg = IncomingMessage(
+                            rowid=msg.rowid,
+                            guid=msg.guid,
+                            text=stripped,
+                            sender=msg.sender,
+                            timestamp=msg.timestamp,
+                            is_group=msg.is_group,
+                            chat_guid=msg.chat_guid,
+                        )
 
                 if i > 0:
                     await asyncio.sleep(_INTER_MESSAGE_DELAY)
@@ -368,8 +487,8 @@ class MessageProcessor:
                         # context for group messages anyway.
                         group_user_id = (user_info or {}).get("user_id") or "group-anonymous"
                         group_display = (user_info or {}).get("display_name") or msg.sender
-                        group_info = {"user_id": group_user_id, "display_name": group_display}
-                        _dbg(msg.sender, "👥 Group route → _process_active_user() (user_id=%s)", group_user_id)
+                        group_info = {"user_id": group_user_id, "display_name": group_display, "_is_chime_in": is_chime_in}
+                        _dbg(msg.sender, "👥 Group route → _process_active_user() (user_id=%s, chime_in=%s)", group_user_id, is_chime_in)
                         await self._process_active_user(msg, group_info)
                     elif user_info is None:
                         _dbg(msg.sender, "🆕 Routing → _onboard_new_user()")
@@ -435,9 +554,36 @@ class MessageProcessor:
 
     # ── New User Onboarding ───────────────────────────────────
 
+    async def _check_group_prospect(self, phone: str) -> bool:
+        """Check if this phone number has interacted with Nest in any group chat."""
+        try:
+            resp = await self._http.get(
+                f"{self.config.supabase_url}/rest/v1/group_prospects",
+                params={
+                    "phone_number": f"eq.{phone}",
+                    "select": "id,interaction_count",
+                    "limit": "1",
+                },
+                headers={
+                    "Authorization": f"Bearer {self.config.supabase_service_role_key}",
+                    "apikey": self.config.supabase_service_role_key,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return len(data) > 0 and (data[0].get("interaction_count", 0) > 0)
+        except Exception:
+            logger.debug("Group prospect check failed (non-blocking)")
+        return False
+
     async def _onboard_new_user(self, msg: IncomingMessage) -> None:
         """Create a new imessage_users entry and start the conversational onboarding."""
         logger.info("New user detected: %s", msg.sender)
+
+        # Check if this person was seen in a group chat (for transition messaging)
+        from_group = await self._check_group_prospect(msg.sender)
+        if from_group:
+            logger.info("New user %s previously interacted in a group chat", msg.sender)
 
         try:
             resp = await self._http.post(
@@ -482,7 +628,7 @@ class MessageProcessor:
             return
 
         onboard_url = f"https://nest.expert/?token={token}"
-        await self._call_onboard_chat(msg, history=[], message_count=1, onboard_url=onboard_url)
+        await self._call_onboard_chat(msg, history=[], message_count=1, onboard_url=onboard_url, from_group=from_group)
 
     # ── Continue Onboarding Conversation ─────────────────────
 
@@ -584,6 +730,7 @@ class MessageProcessor:
         message_count: int,
         onboard_url: str,
         pdl_context: str | None = None,
+        from_group: bool = False,
     ) -> None:
         """Call v2-onboard-chat and send the response."""
         try:
@@ -596,6 +743,8 @@ class MessageProcessor:
             }
             if pdl_context:
                 payload["pdl_context"] = pdl_context
+            if from_group:
+                payload["from_group"] = True
 
             edge_timeout = 25.0 if message_count <= 1 else 20.0
             resp = await self._http.post(
@@ -678,8 +827,9 @@ class MessageProcessor:
 
         agent_start = time.monotonic()
 
-        _dbg(msg.sender, "💬 Calling agent (streaming)")
-        response_text, reaction = await self._forward_to_agent_streaming(msg, user_id, display_name)
+        is_chime_in = user_info.get("_is_chime_in", False)
+        _dbg(msg.sender, "💬 Calling agent (streaming, chime_in=%s)", is_chime_in)
+        response_text, reaction = await self._forward_to_agent_streaming(msg, user_id, display_name, is_chime_in=is_chime_in)
 
         agent_elapsed = time.monotonic() - agent_start
         _dbg(msg.sender, "⏱ Agent round-trip: %.1fs", agent_elapsed)
@@ -811,7 +961,8 @@ class MessageProcessor:
         return response_text
 
     async def _forward_to_agent_streaming(
-        self, msg: IncomingMessage, user_id: str, display_name: str | None = None
+        self, msg: IncomingMessage, user_id: str, display_name: str | None = None,
+        *, is_chime_in: bool = False,
     ) -> tuple[str | None, str | None]:
         """POST to v2-chat-service and handle NDJSON streaming.
 
@@ -825,7 +976,11 @@ class MessageProcessor:
             body["user_name"] = display_name
         if msg.is_group:
             body["is_group"] = True
+            body["sender_phone"] = msg.sender
+            if is_chime_in:
+                body["is_chime_in"] = True
             if msg.chat_guid:
+                body["chat_guid"] = msg.chat_guid
                 group_ctx = self._group_buffer.get_context(msg.chat_guid)
                 if group_ctx:
                     body["group_context"] = group_ctx

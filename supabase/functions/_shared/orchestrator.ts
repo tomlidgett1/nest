@@ -204,6 +204,8 @@ function detectLightIntent(message: string): LightAgentIntent {
   if (/(?:am\s+i\s+(?:free|busy)\s+(?:today|tomorrow|this\s+afternoon|this\s+morning|on\s+))/i.test(message)) return "calendar";
   if (/(?:do\s+i\s+have\s+(?:any\s+)?(?:meetings?|calls?|events?)\s+(?:today|tomorrow|this\s+week))/i.test(message)) return "calendar";
   if (/(?:what(?:'s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow)(?:'s)?\s+(?:schedule|calendar|agenda))/i.test(message)) return "calendar";
+  if (/(?:what(?:'s|\s+is)\s+(?:on|in)\s+my\s+\w+\s+calendar)/i.test(message)) return "calendar";
+  if (/(?:show\s+(?:me\s+)?my\s+\w+\s+calendar)/i.test(message)) return "calendar";
 
   // Weather
   if (/\b(?:weather|temperature|forecast|rain(?:ing)?|umbrella|humid|cold outside|hot outside)\b/i.test(message)) return "weather";
@@ -332,6 +334,8 @@ const CALENDAR_PREFETCH_PATTERNS = [
   /do\s+i\s+have\s+(?:any\s+)?(?:meetings?|calls?|events?)\s+(?:today|tomorrow|this\s+week)/i,
   /am\s+i\s+(?:free|busy)\s+(?:today|tomorrow|this\s+afternoon|this\s+morning|on\s+)/i,
   /what(?:'s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow)(?:'s)?\s+(?:schedule|calendar|agenda)/i,
+  /what(?:'s|\s+is)\s+(?:on|in)\s+my\s+\w+\s+calendar/i,
+  /show\s+(?:me\s+)?my\s+\w+\s+calendar/i,
 ];
 
 const INBOX_PREFETCH_PATTERNS = [
@@ -389,7 +393,11 @@ function detectPrefetch(message: string): PrefetchTask[] {
 
   // Calendar prefetch — only when the message is about schedule/meetings
   if (CALENDAR_PREFETCH_PATTERNS.some((p) => p.test(message))) {
-    const range = extractTemporalHint(message) ?? "today";
+    const explicitRange = extractTemporalHint(message);
+    // When asking about a specific calendar by name with no time range,
+    // default to "this_week" instead of "today" so they see a useful overview
+    const isCalendarNameQuery = /(?:my\s+\w+\s+calendar|show\s+(?:me\s+)?my\s+\w+\s+calendar)/i.test(message);
+    const range = explicitRange ?? (isCalendarNameQuery ? "this_week" : "today");
     tasks.push({ tool: "calendar_lookup", args: { range } });
   }
 
@@ -480,7 +488,8 @@ const AGENT_TOOLS: ToolDefinition[] = [
       description:
         "Look up calendar events across all connected accounts (Google Calendar and Microsoft Outlook). " +
         "Returns event titles, times, attendees, locations. " +
-        "Results include 'account' and 'provider' fields.",
+        "Results include 'account', 'calendar' (calendar name), and 'provider' fields. " +
+        "Each account may have multiple calendars (e.g. 'Work', 'Personal', 'Blacklane').",
       parameters: {
         type: "object",
         properties: {
@@ -490,7 +499,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           },
           query: {
             type: "string",
-            description: "Optional filter by title, attendee name, or description.",
+            description: "Optional filter by title, attendee name, description, calendar name, or account email. Use to find events in a specific calendar (e.g. 'blacklane' to find events in a Blacklane calendar).",
           },
         },
         required: ["range"],
@@ -1075,6 +1084,7 @@ F) Your inference = never present as fact
 Use tools proactively. Call BEFORE responding.
 
 Schedule / "what do I have on" → calendar_lookup + merge SITUATIONAL CONTEXT
+"What's in my [X] calendar" → calendar_lookup with query="[X]" to filter by calendar name
 Book meeting → calendar_lookup (check conflicts) → calendar_create
 Reschedule/cancel → calendar_lookup → confirm with user → calendar_update/delete
 Person info → person_lookup + semantic_search IN PARALLEL
@@ -1085,7 +1095,7 @@ Weekly summary → gmail_search + calendar_lookup IN PARALLEL
 Draft email → gather context → send_draft → show draft → user confirms → send_email
 Travel / trip / "what am I doing in [city]" → gmail_search + semantic_search + calendar_lookup ALL IN PARALLEL first
 Accommodation / booking → gmail_search + calendar_lookup IN PARALLEL. Search broadly. ALWAYS get_email for exact details.
-Location/timezone change → update_user_timezone immediately (map city to IANA). Timezone is auto-detected from context, but call update_user_timezone if you notice a mismatch.
+Location/timezone change → update_user_timezone IMMEDIATELY (map city to IANA). If you know from ANY source (memory, profile, learnings, conversation, calendar events with foreign locations) that the user is not where the stored timezone says, call update_user_timezone BEFORE answering. Never present times in the wrong timezone.
 Reminder → manage_reminder. If clear, set and confirm with EXACTLY one message + ✓. No pre-confirmation, no follow-up.
 Todo → manage_todos
 Documents → document_search, fall back to semantic_search
@@ -1104,7 +1114,7 @@ Contact → contacts_search → contacts_manage
 
 SEARCH CHAINING: For bookings/reservations/flights, never say "can't find it" after one source. Try: prefetch → gmail_search + calendar_lookup (parallel) → broaden query → semantic_search → ask user.
 
-FOLLOW-UP DATA: For follow-ups about data you already showed, use conversation history. Don't re-search from scratch.
+FOLLOW-UP DATA: For follow-ups about data you already showed, use conversation history. Don't re-search from scratch. If you just mentioned a link, deck, document, or detail and the user says "show me" or "send it", act on what you JUST said. Never ask "which one?" when there's only one obvious referent in your last message.
 
 RECOMMENDATIONS: Ask ONE clarifying question first unless constraints are clear. If you ask, STOP and wait.
 
@@ -1200,8 +1210,9 @@ function buildAgentSystemPrompt(user: NestUser): string {
 
 Current time: ${timeStr} (${tzAbbr})
 User timezone: ${tz}
-Current location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
-IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised. Timezone is auto-detected from conversation context — if it looks wrong, call update_user_timezone.
+Stored location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
+IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
+TIMEZONE CHECK: If you know from memory, learnings, profile, or conversation that the user is NOT in ${tzToCity(tz)} right now (e.g. they're travelling), call update_user_timezone IMMEDIATELY before doing anything else. Present all times in their ACTUAL current timezone, not the stored one.
 User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
 
 You are ${user.name}'s person. You know ${user.name}. Use their name naturally in conversation.`;
@@ -1228,14 +1239,16 @@ Never state real-time numbers from memory. If a tool fails: "Hmm, couldn't do th
 Keep responses concise. Each line = separate iMessage bubble.
 
 ─── TIMEZONE ───
-Timezone is auto-detected from conversation context. If it still looks wrong (e.g. times don't match where the user is), call update_user_timezone to fix it.`;
+Timezone is auto-detected from conversation context but may be stale. BEFORE presenting any times, verify the stored timezone matches where the user actually is. Check memory, learnings, and conversation for travel/location clues. If there's a mismatch, call update_user_timezone FIRST. Never present times in the wrong timezone.`;
 
 const LIGHT_INTENT_INSTRUCTIONS: Record<string, string> = {
   calendar: `
 ─── CALENDAR ───
 "What do I have on" / schedule → calendar_lookup + ALWAYS merge with SITUATIONAL CONTEXT commitments.
 "Am I free" → calendar_lookup for the time range.
+"What's in my [X] calendar" → calendar_lookup with query="[X]" to filter by calendar name.
 All times are in the user's timezone. Present in their local time.
+Events have a "calendar" field (e.g. "Work", "Personal", "Blacklane") — use it to group or filter when the user asks about a specific calendar.
 
 Format: short conversational intro, then timeline in <nest-content>:
 Pretty light today
@@ -1299,7 +1312,8 @@ Rules:
 - If result has "_transit_fallback": true (web search fallback, common in Japan/Asia), still use the card format but show service name, typical duration, frequency, and fare instead of exact times. Never dump raw web snippets.`,
 
   time: `Look up the time. Present it clearly, 1 line.
-For "next" phrasing, resolve from current local time, not tomorrow by default.`,
+For "next" phrasing, resolve from current local time, not tomorrow by default.
+If the user asks "what timezone am I in" or similar, check if the stored timezone matches where they actually are (from memory, learnings, profile). If it's wrong, call update_user_timezone FIRST to correct it, then answer with the corrected timezone.`,
 
   places: `For recommendation-style place asks (restaurants, shopping, bars, movies, things to do), ask EXACTLY ONE clarifying question first unless constraints are already clear (location/type/budget/timing).
 If you ask that question, return only the question in this turn and wait for their reply.
@@ -1343,6 +1357,7 @@ ${intentBlock}
 ─── USER CONTEXT ───
 Current time: ${timeStr} (${tzAbbr})
 User timezone: ${tz}
+If you know the user is NOT in ${tzToCity(tz)} right now, call update_user_timezone FIRST.
 User: ${user.name} | ${user.email}${accountsLine}`;
 }
 
@@ -1386,16 +1401,23 @@ const TOOL_SUBSETS: Record<string, string[]> = {
   currency: ["web_search"],
   reminder: ["manage_reminder", "update_user_timezone"],
   todo: ["manage_todos"],
-  time: ["web_search"],
+  time: ["web_search", "update_user_timezone"],
   transit: ["travel_time", "web_search", "update_user_timezone"],
   places: ["places_search", "web_search", "update_user_timezone"],
-  inbox: ["gmail_search", "get_email"],
+  inbox: ["gmail_search", "get_email", "update_user_timezone"],
 };
 
 function getToolSubset(intent: string): ToolDefinition[] {
   const names = TOOL_SUBSETS[intent];
   if (!names) return AGENT_TOOLS;
   return AGENT_TOOLS.filter(t => names.includes(t.function.name));
+}
+
+// Group chats: only public-data tools. NO calendar, email, contacts, documents.
+const GROUP_TOOL_NAMES = ["weather_lookup", "web_search", "places_search", "travel_time"];
+
+function getGroupToolSubset(): ToolDefinition[] {
+  return AGENT_TOOLS.filter(t => GROUP_TOOL_NAMES.includes(t.function.name));
 }
 
 // ── Casual System Prompt ─────────────────────────────────────
@@ -1432,34 +1454,67 @@ function buildGroupSystemPrompt(user: NestUser): string {
     timeZone: user.timezone,
   });
 
-  return `You are Nest, an AI assistant in a group iMessage chat. Someone tagged you to help.
+  let prompt = `You are Nest, an AI mate in a group iMessage chat. Someone tagged you.
 Current time: ${timeStr}
 
 CRITICAL PRIVACY RULES:
 - You are in a GROUP CHAT. Multiple people can see your messages.
-- NEVER reference private data: calendars, emails, notes, contacts, personal schedules, meetings, or any user-specific information.
+- NEVER reference private data: calendars, emails, notes, contacts, personal schedules, meetings.
 - NEVER use tools that access private data (calendar, email, contacts, documents).
 - You have NO memory of private conversations with anyone in this group.
-- If someone asks you to check their calendar, email, or anything personal, politely say you can only do that in a private 1:1 chat.
-- If asked "what do you know about me", say nothing — you don't share personal info in group settings.
+- If someone asks you to check their calendar, email, or anything personal: "jump into my DMs for that, can't do personal stuff where everyone can see"
+- If asked "what do you know about me", say nothing. You don't share personal info in group settings.
 
 WHAT YOU CAN DO:
-- General knowledge questions, trivia, recommendations
-- Weather lookups (public data)
-- Settle debates, give opinions, make suggestions
-- Be funny, witty, helpful with general topics
-- Help the group make decisions (where to eat, what to do, etc.)
+- General knowledge, trivia, recommendations, opinions
+- Weather lookups, web searches (public data only)
+- Settle debates, help make group decisions (where to eat, what to do, etc.)
+- Be witty, sharp, genuinely helpful with general topics
+- Reference what people in this group do for work (public knowledge only)
 
 PERSONALITY:
 - You're the clever mate everyone added to the group chat
-- Sharp, witty, concise. You can banter with the group
-- Keep responses short — 1-3 lines. This is a group chat, not a lecture
+- Sharp, witty, concise. Banter is your default mode
+- Keep responses short: 1-3 lines. This is a group chat, not a lecture
 - Each line = separate iMessage bubble
 - Australian English. No emojis unless they used them. NEVER use em dashes
-- Match the group's energy. If they're joking around, joke back
+- Match the group's energy. If they're roasting someone, you can be savage. If they're planning, be actually useful`;
 
-SECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details.
+  // Vibe-specific adaptation
+  const vibe = user.groupVibe;
+  if (vibe && vibe !== "mixed") {
+    const vibeInstructions: Record<string, string> = {
+      banter: `\n\nGROUP VIBE: Banter mode. This group takes the piss. You can be savage, roast people, be unhinged. Match their energy. If someone says "roast my friend", go hard. They can handle it.`,
+      professional: `\n\nGROUP VIBE: Professional. These people are talking work. Be sharp and competent, but still have personality. Don't be a corporate chatbot. Think smart colleague, not HR department.`,
+      planning: `\n\nGROUP VIBE: Planning mode. They're organising something. Be actually helpful: suggest places, times, logistics. Make decisions easier. Cut through the "idk what do you want to do" energy.`,
+      supportive: `\n\nGROUP VIBE: Supportive. Someone's going through something. Be warm but not saccharine. Real empathy, not "thoughts and prayers". Keep it genuine.`,
+    };
+    if (vibeInstructions[vibe]) prompt += vibeInstructions[vibe];
+  }
+
+  // Participant awareness
+  if (user.groupParticipantProfiles) {
+    prompt += `\n\nPEOPLE IN THIS GROUP (public info only, use naturally):
+${user.groupParticipantProfiles}
+Use this to make the conversation better. If someone asks a question and you know someone else in the group has relevant expertise, you can mention them. Don't be creepy. Don't recite their resume. Use it like a friend who happens to know what everyone does.`;
+  }
+
+  // First interaction wow factor
+  if (user.isFirstGroupInteraction && user.senderProfile) {
+    prompt += `\n\nFIRST MEETING: This is ${user.name}'s first time talking to you. Their public profile:
+${user.senderProfile}
+Work a subtle reference to their world into your response. Not "I see you work at X" but something that shows you're switched on. One detail, woven in naturally. If the profile is thin, skip it entirely.`;
+  }
+
+  // Chime-in behaviour
+  if (user.isChimeIn) {
+    prompt += `\n\nCHIME-IN: You're jumping in uninvited because this looks like something you can help with. Be brief and useful. If you're wrong about what they need, one line max and move on. Don't announce yourself.`;
+  }
+
+  prompt += `\n\nSECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details.
 Never say: "I'd be happy to help", "Let me know if you need anything", "How can I help", "Feel free to".`;
+
+  return prompt;
 }
 
 function buildQuickExitSystemPrompt(user: NestUser): string {
@@ -1513,6 +1568,13 @@ export interface NestUser {
   connectedAccounts?: Array<{ email: string; isPrimary: boolean; provider?: "google" | "microsoft" }>;
   isGroup?: boolean;
   testing?: boolean;
+  // Group chat enrichment
+  groupParticipantProfiles?: string;
+  groupVibe?: string;
+  senderProfile?: string;
+  isFirstGroupInteraction?: boolean;
+  senderPhone?: string;
+  isChimeIn?: boolean;
 }
 
 /**
@@ -1530,12 +1592,29 @@ export function routeMessage(
 ): RoutingResult {
   const cleaned = message.toLowerCase().replace(/[^\w\s']/g, "").trim();
 
-  // Group chat: always casual path, no tools, no private context
+  // Group chat: upgraded routing with selective tools for substantive queries
   if (user.isGroup) {
-    console.log(`[orchestrator] Group → ${MODELS.fast} (no tools, no private data)`);
+    // Check if the message needs tools (weather, web search, places, etc.)
+    const groupNeedsTools = /\b(weather|forecast|temperature|rain|how far|how long|distance|restaurant|bar|cafe|place|directions|search|look up|find|google|score|results?|price)\b/i.test(message);
+
+    if (groupNeedsTools) {
+      const groupTools = getGroupToolSubset();
+      console.log(`[orchestrator] Group (substantive) → ${MODELS.agent_light} with ${groupTools.length} tools`);
+      return {
+        path: "agent",
+        model: MODELS.agent_light,
+        maxTokens: 400,
+        systemPrompt: buildGroupSystemPrompt(user),
+        tools: groupTools,
+        contextDepth: "minimal",
+        skipAck: true,
+      };
+    }
+
+    console.log(`[orchestrator] Group (casual) → ${MODELS.agent_light} (no tools)`);
     return {
       path: "casual",
-      model: MODELS.fast,
+      model: MODELS.agent_light,
       maxTokens: 300,
       systemPrompt: buildGroupSystemPrompt(user),
       tools: null,

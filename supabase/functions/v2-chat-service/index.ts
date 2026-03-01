@@ -60,6 +60,9 @@ Deno.serve(async (req: Request) => {
     user_name?: string;
     is_group?: boolean;
     group_context?: Array<{ role: string; content: string; name?: string }>;
+    sender_phone?: string;
+    chat_guid?: string;
+    is_chime_in?: boolean;
     _qa_variation?: string;
     /** Client-provided IANA timezone (e.g. "Asia/Tokyo"). Takes priority over DB timezone. */
     timezone?: string;
@@ -123,13 +126,17 @@ Deno.serve(async (req: Request) => {
     let activeCommitmentsData: any = null;
     let testingPromptEnabled = false;
 
+    // Group-specific enrichment context (populated below if isGroup)
+    let groupParticipantProfiles: string | undefined;
+    let groupVibe: string | undefined;
+    let senderProfile: string | undefined;
+    let isFirstGroupInteraction = false;
+
     if (isGroup) {
       // Group mode: use conversation context from the bridge (in-memory buffer)
-      // Each entry has { role, content, name? } where name identifies the speaker
       const groupCtx = payload.group_context ?? [];
 
-      // Format group messages so the LLM knows who said what.
-      // The current message is already the last entry (appended by bridge before calling).
+      // Format group messages so the LLM knows who said what
       recentChat = groupCtx.map((m) => {
         if (m.role === "user" && m.name) {
           return { role: m.role, content: `[${m.name}]: ${m.content}` };
@@ -137,7 +144,122 @@ Deno.serve(async (req: Request) => {
         return { role: m.role, content: m.content };
       });
 
-      console.log(`[chat] Group mode: ${recentChat.length} messages from bridge buffer, skipped all private context`);
+      // ── Load group enrichment context ──────────────────────
+      const senderPhone = payload.sender_phone;
+      const chatGuid = payload.chat_guid;
+
+      if (chatGuid) {
+        try {
+          const { data: groupChat } = await supabaseAdmin
+            .from("group_chats")
+            .select("id, group_vibe")
+            .eq("chat_guid", chatGuid)
+            .maybeSingle();
+
+          if (groupChat) {
+            groupVibe = (groupChat.group_vibe as string) || undefined;
+
+            // Load participant profiles
+            const { data: members } = await supabaseAdmin
+              .from("group_chat_members")
+              .select("prospect_id")
+              .eq("group_chat_id", groupChat.id)
+              .limit(30);
+
+            if (members && members.length > 0) {
+              const prospectIds = members.map((m: any) => m.prospect_id);
+              const { data: prospects } = await supabaseAdmin
+                .from("group_prospects")
+                .select("phone_number, display_name, pdl_profile, pdl_enrichment_status")
+                .in("id", prospectIds);
+
+              if (prospects && prospects.length > 0) {
+                const profileLines: string[] = [];
+                for (const p of prospects) {
+                  const pdl = p.pdl_profile as Record<string, any> | null;
+                  if (!pdl) continue;
+                  const name = pdl.full_name ?? p.display_name ?? p.phone_number;
+                  const title = pdl.job_title ? `${pdl.job_title}` : "";
+                  const company = pdl.job_company_name ? ` @ ${pdl.job_company_name}` : "";
+                  const loc = pdl.location_name ?? "";
+                  profileLines.push(`- ${name}: ${title}${company}${loc ? ` (${loc})` : ""}`);
+
+                  // Check if this is the current sender
+                  if (senderPhone && p.phone_number === senderPhone && pdl.job_title) {
+                    senderProfile = profileToContext(pdl as PDLProfile);
+                  }
+                }
+                if (profileLines.length > 0) {
+                  groupParticipantProfiles = profileLines.join("\n");
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("[chat] Group context loading failed (non-blocking):", e);
+        }
+      }
+
+      // Check first interaction for sender
+      if (senderPhone) {
+        try {
+          const { data: prospect } = await supabaseAdmin
+            .from("group_prospects")
+            .select("first_interaction_at, interaction_count")
+            .eq("phone_number", senderPhone)
+            .maybeSingle();
+
+          if (prospect && !prospect.first_interaction_at) {
+            isFirstGroupInteraction = true;
+            // Mark first interaction (fire-and-forget)
+            supabaseAdmin
+              .from("group_prospects")
+              .update({
+                first_interaction_at: new Date().toISOString(),
+                interaction_count: (prospect.interaction_count ?? 0) + 1,
+                last_seen_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .eq("phone_number", senderPhone)
+              .then(() => {})
+              .catch(() => {});
+          } else if (prospect) {
+            // Increment interaction count (fire-and-forget)
+            supabaseAdmin
+              .from("group_prospects")
+              .update({
+                interaction_count: (prospect.interaction_count ?? 0) + 1,
+                last_seen_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .eq("phone_number", senderPhone)
+              .then(() => {})
+              .catch(() => {});
+          }
+        } catch (e) {
+          console.warn("[chat] First interaction check failed (non-blocking):", e);
+        }
+      }
+
+      // Detect group vibe from recent messages
+      if (!groupVibe || groupVibe === "mixed") {
+        groupVibe = detectGroupVibe(groupCtx) || "mixed";
+        // Persist detected vibe (fire-and-forget)
+        if (chatGuid && groupVibe !== "mixed") {
+          supabaseAdmin
+            .from("group_chats")
+            .update({ group_vibe: groupVibe, updated_at: new Date().toISOString() })
+            .eq("chat_guid", chatGuid)
+            .then(() => {})
+            .catch(() => {});
+        }
+      }
+
+      console.log(
+        `[chat] Group mode: ${recentChat.length} msgs, ` +
+        `${groupParticipantProfiles ? groupParticipantProfiles.split("\n").length : 0} profiles, ` +
+        `vibe=${groupVibe || "unknown"}, firstInteraction=${isFirstGroupInteraction}`,
+      );
     } else {
       // 1:1 mode: full private context
       // Pre-fetch timezone so "today" is computed in the user's local time, not UTC
@@ -339,10 +461,46 @@ Deno.serve(async (req: Request) => {
       connectedAccounts: isGroup ? undefined : (connectedAccounts.length > 0 ? connectedAccounts : undefined),
       isGroup,
       testing: isGroup ? false : testingPromptEnabled,
+      // Group chat enrichment
+      groupParticipantProfiles: isGroup ? groupParticipantProfiles : undefined,
+      groupVibe: isGroup ? groupVibe : undefined,
+      senderProfile: isGroup ? senderProfile : undefined,
+      isFirstGroupInteraction: isGroup ? isFirstGroupInteraction : undefined,
+      senderPhone: isGroup ? payload.sender_phone : undefined,
+      isChimeIn: isGroup ? !!payload.is_chime_in : undefined,
     };
 
     const realMessageCount = isGroup ? 0 : (recentChat.length);
     const profileIsNew = !isGroup && !!richProfile && realMessageCount < 16;
+
+    // ── Group-to-private transition detection ─────────────────
+    // If a user messages 1:1 for the first time AND was seen in a group chat,
+    // inject a one-time transition acknowledgment.
+    let groupTransition = false;
+    if (!isGroup && !isAppPath && realMessageCount < 3) {
+      try {
+        const { data: imsgUser } = await supabaseAdmin
+          .from("imessage_users")
+          .select("phone_number")
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        if (imsgUser?.phone_number) {
+          const { data: prospect } = await supabaseAdmin
+            .from("group_prospects")
+            .select("interaction_count")
+            .eq("phone_number", imsgUser.phone_number)
+            .maybeSingle();
+
+          if (prospect && (prospect.interaction_count ?? 0) > 0) {
+            groupTransition = true;
+            console.log(`[chat] Group-to-private transition detected for ${userId}`);
+          }
+        }
+      } catch (e) {
+        console.warn("[chat] Group transition check failed (non-blocking):", e);
+      }
+    }
 
     // Parse active commitments for situational context
     const activeCommitments = !isGroup && activeCommitmentsData?.data
@@ -374,6 +532,7 @@ Deno.serve(async (req: Request) => {
       activeCommitments: isGroup ? null : (activeCommitments && activeCommitments.length > 0 ? activeCommitments : null),
       recallPitchStatus: isGroup ? null : (userMemory?.recallPitchStatus ?? null),
       timezoneHolder,
+      groupTransition: groupTransition || undefined,
       ...(payload._qa_variation ? { _qa_variation: payload._qa_variation } : {}),
     };
 
@@ -826,6 +985,37 @@ async function tryPdlEnrichment(
     console.error("[chat] PDL enrichment failed (non-blocking):", e);
     return undefined;
   }
+}
+
+/**
+ * Lightweight vibe detection from group message context.
+ * Heuristic analysis — no LLM call, runs in ~0ms.
+ */
+function detectGroupVibe(
+  messages: Array<{ role: string; content: string }>,
+): string | null {
+  const userMessages = messages
+    .filter((m) => m.role === "user")
+    .map((m) => m.content.toLowerCase());
+
+  if (userMessages.length < 3) return null; // not enough signal
+
+  const allText = userMessages.join(" ");
+
+  const banterSignals = (allText.match(/\b(lol|lmao|haha|dead|mate|legend|piss off|roast|burn|ratio|cunt|stfu|bruh|oi)\b/g) || []).length;
+  const proSignals = (allText.match(/\b(meeting|deadline|project|deliverable|stakeholder|quarter|kpi|budget|sprint|standup|client)\b/g) || []).length;
+  const planSignals = (allText.match(/\b(should we|let's|where|when|who's coming|are you in|count me|plan|book|organise|organize)\b/g) || []).length;
+  const supportSignals = (allText.match(/\b(you okay|how are you|rough day|sorry to hear|thinking of you|hang in there|sending love)\b/g) || []).length;
+
+  const scores = [
+    { vibe: "banter", count: banterSignals },
+    { vibe: "professional", count: proSignals },
+    { vibe: "planning", count: planSignals },
+    { vibe: "supportive", count: supportSignals },
+  ].sort((a, b) => b.count - a.count);
+
+  if (scores[0].count < 2) return null;
+  return scores[0].vibe;
 }
 
 function jsonResponse(body: Record<string, unknown>, status: number): Response {

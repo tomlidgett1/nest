@@ -478,6 +478,8 @@ async function calendarLookup(
   if (query) {
     events = events.filter((e: any) =>
       e.title?.toLowerCase().includes(query) ||
+      e.calendar?.toLowerCase().includes(query) ||
+      e.account?.toLowerCase().includes(query) ||
       e.attendees?.some((a: string) => a.toLowerCase().includes(query)) ||
       e.description?.toLowerCase().includes(query)
     );
@@ -653,6 +655,26 @@ function resolveTimeRange(range: string, tz: string): { timeMin: string; timeMax
       if (daysMatch) {
         const n = parseInt(daysMatch[1], 10);
         const end = new Date(todayLocal.year, todayLocal.month - 1, todayLocal.day + n);
+        return {
+          timeMin: now.toISOString(),
+          timeMax: makeDay(end.getFullYear(), end.getMonth() + 1, end.getDate()).timeMax,
+        };
+      }
+
+      const weeksMatch = lower.match(/next\s+(\d+)\s+weeks?/);
+      if (weeksMatch) {
+        const n = parseInt(weeksMatch[1], 10);
+        const end = new Date(todayLocal.year, todayLocal.month - 1, todayLocal.day + n * 7);
+        return {
+          timeMin: now.toISOString(),
+          timeMax: makeDay(end.getFullYear(), end.getMonth() + 1, end.getDate()).timeMax,
+        };
+      }
+
+      const monthsMatch = lower.match(/next\s+(\d+)\s+months?/);
+      if (monthsMatch) {
+        const n = parseInt(monthsMatch[1], 10);
+        const end = new Date(todayLocal.year, todayLocal.month - 1 + n, todayLocal.day);
         return {
           timeMin: now.toISOString(),
           timeMax: makeDay(end.getFullYear(), end.getMonth() + 1, end.getDate()).timeMax,
