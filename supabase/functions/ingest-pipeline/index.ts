@@ -17,6 +17,14 @@ import { refreshAccessToken } from "../_shared/gmail-helpers.ts";
 import { listGmailThreadIds, fetchGmailThreadsByIds } from "../_shared/gmail-fetcher.ts";
 import { fetchCalendarEvents } from "../_shared/calendar-fetcher.ts";
 import {
+  getStravaAccessToken,
+  fetchStravaActivities,
+  activityToRow,
+  buildStravaActivitySummary,
+  stravaContextHeader,
+  reverseGeocode,
+} from "../_shared/strava-helpers.ts";
+import {
   sentenceAwareChunks,
   buildNoteSummary,
   buildEmailSummary,
@@ -44,6 +52,7 @@ const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
 const EMAIL_PAGE_SIZE = 30;
 const CALENDAR_PAGE_SIZE = 80;
+const STRAVA_PAGE_SIZE = 30;
 const STALE_THRESHOLD_MS = 180_000;
 const MAX_TASK_ATTEMPTS = 3;
 const PARALLEL_WORKERS = 3; // concurrent Edge Function invocations per job
@@ -139,11 +148,14 @@ Deno.serve(async (req: Request) => {
       }).eq("id", task.id);
 
       if (result.has_more && result.next_offset != null) {
+        const nextParams = task.task_type === "strava"
+          ? { ...task.params, page: result.next_offset }
+          : { ...task.params, offset: result.next_offset };
         await supabase.from("ingestion_tasks").insert({
           job_id: task.job_id,
           user_id: task.user_id,
           task_type: task.task_type,
-          params: { ...task.params, offset: result.next_offset },
+          params: nextParams,
         });
         console.log(`[ingest-pipeline] Continuation: ${task.task_type} offset=${result.next_offset}`);
       }
@@ -270,6 +282,16 @@ async function createJobAndSeedTasks(
     }
   }
 
+  // Strava doesn't depend on Google/Microsoft accounts — it's its own connection
+  if (sources.includes("strava")) {
+    tasks.push({
+      job_id: jobId,
+      user_id: userId,
+      task_type: "strava",
+      params: { mode, page: 1 },
+    });
+  }
+
   if (tasks.length > 0) {
     await supabase.from("ingestion_tasks").insert(tasks);
   }
@@ -339,6 +361,8 @@ async function executeTask(supabase: SupabaseClient, task: TaskRow): Promise<Tas
       return executeEmailsTask(supabase, task.user_id, task.params);
     case "calendar":
       return executeCalendarTask(supabase, task.user_id, task.params);
+    case "strava":
+      return executeStravaTask(supabase, task.user_id, task.params);
     default:
       throw new Error(`Unknown task type: ${task.task_type}`);
   }
@@ -352,7 +376,7 @@ async function executeNotesTask(
   params: Record<string, any>,
 ): Promise<TaskResult> {
   const mode = params.mode ?? "full";
-  const cutoff = new Date(Date.now() - 120 * 86400000).toISOString();
+  const cutoff = new Date(Date.now() - 730 * 86400000).toISOString();
 
   let query = supabase
     .from("notes")
@@ -509,7 +533,7 @@ async function executeEmailsTask(
   const accessToken = (await refreshAccessToken(refreshToken)).token;
   const acctInfo: AccountInfo = { googleEmail: email, isPrimary };
 
-  const daysBack = mode === "incremental" ? 3 : 120;
+  const daysBack = mode === "incremental" ? 3 : 730;
   const maxThreads = mode === "incremental" ? 50 : Infinity;
 
   // Phase 1: List all thread IDs (cheap — ~1 API call per 100 IDs)
@@ -620,7 +644,7 @@ async function executeCalendarTask(
   const accessToken = (await refreshAccessToken(refreshToken)).token;
   const acctInfo: AccountInfo = { googleEmail: email, isPrimary };
 
-  const daysBack = mode === "incremental" ? 7 : 120;
+  const daysBack = mode === "incremental" ? 7 : 730;
   const daysForward = mode === "incremental" ? 60 : 365;
   const primaryOnly = mode === "full";
 
@@ -712,6 +736,149 @@ async function executeCalendarTask(
     skipped,
     has_more: hasMore,
     next_offset: hasMore ? nextOffset : undefined,
+  };
+}
+
+// ── Strava Task (paginated — 200 activities per invocation) ──
+
+const STRAVA_YEARS_BACK = 8;
+
+async function executeStravaTask(
+  supabase: SupabaseClient,
+  userId: string,
+  params: Record<string, any>,
+): Promise<TaskResult> {
+  const mode = params.mode ?? "full";
+  const page: number = params.page ?? 1;
+
+  const { accessToken } = await getStravaAccessToken(supabase, userId);
+
+  const after = mode === "incremental"
+    ? Math.floor((Date.now() - 7 * 86_400_000) / 1000)
+    : Math.floor((Date.now() - STRAVA_YEARS_BACK * 365.25 * 86_400_000) / 1000);
+
+  console.log(`[ingest-pipeline] Strava: page=${page}, mode=${mode}, after=${new Date(after * 1000).toISOString()}`);
+
+  const activities = await fetchStravaActivities(accessToken, {
+    after,
+    page,
+    perPage: STRAVA_PAGE_SIZE,
+  });
+
+  console.log(`[ingest-pipeline] Strava: fetched ${activities.length} activities on page ${page}`);
+
+  const allChunks: ChunkToEmbed[] = [];
+  let docCount = 0;
+  let skipped = 0;
+
+  const SUB_BATCH = 25;
+  const pendingChunks: ChunkToEmbed[] = [];
+  let totalEmbeddings = 0;
+
+  for (const activity of activities) {
+    const stravaIdStr = String(activity.id);
+    const hash = contentHash("strava_summary", stravaIdStr, "summary");
+
+    if (mode === "incremental") {
+      const needsUpdate = await sourceNeedsUpdate(supabase, userId, "strava_summary", stravaIdStr, hash);
+      if (!needsUpdate) { skipped++; continue; }
+    }
+
+    // Reverse geocode start/end locations
+    let startLocationName: string | null = null;
+    let endLocationName: string | null = null;
+    if (activity.start_latlng?.[0] && activity.start_latlng?.[1]) {
+      startLocationName = await reverseGeocode(activity.start_latlng[0], activity.start_latlng[1]);
+    }
+    if (activity.end_latlng?.[0] && activity.end_latlng?.[1]) {
+      endLocationName = await reverseGeocode(activity.end_latlng[0], activity.end_latlng[1]);
+    }
+
+    // Upsert structured row
+    const row = activityToRow(userId, activity, startLocationName, endLocationName);
+    await supabase
+      .from("strava_activities")
+      .upsert(row, { onConflict: "user_id,strava_id" });
+
+    // Clean old embeddings
+    await softDeleteSource(supabase, userId, "strava_summary", stravaIdStr);
+    await softDeleteSource(supabase, userId, "strava_chunk", stravaIdStr);
+
+    const summary = buildStravaActivitySummary(activity, startLocationName, endLocationName);
+    const sportType = activity.sport_type ?? activity.type ?? "Activity";
+    const dateStr = new Date(activity.start_date_local ?? activity.start_date)
+      .toLocaleDateString("en-AU", {
+        weekday: "short", day: "numeric", month: "short", year: "numeric",
+        timeZone: "UTC",
+      });
+    const contextHdr = stravaContextHeader(activity.name, sportType, dateStr);
+
+    pendingChunks.push({
+      text: truncateForEmbedding(`${contextHdr}\n---\n${summary}`),
+      sourceType: "strava_summary",
+      sourceId: stravaIdStr,
+      title: `${sportType}: ${activity.name}`,
+      chunkIndex: 0,
+      contentHash: hash,
+      metadata: {
+        sport_type: sportType,
+        distance_km: Number(((activity.distance ?? 0) / 1000).toFixed(2)),
+        moving_time_mins: Math.round((activity.moving_time ?? 0) / 60),
+        start_date: activity.start_date_local ?? activity.start_date,
+        athlete_count: activity.athlete_count ?? 1,
+        start_location: startLocationName,
+        end_location: endLocationName,
+      },
+    });
+
+    if (activity.description && activity.description.length > 50) {
+      const descChunks = sentenceAwareChunks(activity.description, contextHdr);
+      for (let i = 0; i < descChunks.length; i++) {
+        pendingChunks.push({
+          text: truncateForEmbedding(descChunks[i]),
+          sourceType: "strava_chunk",
+          sourceId: stravaIdStr,
+          title: `${sportType}: ${activity.name}`,
+          chunkIndex: i,
+          contentHash: contentHash("strava_chunk", stravaIdStr, "chunk", i),
+          parentSourceId: stravaIdStr,
+          metadata: { sport_type: sportType, start_location: startLocationName },
+        });
+      }
+    }
+
+    docCount++;
+
+    if (pendingChunks.length >= SUB_BATCH) {
+      const embedded = await embedChunks(pendingChunks);
+      const { inserted } = await insertEmbeddedChunks(supabase, userId, embedded);
+      totalEmbeddings += inserted;
+      allChunks.push(...pendingChunks);
+      pendingChunks.length = 0;
+    }
+  }
+
+  if (pendingChunks.length > 0) {
+    const embedded = await embedChunks(pendingChunks);
+    const { inserted } = await insertEmbeddedChunks(supabase, userId, embedded);
+    totalEmbeddings += inserted;
+    allChunks.push(...pendingChunks);
+  }
+
+  const hasMore = activities.length === STRAVA_PAGE_SIZE;
+
+  console.log(
+    `[ingest-pipeline] Strava page ${page}: ${allChunks.length} chunks from ${docCount} activities ` +
+    `(${skipped} skipped${hasMore ? ", more pages" : ""})`,
+  );
+
+  return {
+    documents: docCount,
+    chunks: allChunks.length,
+    embeddings: totalEmbeddings,
+    skipped,
+    has_more: hasMore,
+    next_offset: hasMore ? page + 1 : undefined,
   };
 }
 

@@ -439,3 +439,9 @@ verify_jwt = false
 
 [functions.v2-chat-service]
 verify_jwt = false
+
+[functions.strava-callback]
+verify_jwt = false
+
+[functions.strava-webhook]
+verify_jwt = false

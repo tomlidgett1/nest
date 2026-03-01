@@ -14,7 +14,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { handleMessage, type NestContext } from "../_shared/personality-agent.ts";
-import { routeMessage, type NestUser } from "../_shared/orchestrator.ts";
+import { tryFastRoute, type NestUser } from "../_shared/orchestrator.ts";
 import { getUserMemory, updateMemory, extractLearnings } from "../_shared/memory-service.ts";
 import { enrichByIdentity, enrichByPhone, profileToContext } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
@@ -132,6 +132,7 @@ Deno.serve(async (req: Request) => {
     let senderProfile: string | undefined;
     let isFirstGroupInteraction = false;
     let canShowNestLink = false;
+    let allMembersAreNestUsers = false;
 
     if (isGroup) {
       // Group mode: load persisted history from DB, supplement with bridge buffer
@@ -250,11 +251,18 @@ Deno.serve(async (req: Request) => {
               const prospectIds = members.map((m: any) => m.prospect_id);
               const { data: prospects } = await supabaseAdmin
                 .from("group_prospects")
-                .select("phone_number, display_name, pdl_profile, pdl_enrichment_status")
+                .select("phone_number, display_name, pdl_profile, pdl_enrichment_status, is_nest_user")
                 .in("id", prospectIds);
 
               if (prospects && prospects.length > 0) {
                 const profileLines: string[] = [];
+                // Check if every member in the group is already a Nest user
+                const allNest = prospects.every((p: any) => p.is_nest_user === true);
+                if (allNest) {
+                  allMembersAreNestUsers = true;
+                  canShowNestLink = false; // No point sharing link if everyone's already on Nest
+                }
+
                 for (const p of prospects) {
                   const pdl = p.pdl_profile as Record<string, any> | null;
                   if (!pdl) continue;
@@ -608,6 +616,7 @@ Deno.serve(async (req: Request) => {
       senderPhone: isGroup ? payload.sender_phone : undefined,
       isChimeIn: isGroup ? !!payload.is_chime_in : undefined,
       canShowNestLink: isGroup ? canShowNestLink : undefined,
+      allMembersAreNestUsers: isGroup ? allMembersAreNestUsers : undefined,
     };
 
     const realMessageCount = isGroup ? 0 : (recentChat.length);
@@ -680,8 +689,8 @@ Deno.serve(async (req: Request) => {
     // Quick synchronous route to determine if tools will be used.
     // If agent path AND iMessage source, stream an ack first via NDJSON.
 
-    const quickRoute = routeMessage(message, nestUser, recentChat);
-    const needsAck = !isAppPath && quickRoute.path === "agent";
+    const quickRoute = tryFastRoute(message, nestUser, recentChat);
+    const needsAck = !isAppPath && (!quickRoute || quickRoute.path === "agent");
 
     if (needsAck) {
       const encoder = new TextEncoder();
@@ -832,7 +841,7 @@ Deno.serve(async (req: Request) => {
 
     // RAG runs in parallel with prefetch inside handleMessage
     const ragPromise =
-      !isGroup && quickRoute.path === "agent"
+      !isGroup && (!quickRoute || quickRoute.path === "agent")
         ? serverSideRAG(message, recentChat, userId, supabaseAdmin).catch((e: unknown) => {
             console.warn("[chat] Proactive RAG failed (non-blocking):", e);
             return "";

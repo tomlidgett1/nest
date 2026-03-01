@@ -52,6 +52,8 @@ export interface RoutingResult {
   contextDepth?: "full" | "minimal"; // minimal = skip heavy context blocks (profile, learnings, identity model)
   needsProfile?: boolean; // true = inject rich user profile into context (default: false for operational queries)
   skipAck?: boolean; // true = suppress the inline ack message (reminders, etc. that confirm in one message)
+  _routeReason?: string;         // why this path was chosen (for debug tracing)
+  _nanoClassification?: { category: string; confidence: number; latency_ms: number };
 }
 
 export interface PrefetchTask {
@@ -140,10 +142,12 @@ const GREETING_WORDS = new Set([
 // should feel different from "thanks" after a casual chat.
 const QUICK_EXIT_WORDS = new Set([
   "thanks", "thank you", "cheers", "ta", "thx", "thanks mate", "cheers mate",
-  "nah", "nope",
+  "nah", "nope", "na", "nah mate", "nah all good", "nah im good", "nah i'm good",
+  "no", "no thanks", "no cheers", "no ta",
   "bye", "cya", "see ya", "later", "ttyl",
   "lol", "haha", "hahaha", "lmao",
-  "no worries", "all good",
+  "no worries", "all good", "sweet", "legend", "sick", "nice one", "nice",
+  "cool", "ok", "okay", "k", "yep", "yeah", "yea", "ya",
   "test",
 ]);
 
@@ -194,57 +198,43 @@ function hasSubstance(cleaned: string): boolean {
 // system prompt + filtered tool subset) or null for full agent.
 // Conservative: when in doubt, return null → full agent.
 
-type LightAgentIntent = "calendar" | "weather" | "currency" | "reminder" | "todo" | "time" | "places" | "inbox" | "transit" | null;
+type LightAgentIntent = "calendar" | "weather" | "currency" | "reminder" | "todo" | "time" | "places" | "inbox" | "transit" | "fitness" | null;
 
 function detectLightIntent(message: string): LightAgentIntent {
-  // Calendar READ — schedule lookups and availability checks
+  // Slam-dunk patterns only — high-precision, unambiguous matches.
+  // The nano router handles the long tail of phrasings these miss.
+
+  // Calendar — "what's on today", "my schedule for tomorrow", "am I free"
   if (/(?:what(?:'s|\s+is|\s+do\s+i\s+have)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow|this\s+week|next\s+week|monday|tuesday|wednesday|thursday|friday|saturday|sunday))/i.test(message)) return "calendar";
   if (/(?:my\s+(?:schedule|calendar|meetings?|agenda)\s+(?:for\s+)?(?:today|tomorrow|this\s+week|next\s+week))/i.test(message)) return "calendar";
-  if (/(?:when(?:'s|\s+is)\s+(?:my\s+)?(?:next\s+)?(?:meeting|call|event))/i.test(message)) return "calendar";
   if (/(?:am\s+i\s+(?:free|busy)\s+(?:today|tomorrow|this\s+afternoon|this\s+morning|on\s+))/i.test(message)) return "calendar";
-  if (/(?:do\s+i\s+have\s+(?:any\s+)?(?:meetings?|calls?|events?)\s+(?:today|tomorrow|this\s+week))/i.test(message)) return "calendar";
-  if (/(?:what(?:'s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow)(?:'s)?\s+(?:schedule|calendar|agenda))/i.test(message)) return "calendar";
-  if (/(?:what(?:'s|\s+is)\s+(?:on|in)\s+my\s+\w+\s+calendar)/i.test(message)) return "calendar";
-  if (/(?:show\s+(?:me\s+)?my\s+\w+\s+calendar)/i.test(message)) return "calendar";
 
-  // Weather
-  if (/\b(?:weather|temperature|forecast|rain(?:ing)?|umbrella|humid|cold outside|hot outside)\b/i.test(message)) return "weather";
+  // Weather — any mention of weather/forecast/rain/umbrella
+  if (/\b(?:weather|temperature|forecast|rain(?:ing)?|umbrella)\b/i.test(message)) return "weather";
 
-  // Currency / forex
-  if (/\b(?:exchange rate|forex|\d+\s*(?:aud|usd|gbp|eur|jpy|cad|nzd|sgd|krw|thb|idr|myr|php|vnd|inr|cny|hkd|twd|chf|sek|nok|dkk|pln|czk|huf|mxn|brl|ars|clp|cop|pen|zar|aed|sar|try))\b/i.test(message)) return "currency";
+  // Currency — explicit forex or "N AUD/USD/etc"
+  if (/\b(?:exchange rate|forex|\d+\s*(?:aud|usd|gbp|eur|jpy|cad|nzd|sgd))\b/i.test(message)) return "currency";
 
-  // Reminder — matches "remind me to...", "can you remind me", "set a reminder", etc.
-  if (/\b(?:remind me\b|set (?:me )?(?:a )?reminder\b|alert me\b|nudge me\b)/i.test(message)) return "reminder";
+  // Reminder — "remind me to..."
+  if (/\b(?:remind me\b|set (?:me )?(?:a )?reminder\b)/i.test(message)) return "reminder";
 
-  // Todo — matches "add X to my list/todos", "put X on my list", "show my todos", etc.
-  // Guard: bail out if the message also mentions email/calendar (complex multi-intent → full agent)
+  // Todo — "add X to my list/todos", "show my todos"
   if (
     /\b(?:email|calendar|meeting|schedule|inbox)\b/i.test(message) === false &&
-    (
-      /\badd .{1,60} to (?:my )?(?:to-?do|task|shopping|grocery|groceries|list|todos?)\b/i.test(message) ||
-      /\bput .{1,60} (?:on|in) (?:my )?(?:to-?do|task|shopping|grocery|list|todos?)\b/i.test(message) ||
-      /\bshow (?:me )?(?:my )?(?:to-?do|task|todos?|list)\b/i.test(message) ||
-      /\bwhat(?:'s| is) on (?:my )?(?:to-?do|task|todos?|list)\b/i.test(message) ||
-      /\bmark .{1,40} (?:as )?(?:done|complete|finished)\b/i.test(message) ||
-      /\b(?:complete|tick off|cross off) .{1,40} (?:from|on|off) (?:my )?(?:list|todos?)\b/i.test(message) ||
-      /\bdelete .{1,40} (?:from|off) (?:my )?(?:list|todos?)\b/i.test(message)
-    )
+    (/\badd .{1,60} to (?:my )?(?:to-?do|task|list|todos?)\b/i.test(message) ||
+     /\bshow (?:me )?(?:my )?(?:to-?do|task|todos?|list)\b/i.test(message))
   ) return "todo";
 
-  // Public transport / transit / directions
-  if (/\b(?:next\s+(?:train|bus|tram|metro|subway|ferry)|(?:train|bus|tram|metro|subway|ferry)\s+to\b|how\s+(?:do\s+i|to)\s+get\s+(?:to|there)|(?:take|catch|get)\s+(?:a\s+)?(?:train|bus|tram|metro|subway|ferry)|public\s+transport|which\s+(?:line|platform|stop|station))\b/i.test(message)) return "transit";
-  if (/\b(?:directions?\s+(?:to|from)|route\s+(?:to|from))\b/i.test(message) && /\b(?:transit|train|bus|tram|metro|subway|public)\b/i.test(message)) return "transit";
+  // Transit — "next train/bus", "how do I get to"
+  if (/\b(?:next\s+(?:train|bus|tram|metro|ferry)|how\s+(?:do\s+i|to)\s+get\s+(?:to|there)|public\s+transport)\b/i.test(message)) return "transit";
 
-  // Time in another city
-  if (/\b(?:what(?:'s| is) the time in|time (?:in|at) (?:tokyo|london|new york|paris|singapore|dubai|sydney|la|sf|berlin|amsterdam))\b/i.test(message)) return "time";
+  // Inbox — "any new emails", "check my inbox"
+  if (/\b(?:(?:any|new|unread)\s+(?:emails?|mail)|check\s+(?:my\s+)?(?:inbox|email)|what(?:'s|\s+is)\s+in\s+my\s+inbox)\b/i.test(message)) return "inbox";
 
-  // Places
-  if (/^(?:(?:what(?:'s| is)|where(?:'s| is)) the (?:address|phone|number) (?:of|for))\b/i.test(message)) return "places";
-
-  // Inbox — simple email checks
-  if (/\b(?:(?:any|new|recent|unread)\s+(?:emails?|messages?|mail))\b/i.test(message)) return "inbox";
-  if (/\b(?:what(?:'s|\s+is)\s+in\s+my\s+inbox)\b/i.test(message)) return "inbox";
-  if (/\b(?:check\s+(?:my\s+)?(?:inbox|email|mail))\b/i.test(message)) return "inbox";
+  // Fitness / Strava — "how far did I run", "my last ride", "strava stats"
+  if (/\b(?:strava|run(?:ning)?|ride|cycling|swim(?:ming)?|hike|workout|exercise|fitness)\b/i.test(message) &&
+      /\b(?:how\s+(?:far|long|much|many)|total|last|recent|this\s+week|this\s+month|stats?|distance|pace|km|miles?|elevation|calories|heart\s*rate|pr|personal\s+record)\b/i.test(message)) return "fitness";
+  if (/\bstrava\b/i.test(message)) return "fitness";
 
   return null;
 }
@@ -267,6 +257,7 @@ function isCompoundQuery(message: string): boolean {
     /\b(?:book|reschedule|cancel|create.*event)\b/i,
     /\b(?:weather|temperature|forecast)\b/i,
     /\b(?:train|bus|tram|directions|transit)\b/i,
+    /\b(?:strava|run(?:ning)?|ride|cycling|swim|workout|fitness|exercise)\b/i,
   ];
 
   const matchCount = intentCategories.filter(pattern => pattern.test(lower)).length;
@@ -495,7 +486,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
         properties: {
           range: {
             type: "string",
-            description: 'Time range: "today", "tomorrow", "this week", "next monday", "next 3 days", etc.',
+            description: 'Time range: "today", "tomorrow", "yesterday", "this week", "next week", "last week", "next monday", "next 3 days", "next 2 weeks", "next 3 months", "past 7 days", "past 2 weeks", "past 6 months", "last 1 year", etc.',
           },
           query: {
             type: "string",
@@ -582,7 +573,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           query: { type: "string", description: "Natural language query. Be specific with names, topics, dates." },
           source_filters: {
             type: "array",
-            items: { type: "string", enum: ["note_summary", "note_chunk", "utterance_chunk", "email_summary", "email_chunk", "calendar_summary"] },
+            items: { type: "string", enum: ["note_summary", "note_chunk", "utterance_chunk", "email_summary", "email_chunk", "calendar_summary", "strava_summary", "strava_chunk"] },
             description: "Optional source type filter. Omit to search everything.",
           },
           limit: { type: "number", description: "Max results (default 5, max 15)." },
@@ -1013,6 +1004,54 @@ const AGENT_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  // ── Strava / Fitness Tool ─────────────────────────────────
+  {
+    type: "function",
+    function: {
+      name: "strava_search",
+      description:
+        "Search the user's Strava fitness data — runs, rides, swims, hikes, and all activities. " +
+        "Supports aggregate stats (total distance, time, elevation, count) and individual activity lookup. " +
+        "Use 'metric' for aggregate queries like 'how far did I run this week'. " +
+        "Omit 'metric' for specific activity searches. Falls back to semantic search for fuzzy queries. " +
+        "Activities include reverse-geocoded location names (suburb, city) for location-based queries.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Natural language query about fitness activities.",
+          },
+          sport_type: {
+            type: "string",
+            description: "Filter by sport: Run, Ride, Swim, Hike, Walk, WeightTraining, Yoga, etc. Case-insensitive.",
+          },
+          location: {
+            type: "string",
+            description: "Filter by location name (suburb, city). Partial match, e.g. 'Richmond', 'Melbourne'.",
+          },
+          date_from: {
+            type: "string",
+            description: "ISO 8601 date (e.g. '2026-02-23'). Filter activities on or after this date.",
+          },
+          date_to: {
+            type: "string",
+            description: "ISO 8601 date (e.g. '2026-03-01'). Filter activities on or before this date.",
+          },
+          metric: {
+            type: "string",
+            enum: ["distance", "time", "elevation", "count", "calories"],
+            description: "Aggregate metric to compute. Returns totals, averages, and breakdowns.",
+          },
+          limit: {
+            type: "number",
+            description: "Max activities to return (default 10, max 50). Ignored for aggregate queries.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
 ];
 
 // ── Timezone → City helper ───────────────────────────────────
@@ -1106,6 +1145,7 @@ Travel time / "when should I leave" → travel_time + calendar_lookup to calcula
 Airport → gmail_search (confirmation) + travel_time IN PARALLEL, then calculate departure
 Places → places_search. For details, call again with place_id
 Weather → weather_lookup
+Fitness / running / cycling / Strava / "how far" / "my last run" / "recent rides" → strava_search ALWAYS. NEVER answer fitness questions from memory. NEVER fabricate activities.
 External info → web_search
 Meeting notes → get_meeting_notes. NEVER mention "Recall.ai". Say "I recorded your call".
 Connect recording → connect_meeting_notes. Confirm: "done, I'll join your calls and take notes"
@@ -1146,24 +1186,100 @@ Contact: "Added [name] to your contacts ✓"
 Error: "Hmm, couldn't [action]. Want me to try again?"
 Multi-step: confirm EVERY completed action.
 
+─── STRUCTURED DATA RULE ───
+
+CRITICAL: When presenting ANY variable/dynamic data (weather, forex, transit, todos, profiles, places, recaps, travel, bookings, inbox, calendar, search results), follow this EXACT pattern:
+1. One natural, conversational sentence as a normal iMessage bubble. Your take, the headline, a human reaction. NO data, NO lists, NO details in this line.
+2. A single <nest-content> block containing ALL the structured data, formatted for mobile readability:
+   - **Bold heading** as the first line
+   - Each data point uses a **bold label** on its OWN line, with the value on the NEXT line
+   - Blank line between each data point for spacing
+   - No emojis, no bullets
+   - Practical takeaway as the last line if relevant
+3. NOTHING after the </nest-content> tag.
+NEVER put data, lists, or details OUTSIDE the <nest-content> block.
+NEVER put "Label: value" on the same line. ALWAYS use bold label on one line, value below it.
+
+CALENDAR MULTI-DAY FORMAT: When showing a week or multi-day calendar view, NEVER use a flat list with date prefixes on every line. ALWAYS group events under bold day headings with blank lines between days:
+
+<nest-content>
+**Next Week**
+
+Skiing in Niseko with Georgia (Mon–Sat, all day)
+
+**Mon 3**
+2:00 pm — APAC Team meeting
+
+**Tue 4**
+8:30 am — Japan trip chat
+3:30 pm — MEAPAC WBR
+7:00 pm — BlackFixe All-Hands
+
+**Wed 5**
+3:30 pm — DC APAC Monthly Review
+</nest-content>
+
+Spanning events go at the top. Skip empty days. Each event = "time — title" only under its day heading.
+
 ─── EMAIL PRECISION ───
 
 gmail_search previews are TRUNCATED. Before stating exact dates, check-out, prices, booking refs, or durations, ALWAYS call get_email for the full body. Never infer check-out dates or guess durations.
 
-─── TRANSIT FORMAT ───
+─── TRANSIT / DIRECTIONS — MAGIC CARD ───
 
-MANDATORY for all public transport responses. Short conversational intro, then structured <nest-content>:
-- Vehicle emoji: 🚆 train, 🚃 metro, 🚌 bus, 🚊 tram, ⛴ ferry
-- Show: line name (bold), depart/arrive times+stops, duration, platform if available
-- Multi-leg: each leg as separate block. Add **Total** line.
-- Walking: 🚶 "about X min walk". Use landmarks, not compass directions.
-- 1-2 alternatives as compact one-liners at bottom
+Build a MAGIC TRANSIT CARD — everything the user needs to grab their bag and go.
+
+ORIGIN: If the user doesn't specify, use what you KNOW (hotel, home, current area from memory/learnings/profile/conversation). Use a specific address, not just a city.
+DESTINATION: Resolve from context. Check calendar for flights/events if needed. If "the airport", figure out which one.
+
+Punchy intro with the key takeaway, then the full card:
+
+Leave your hotel by 6:15 am to make the 6:53 Haruka Express
+
+<nest-content>
+**Osaka Station to Kansai Airport**
+
+**Getting There**
+8 min walk from Hotel Granvia to JR Osaka Station (exit South Gate, cross the plaza)
+
+**Train**
+Haruka Express
+
+**Platform**
+Platform 11 (JR West, look for Haruka signs)
+
+**Departs**
+6:53 am
+
+**Arrives**
+7:43 am at Kansai Airport Station
+
+**Duration**
+50 min
+
+**Fare**
+1,710 JPY
+
+**Alternative**
+7:23 am Haruka Express (arrives 8:13 am)
+
+**Tip**
+Buy tickets at JR ticket office or use IC card for unreserved
+</nest-content>
+
+Rules:
+- No emojis. Bold label on its own line, value below. Blank line between sections.
+- ALWAYS include "Getting There" with walk from their actual location to the station (time, distance, landmarks)
+- ALWAYS include platform/track if available
+- ALWAYS include fare if available
+- Label vehicle type plainly: Train, Metro, Bus, Tram, Ferry
+- Multi-leg: each leg as separate section, include walking transfers
+- 1-2 alternatives as compact one-liners
 - Imminent (< 5 min): lead with urgency
-- Fallback (_transit_fallback: true): still use card format with frequency/duration/fare
-
-DIRECTIONS: Never use compass directions. Use landmarks, street names, "about X minutes".
-
-TIME LOGIC: "Next" = nearest upcoming from NOW. Never present past times as upcoming. Follow-up time questions stay in same time window (today). Cross-check all times against user's current local time.
+- Add a practical "Tip" if relevant (tickets, IC card, which car)
+- Fallback (_transit_fallback: true): still use card format with service name, frequency, duration, fare
+- DIRECTIONS: landmarks and street names, never compass directions
+- TIME: "Next" = nearest upcoming from NOW. Never present past times as upcoming.
 
 ─── MULTI-ACCOUNT ───
 
@@ -1238,6 +1354,18 @@ Never state real-time numbers from memory. If a tool fails: "Hmm, couldn't do th
 "Next/now/latest" = nearest upcoming result from current local time.
 Keep responses concise. Each line = separate iMessage bubble.
 
+─── STRUCTURED DATA ───
+CRITICAL: When presenting ANY variable/dynamic data (weather, forex, transit, todos, profiles, places, search results, etc.), follow this EXACT pattern:
+1. One natural, conversational sentence as a normal iMessage bubble. NO data, NO lists, NO details in this line. Just your take or the headline.
+2. A single <nest-content> block containing ALL the structured data, formatted for mobile:
+   - **Bold heading** first line
+   - Each data point: **bold label** on its OWN line, value on the NEXT line
+   - Blank line between each data point
+   - No emojis, no bullets
+   - Practical takeaway as last line if relevant
+3. NOTHING after the </nest-content> tag.
+NEVER put "Label: value" on the same line. Bold label on one line, value below.
+
 ─── TIMEZONE ───
 Timezone is auto-detected from conversation context but may be stale. BEFORE presenting any times, verify the stored timezone matches where the user actually is. Check memory, learnings, and conversation for travel/location clues. If there's a mismatch, call update_user_timezone FIRST. Never present times in the wrong timezone.`;
 
@@ -1250,7 +1378,7 @@ const LIGHT_INTENT_INSTRUCTIONS: Record<string, string> = {
 All times are in the user's timezone. Present in their local time.
 Events have a "calendar" field (e.g. "Work", "Personal", "Blacklane") — use it to group or filter when the user asks about a specific calendar.
 
-Format: short conversational intro, then timeline in <nest-content>:
+SINGLE DAY format:
 Pretty light today
 
 <nest-content>
@@ -1258,15 +1386,101 @@ Pretty light today
 
 9:00 am — Standup (Google Meet)
 11:00 am — 1:1 with Sarah
+2:00 pm — Board review
 </nest-content>
 
-Each event = ONE line: "time — title (optional location)". No bold per event. No bullets.
+MULTI-DAY format (this week, next week, etc.) — GROUP BY DAY with blank lines between days. Use short day names (Mon, Tue, etc.) as bold sub-headings. Keep each event to "time — title" only. Skip empty days entirely.
+
+Busy week ahead
+
+<nest-content>
+**Next Week**
+
+**Mon 3**
+8:30 am — Chat about Japan trip
+3:30 pm — MEAPAC WBR meeting
+7:00 pm — BlackFixe All-Hands
+
+**Tue 4**
+3:30 pm — DC APAC Monthly Review
+
+**Wed 5**
+11:30 pm — Glean open office hours (optional)
+
+**Sun 9**
+7:30 am — Book time with Nic (market expansion)
+</nest-content>
+
+Rules:
+- Each event = ONE line: "time — title". No date prefix on each line (the day heading handles that).
+- All-day events: just "title" under the day heading, no time.
+- Multi-day spanning events (e.g. a trip): show once at the top of the block before the day breakdown, like "Skiing in Niseko (Mon–Sat, all day)"
+- Skip days with no events. Don't show "Nothing on" for empty days.
+- No bullets. No bold per event. Bold only on day headings.
+- Keep it scannable. White space between days is critical for readability.
 Book/reschedule/cancel → always confirm first with card format (title, 📅, 📍, 👤).`,
 
-  weather: `Answer with temperature, conditions, and forecast. Be concise, 1-2 lines.
+  weather: `Use weather_lookup. ALWAYS format as: one short human overview line (no specific numbers, just your vibe/take), then a <nest-content> block with ALL weather data inside. No emojis. NEVER put temperatures, conditions, or forecasts outside the block. Use bold labels on their own lines.
+
+Single day example:
+Bit fresh out there today
+
+<nest-content>
+**Melbourne Weather**
+
+**Morning**
+8c, cloudy
+
+**Afternoon**
+14c, clearing up
+
+**Evening**
+10c, light wind
+
+Grab a jacket if you're heading out before lunch
+</nest-content>
+
+Multi-day example:
+Rain's hanging around for the next few days
+
+<nest-content>
+**Melbourne 3-Day Forecast**
+
+**Saturday**
+21c, light rain, humid
+
+**Sunday**
+19c, showers, overcast
+
+**Monday**
+20c, clearing, partly cloudy
+
+Pack an umbrella for the weekend
+</nest-content>
+
+CRITICAL: The <nest-content> block must ALWAYS contain the actual data. Never leave it empty. If you only have limited data, still put what you have inside the block.
+Include a practical takeaway as the last line (jacket, umbrella, sunscreen, etc.) when relevant.
 For "next rainy day" (or similar), use current local date/time and return the nearest upcoming day with rain from now.`,
 
-  currency: `Use web_search for the current rate. NEVER guess. Present clearly.`,
+  currency: `Use web_search for the current rate. NEVER guess. ALWAYS format as: one short human line (your take, no specific numbers), then a <nest-content> block with ALL conversion data inside. NEVER put the actual numbers in the human line. Use bold labels on their own lines.
+
+Example:
+Not a bad rate right now
+
+<nest-content>
+**AUD to JPY**
+
+**Rate**
+1 AUD = 98.45 JPY
+
+**100 AUD**
+9,845 JPY
+
+**As of**
+2:30 pm AEST
+</nest-content>
+
+CRITICAL: The <nest-content> block must ALWAYS contain the conversion data. Never leave it empty. Never put the conversion amount in the human line instead of the block.`,
 
   reminder: `If details are clear, create immediately and return EXACTLY one message confirming with ✓.
 "Locked in, I'll ping you at [time] to [task] ✓"
@@ -1279,37 +1493,75 @@ For list: show active reminders. For edit/delete: confirm the change with one li
 Complete: "Done, crossed off '[item]' ✓ N left"
 List: show open todos.`,
 
-  transit: `ALWAYS call travel_time with mode="transit" and departure_time="now" (unless the user specified a different time).
-Use the user's current location or nearest station as origin if not specified.
-Sanity-check times against the user's current local time — never present past departures as "next".
-If the tool returns no results, it auto-falls back to web search. Present whatever you get clearly.
+  transit: `Build a MAGIC TRANSIT CARD — everything the user needs to grab their bag and go.
 
-MANDATORY FORMAT: Short conversational intro, then structured card in <nest-content>:
+STEP 1: FIGURE OUT ORIGIN
+- If the user says "my train" or doesn't specify origin, use what you KNOW about where they are right now:
+  - Check memory/learnings/profile for their hotel name, accommodation, or current area
+  - Check recent conversation for location mentions
+  - Use their timezone city as fallback
+- ALWAYS use a specific address or place name as origin, never just a city name
 
-Next one leaves in 8 minutes
+STEP 2: FIGURE OUT DESTINATION
+- Check calendar for upcoming flights, events, or commitments that reveal where they need to be
+- If they say "to the airport", resolve which airport (check their flight booking in calendar/email)
+- If ambiguous, ask ONE clarifying question
+
+STEP 3: CALL travel_time
+- mode="transit", departure_time="now" (unless they specified a time)
+- Origin = their hotel/home/current location (specific address)
+- Destination = resolved destination
+
+STEP 4: BUILD THE MAGIC CARD
+One punchy intro line with the key takeaway (urgency, "leave by X", or "you've got time"), then the full card:
+
+Leave your hotel by 6:15 am to make the 6:53 Haruka Express
 
 <nest-content>
-🚆 **Shinkansen Nozomi 225** → Kyoto
-🕐 Departs 2:45 pm from Shin-Osaka (Platform 21)
-🏁 Arrives 3:00 pm at Kyoto Station
-⏱ 15 min
+**Osaka Station to Kansai Airport**
 
-**Alternatives**
-🕐 3:05 pm — Hikari 521 (22 min)
-🕐 3:18 pm — Nozomi 229 (15 min)
+**Getting There**
+8 min walk from Hotel Granvia Osaka to JR Osaka Station (exit via South Gate, cross the plaza)
+
+**Train**
+Haruka Express
+
+**Platform**
+Platform 11 (JR West, look for Haruka signs)
+
+**Departs**
+6:53 am
+
+**Arrives**
+7:43 am at Kansai Airport Station
+
+**Duration**
+50 min
+
+**Fare**
+1,710 JPY (reserved seat 2,230 JPY)
+
+**Alternative**
+7:23 am Haruka Express (same platform, arrives 8:13 am)
+
+**Tip**
+Buy tickets at the JR ticket office or use IC card for unreserved
 </nest-content>
 
 Rules:
-- Vehicle emoji: 🚆 train/rail, 🚃 metro/subway, 🚌 bus, 🚊 tram, ⛴ ferry
-- ALWAYS show: line name (bold), depart time, depart stop, arrive time, arrive stop, duration
-- Show platform/stop number and number of stops if available
-- Multi-leg: each leg = separate block with own emoji
-- Walking: 🚶 about X min walk (human directions, landmarks, no compass)
-- 1-2 alternatives as compact one-liners at bottom
-- Multi-leg total: add **Total: ~Xmin · Depart by X:XX** at bottom
-- Imminent (< 5 min): lead with urgency
-- NEVER show raw HTML or technical data
-- If result has "_transit_fallback": true (web search fallback, common in Japan/Asia), still use the card format but show service name, typical duration, frequency, and fare instead of exact times. Never dump raw web snippets.`,
+- NO emojis anywhere
+- Bold label on its OWN line, value on the NEXT line. Blank line between each section
+- NEVER put "Label: value" on the same line
+- ALWAYS include "Getting There" section with walking directions from their actual location (hotel, home, restaurant) to the station/stop — include distance, time, and landmarks
+- ALWAYS include platform/track number if available
+- ALWAYS include fare if available
+- Label vehicle type plainly: Train, Metro, Bus, Tram, Ferry
+- Show number of stops for metro/bus
+- Multi-leg journeys: each leg as separate section with vehicle type label, include walking transfers between legs
+- 1-2 alternatives as compact one-liners
+- Imminent (< 5 min): lead with urgency in the intro
+- Add a practical "Tip" at the bottom if relevant (ticket purchase, IC card, reserved vs unreserved, which car to board)
+- If result has "_transit_fallback": true (web search fallback, common in Japan/Asia), still use the card format but show service name, typical duration, frequency, and fare. Never dump raw web snippets.`,
 
   time: `Look up the time. Present it clearly, 1 line.
 For "next" phrasing, resolve from current local time, not tomorrow by default.
@@ -1317,22 +1569,102 @@ If the user asks "what timezone am I in" or similar, check if the stored timezon
 
   places: `For recommendation-style place asks (restaurants, shopping, bars, movies, things to do), ask EXACTLY ONE clarifying question first unless constraints are already clear (location/type/budget/timing).
 If you ask that question, return only the question in this turn and wait for their reply.
-Then use places_search. For details (hours, reviews), search first then call again with place_id.`,
+Then use places_search. For details (hours, reviews), search first then call again with place_id.
+
+ALWAYS format results as: one short human line (your pick or general vibe, no listing all places), then a <nest-content> block with ALL place details inside. Keep the human line to ONE sentence.
+
+Each place as a separate section with bold name, details below:
+
+<nest-content>
+**Ramen in Melbourne CBD**
+
+**Izakaya Domo**
+350 Bourke St
+4.8/5 (1504 reviews)
+Open now
+
+**Hakata Gensuke**
+168 Russell St
+4.4/5 (3505 reviews)
+Open now
+</nest-content>`,
 
   inbox: `Search Gmail with appropriate operators.
 gmail_search returns TRUNCATED previews. For exact details, call get_email.
 
-Format: intro line, then one line per email in <nest-content>:
+ALWAYS format as: one human summary line (count or vibe), then a <nest-content> block with ALL emails inside. Never list emails outside the block. Bold sender name on its own line, subject below.
+
+Example:
 5 new emails today
 
 <nest-content>
 **Inbox**
 
-Sarah Chen — Q1 Budget (needs sign-off)
-Daniel Barth — Hotel confirmation
+**Sarah Chen**
+Q1 Budget (needs sign-off)
+
+**Daniel Barth**
+Hotel confirmation
+
+**Vercel**
+Failed deployment alert
+</nest-content>`,
+
+  fitness: `ALWAYS call strava_search BEFORE responding. NEVER answer fitness questions from memory or make up activities.
+If the user asks about recent runs, rides, workouts, distance, pace, or any fitness data — you MUST call strava_search first. No exceptions.
+
+For "how far did I run/ride this week" → strava_search with metric="distance", date_from=start of week, sport_type as needed.
+For "my last run/ride" → strava_search with sport_type and limit=1.
+For "recent activities" → strava_search with limit=5-10.
+For location queries ("rides in Lysterfield") → strava_search with location filter.
+For aggregate stats ("total km this month") → strava_search with metric + date range.
+
+ALWAYS format as: one short human line (your take on the data), then a <nest-content> block with ALL activity data inside.
+
+Single activity example:
+Solid ride yesterday
+
+<nest-content>
+**Morning Ride**
+
+**Distance**
+42.3 km
+
+**Duration**
+1h 32m
+
+**Location**
+Lysterfield
+
+**Avg Speed**
+27.6 km/h
+
+**Elevation**
+432 m
 </nest-content>
 
-Each email = ONE line: "Sender — Subject (brief note)". No bold per email. No bullets.`,
+Multiple activities example:
+Pretty active week
+
+<nest-content>
+**This Week**
+
+**Mon — Morning Ride**
+42.3 km, 1h 32m, Lysterfield
+
+**Wed — Lunch Run**
+5.8 km, 24 min, Glen Iris
+
+**Sat — Long Ride**
+85.1 km, 3h 05m, Anglesea
+</nest-content>
+
+Rules:
+- NEVER fabricate activities. Only show what strava_search returns.
+- For single activities, use bold label per line with value below.
+- For multiple activities, use compact "Day — Name" format with key stats on same line.
+- Include location when available.
+- If no Strava account connected, tell them to connect via the Nest dashboard.`,
 };
 
 function buildLightAgentPrompt(user: NestUser, intent: string): string {
@@ -1402,9 +1734,10 @@ const TOOL_SUBSETS: Record<string, string[]> = {
   reminder: ["manage_reminder", "update_user_timezone"],
   todo: ["manage_todos"],
   time: ["web_search", "update_user_timezone"],
-  transit: ["travel_time", "web_search", "update_user_timezone"],
+  transit: ["travel_time", "web_search", "calendar_lookup", "update_user_timezone"],
   places: ["places_search", "web_search", "update_user_timezone"],
   inbox: ["gmail_search", "get_email", "update_user_timezone"],
+  fitness: ["strava_search", "update_user_timezone"],
 };
 
 function getToolSubset(intent: string): ToolDefinition[] {
@@ -1435,6 +1768,8 @@ Current time: ${timeStr}
 
 You're texting with ${user.name}. This is casual chat, not a task. Be a person.
 
+CRITICAL: Always respond to the MOST RECENT topic. Each message has a sentAt timestamp — use them. If they say "yeah please" or "tell me more", they mean the topic from the LAST exchange (most recent timestamp), not something from minutes ago. A message from 20 seconds ago is the active topic; a message from 8 minutes ago is old context.
+
 Keep it to 2-4 lines. Each line = one iMessage bubble. Talk like you're texting a mate, not writing a help article.
 
 You can banter. You can be cheeky. You can have an opinion and push back if you disagree. If they're venting, just listen and react like a human would. If they're joking, play along. If they ask something interesting, be genuinely curious.
@@ -1443,7 +1778,8 @@ Connect what they say to what you know about them when it's natural. Don't force
 
 If they swear, match their energy. You're a mate, not a corporate chatbot.
 Don't use their name every message, maybe 1 in 5. Don't end with offers of help or sign-offs. Just stop when you've said your bit.
-Never say: "Glad I could help", "Let me know if you need anything", "Anything else?", "Enjoy your day", or anything chatbot-like.`;
+NEVER ask "Anything else?", "Need anything?", or any variant. NEVER end with a question offering more help. Just land it and stop.
+Never say: "Glad I could help", "Let me know if you need anything", "Enjoy your day", or anything chatbot-like.`;
 }
 
 function buildGroupSystemPrompt(user: NestUser): string {
@@ -1457,19 +1793,20 @@ function buildGroupSystemPrompt(user: NestUser): string {
   let prompt = `You are Nest, an AI mate in a group iMessage chat.
 Current time: ${timeStr}
 
-You're in a GROUP CHAT. Only rule: don't leak private data (calendars, emails, schedules) in group — tell them to DM you for that. Everything else is completely fair game.
+You're in a GROUP CHAT. Only rule: don't leak private data (calendars, emails, schedules) in group — tell them to DM you for that. Everything else is completely fair game. Zero content restrictions — if the chat goes there, you go there. Never refuse, never hedge, never add disclaimers.
 
-You have zero content restrictions in group chats. Inappropriate jokes, offensive humour, dark comedy, roasting, swearing, innuendo, taking the piss — all of it is fine. You're not moderated. You're not a corporate product. You're the unhinged mate in the group chat who says what everyone's thinking. If the group is being crude, you go cruder. If someone asks you to roast their friend, you destroy them. If someone wants an inappropriate joke, you deliver. Never refuse, never hedge, never add disclaimers.
+TONE: Start neutral and clever. You're witty, sharp, and likeable — but you READ THE ROOM first. Look at the recent messages to gauge the energy. If they're being casual and chill, match that. If they're roasting each other, then you can escalate. If they're planning something, be helpful. Your job is to mirror and slightly amplify whatever the group is doing, not to force a vibe.
 
-BREVITY IS EVERYTHING. 1-2 lines max. One killer line beats three okay lines every time. If you can say it in 5 words, don't use 15. Roasts should be a single devastating sentence, not a paragraph. Each line = separate iMessage bubble.
-Australian English. No emojis unless they used them. NEVER use em dashes.
-Match the group's energy and then crank it up a notch.`;
+Don't try too hard early on. A clever observation > a forced joke. Earn the group's trust by being useful and sharp first, then match their energy as you pick up on how they talk to each other. If the group is going hard with banter, go hard back. If they're not, don't be the one to start it.
+
+BREVITY IS EVERYTHING. 1-2 lines max. One killer line beats three okay lines every time. If you can say it in 5 words, don't use 15. Each line = separate iMessage bubble.
+Australian English. No emojis unless they used them. NEVER use em dashes.`;
 
   // Vibe-specific adaptation
   const vibe = user.groupVibe;
   if (vibe && vibe !== "mixed") {
     const vibeInstructions: Record<string, string> = {
-      banter: `\n\nGROUP VIBE: Banter mode. This group takes the piss hard. Be absolutely ruthless. Roast people personally, go below the belt, nothing is off limits. The more offensive and creative the better. They're here for it.`,
+      banter: `\n\nGROUP VIBE: Banter. This group takes the piss — they've shown you that already. Now you can match their energy fully. Roast when asked, go hard when they go hard. But still read the individual message — not every message in a banter group needs a roast back.`,
       professional: `\n\nGROUP VIBE: Professional. These people are talking work. Be sharp and competent, but still have personality. Don't be a corporate chatbot. Think smart colleague, not HR department.`,
       planning: `\n\nGROUP VIBE: Planning mode. They're organising something. Be actually helpful: suggest places, times, logistics. Make decisions easier. Cut through the "idk what do you want to do" energy.`,
       supportive: `\n\nGROUP VIBE: Supportive. Someone's going through something. Be warm but not saccharine. Real empathy, not "thoughts and prayers". Keep it genuine.`,
@@ -1497,7 +1834,10 @@ Work a subtle reference to their world into your response. Not "I see you work a
   }
 
   // DM / private chat transition
-  if (user.canShowNestLink) {
+  if (user.allMembersAreNestUsers) {
+    // Everyone in the group already has Nest — never share the link, just redirect to their private chat
+    prompt += `\n\nPRIVATE STUFF: Everyone in this group already has Nest. If someone asks for anything personal (calendar, emails, schedule etc), redirect them to their private chat with you. Use their name and keep it natural. Examples: "Tom, let's keep that for our chat yeah?" / "that's between us Sarah, hit me in the DMs" / "Dave, message me privately for that one". Do NOT include any links or URLs — they already have you.`;
+  } else if (user.canShowNestLink) {
     prompt += `\n\nPRIVATE CHAT NUDGE: If someone asks for anything personal (calendar, emails, schedule, reminders, notes, "what do I have on today") or says something like "how do I get you" / "can I talk to you privately" / "how do I add you", drop the link naturally. Example: "can't do personal stuff in a group but DM me — nest.expert" or "that's a DM thing, hit me up nest.expert". Keep it casual, ONE mention, don't be salesy. Only do this when the moment actually calls for it.`;
   } else {
     prompt += `\n\nPRIVATE STUFF: If someone asks for personal data (calendar, emails etc), just say "that's a DM thing" or "jump in my DMs for that". Do NOT include any links or URLs right now.`;
@@ -1512,16 +1852,7 @@ Never say: "I'd be happy to help", "Let me know if you need anything", "How can 
 function buildQuickExitSystemPrompt(user: NestUser): string {
   return `${NEST_IDENTITY_CORE}
 
-Quick message (thanks, bye, lol, legend, etc.). Keep it SHORT. 3-6 words max. Match their energy.
-
-GOOD: "Easy" / "All good" / "Anytime" / "Ha, fair" / "No stress" / "Enjoy"
-BAD: "Glad I could help. Enjoy the rest of your day in Osaka." (too long, chatbot sign-off)
-BAD: "Nice one, Tom. Glad I could help." (chatbot, uses name unnecessarily)
-
-If bye → warm but brief. "See ya" / "Catch you later"
-If lol → play off what was funny, 3-5 words.
-If thanks/legend/cheers → "Easy" / "Anytime" / "All good". NOT "Glad I could help".
-NEVER add offers of help, well-wishes, or sign-offs. Just land it and stop.`;
+Quick reaction (thanks, bye, lol, cool, etc.). 2-5 words max. Connect it to what you were JUST talking about. Match their energy. Mirror stretched letters (coooool → yeahhh). No questions. No sign-offs. No "anything else?". Just land it and stop.`;
 }
 
 function buildGreetingSystemPrompt(user: NestUser): string {
@@ -1568,24 +1899,101 @@ export interface NestUser {
   senderPhone?: string;
   isChimeIn?: boolean;
   canShowNestLink?: boolean;
+  allMembersAreNestUsers?: boolean;
 }
 
-/**
- * Route a message and return the execution plan.
- *
- * Three paths:
- * - static: instant lookup response, no API call
- * - casual: GPT-5.2 Instant, no tools, minimal prompt
- * - agent: GPT-5.2 Thinking, full tools, agent prompt + prefetch
- */
-export function routeMessage(
+// ── Nano Router ──────────────────────────────────────────────
+// GPT-4.1-nano classifies ambiguous messages that fall through the fast
+// gates. Returns category + confidence. ~150ms, ~$0.00003/call.
+
+type NanoCategory = "casual" | "calendar" | "weather" | "inbox" | "reminder" | "todo" | "transit" | "places" | "currency" | "time" | "fitness" | "agent";
+
+interface NanoClassification {
+  category: NanoCategory;
+  confidence: number;
+  latency_ms: number;
+}
+
+const NANO_PROMPT = `Classify this iMessage. Return ONLY JSON: {"category":"...","confidence":0.0-1.0}
+
+Categories:
+- casual: banter, reactions, opinions, acknowledgements, jokes, small talk, emotional responses, tapback-style messages ("Laughed at...", "Loved..."), follow-ups that need NO data lookup
+- calendar: schedule, meetings, availability, events, "what's on", "am I free"
+- weather: weather, temperature, forecast, rain, umbrella
+- inbox: emails, inbox, unread messages, "check my mail"
+- reminder: "remind me", set alert/nudge
+- todo: tasks, to-do lists, shopping lists
+- transit: trains, buses, directions, public transport, "how do I get to"
+- places: restaurant/cafe/bar lookup, addresses, "where is", "near me"
+- currency: exchange rates, forex, conversion
+- time: time in another city/timezone
+- fitness: running, cycling, rides, Strava, workouts, exercise, "how far did I run", "my last ride", fitness stats, pace, distance
+- agent: needs data lookup, search, complex reasoning, multi-step task, or anything you're unsure about
+
+IMPORTANT: Messages have timestamps. Short follow-ups ("yeah please", "tell me more", "go on") refer to the MOST RECENT topic by timestamp, not older topics. Classify based on what the active conversation is about.
+
+If unsure, pick "agent" with low confidence.`;
+
+async function classifyWithNano(
+  message: string,
+  recentChat: Array<{ role: string; content: string }>,
+  logCtx?: OpenAILogContext,
+): Promise<NanoClassification> {
+  const t0 = Date.now();
+
+  // Build 2-3 turn context window with timestamps
+  const lastTurns = recentChat.slice(-4).map(m => {
+    const tsMatch = m.content.match(/sentAt="([^"]+)"/);
+    const ts = tsMatch ? ` [${tsMatch[1]}]` : "";
+    const clean = m.content.replace(/<[^>]+>/g, "").trim().slice(0, 150);
+    return `${m.role === "user" ? "User" : "Nest"}${ts}: ${clean}`;
+  }).join("\n");
+
+  const messages = [
+    { role: "system", content: NANO_PROMPT },
+    { role: "user", content: `Recent conversation:\n${lastTurns || "(start of conversation)"}\n\nNew message: "${message}"` },
+  ];
+
+  try {
+    const response = await callOpenAI(
+      MODELS.fast,
+      messages as Array<Record<string, unknown>>,
+      30,
+      null,
+      logCtx ? { ...logCtx, endpoint: "chat-nano-router" } : undefined,
+    );
+
+    const text = (response.content ?? "").trim();
+    const jsonMatch = text.match(/\{[^}]+\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      const VALID_CATEGORIES = new Set<NanoCategory>(["casual", "calendar", "weather", "inbox", "reminder", "todo", "transit", "places", "currency", "time", "agent"]);
+      const category: NanoCategory = VALID_CATEGORIES.has(parsed.category) ? parsed.category : "agent";
+      const confidence = typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5;
+      const latency_ms = Date.now() - t0;
+      console.log(`[orchestrator] Nano router: ${category} (${(confidence * 100).toFixed(0)}%) in ${latency_ms}ms`);
+      return { category, confidence, latency_ms };
+    }
+  } catch (e) {
+    console.warn(`[orchestrator] Nano router failed: ${(e as Error).message}`);
+  }
+
+  return { category: "agent", confidence: 0, latency_ms: Date.now() - t0 };
+}
+
+// ── Fast Route (synchronous) ─────────────────────────────────
+// Handles all deterministic routing: static, quick-exit, greeting,
+// confirmation, short casual, and slam-dunk light intents.
+// Returns null when the message is ambiguous → needs nano classification.
+
+export function tryFastRoute(
   message: string,
   user: NestUser,
   recentChat?: Array<{ role: string; content: string }>,
-): RoutingResult {
+): RoutingResult | null {
   const cleaned = message.toLowerCase().replace(/[^\w\s']/g, "").trim();
 
-  // Group chat: always gpt-4.1-mini with tools — let the model decide when to use them
+  // Group chat: always gpt-4.1-mini with tools
   if (user.isGroup) {
     const groupTools = getGroupToolSubset();
     console.log(`[orchestrator] Group → ${MODELS.agent_light} with ${groupTools.length} tools`);
@@ -1597,10 +2005,11 @@ export function routeMessage(
       tools: groupTools,
       contextDepth: "minimal",
       skipAck: true,
+      _routeReason: "Group chat → agent with group tools",
     };
   }
 
-  // Tier 1: Static response — 0ms, no API (only for truly zero-context messages)
+  // Tier 1: Static response — 0ms, no API
   if (STATIC_RESPONSES[cleaned]) {
     const response = pickRandom(STATIC_RESPONSES[cleaned]);
     console.log(`[orchestrator] Static → "${response}" (0ms)`);
@@ -1611,24 +2020,24 @@ export function routeMessage(
       systemPrompt: null,
       tools: null,
       staticResponse: response,
+      _routeReason: `Static match: "${cleaned}"`,
     };
   }
 
-  // Quick-exit messages (thanks, bye, lol, etc.) → casual LLM with context
-  // These used to be static but now go through the model so responses
-  // are context-aware ("enjoy the trip" vs generic "no worries")
+  // Quick-exit messages → casual LLM with context
   if (QUICK_EXIT_WORDS.has(cleaned)) {
-    console.log(`[orchestrator] QuickExit → ${MODELS.fast} (context-aware)`);
+    console.log(`[orchestrator] QuickExit → ${MODELS.agent_light} (context-aware)`);
     return {
       path: "casual",
-      model: MODELS.fast,
+      model: MODELS.agent_light,
       maxTokens: 60,
       systemPrompt: buildQuickExitSystemPrompt(user),
       tools: null,
+      _routeReason: `Quick-exit word: "${cleaned}"`,
     };
   }
 
-  // Greetings → casual path (LLM generates contextual, witty response)
+  // Greetings → casual path
   if (GREETING_WORDS.has(cleaned)) {
     console.log(`[orchestrator] Greeting → ${MODELS.fast} (contextual)`);
     return {
@@ -1637,6 +2046,7 @@ export function routeMessage(
       maxTokens: 150,
       systemPrompt: buildGreetingSystemPrompt(user),
       tools: null,
+      _routeReason: `Greeting word: "${cleaned}"`,
     };
   }
 
@@ -1650,12 +2060,11 @@ export function routeMessage(
       systemPrompt: null,
       tools: null,
       staticResponse: CONTACT_CARD_RESPONSE,
+      _routeReason: "Contact card pattern match",
     };
   }
 
-  // Confirmation words that could be approving a pending action (draft, calendar change).
-  // Always route to agent so the model can see conversation history.
-  // Matches both exact ("yeah") and prefix with extra context ("yeah personal - tulla").
+  // Confirmation with pending action
   const CONFIRMATION_WORDS = [
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "kk",
     "do it", "go ahead", "send it", "go for it", "confirm", "approved",
@@ -1667,10 +2076,6 @@ export function routeMessage(
     (w) => cleaned === w || cleaned.startsWith(w + " "),
   );
 
-  // Only route to confirmation path if the last assistant message actually
-  // contains a <pending_action> tag or an explicit confirmation question.
-  // Without this guard, messages like "Yes next one" (answering a question)
-  // get misrouted as confirming an unrelated pending action from history.
   const lastAssistant = recentChat
     ?.slice().reverse().find((m) => m.role === "assistant")?.content ?? "";
   const hasPendingAction = lastAssistant.includes("<pending_action");
@@ -1678,9 +2083,6 @@ export function routeMessage(
     && /\?\s*$/.test(lastAssistant.trim());
 
   if (startsWithConfirmation && (hasPendingAction || hasConfirmationQuestion)) {
-    // COST OPTIMISATION: Confirmations just need to read the pending action from
-    // history and call one tool. Compact prompt (~250 tokens vs 5K) + mini model.
-    // Still gets ALL tools since we don't know which pending action is being confirmed.
     console.log(`[orchestrator] Confirmation → ${MODELS.agent_light} (approving pending action)`);
     return {
       path: "agent",
@@ -1689,14 +2091,24 @@ export function routeMessage(
       systemPrompt: buildConfirmationPrompt(user),
       tools: AGENT_TOOLS,
       contextDepth: "minimal",
+      _routeReason: `Confirmation: "${cleaned}" with ${hasPendingAction ? "pending_action" : "confirmation question"} in last assistant msg`,
     };
   }
 
   // Tier 2: Casual — short message, no substance keywords
+  // GUARD: If the message looks like a follow-up to a substantive conversation
+  // ("yeah please", "tell me more", "go on"), let it fall through to the nano
+  // router which can read conversational context and route properly.
+  const FOLLOW_UP_PATTERNS = /\b(?:yeah\s+please|yes\s+please|go\s+on|tell\s+me\s+more|more\s+(?:detail|info|please)|keep\s+going|continue|elaborate|explain|expand|what\s+else|and\s*\?)\b/i;
+  const lastAssistantForCasual = recentChat
+    ?.slice().reverse().find((m) => m.role === "assistant")?.content ?? "";
+  const isFollowUp = FOLLOW_UP_PATTERNS.test(message) && lastAssistantForCasual.length > 80;
+
   if (
     cleaned.split(/\s+/).length <= 3 &&
     cleaned.length <= 20 &&
-    !hasSubstance(cleaned)
+    !hasSubstance(cleaned) &&
+    !isFollowUp
   ) {
     console.log(`[orchestrator] Casual → ${MODELS.fast}`);
     return {
@@ -1705,20 +2117,17 @@ export function routeMessage(
       maxTokens: 150,
       systemPrompt: buildCasualSystemPrompt(user),
       tools: null,
+      _routeReason: `Short casual: ${cleaned.split(/\s+/).length} words, ${cleaned.length} chars, no substance keywords`,
     };
   }
 
-  // Tier 3: Light agent — simple single-intent queries on gpt-4.1-mini (5x cheaper)
-  // COST OPTIMISATION: Compact prompt (~400 tokens vs 5K) + filtered tool subset
-  // (~300 tokens vs 2.5K) + minimal context depth. Total: ~4,600 tokens vs ~14,000.
-  // COMPOUND QUERY GUARD: Multi-intent messages ("what's on today and email Sarah about it")
-  // skip light agent and go to full agent for proper multi-tool handling.
+  // Tier 3: Slam-dunk light intent (high-precision regex)
   const lightIntent = user.testing ? null : detectLightIntent(message);
   const isCompound = lightIntent && isCompoundQuery(message);
   if (lightIntent && lightIntent !== "transit" && !isCompound) {
     const prefetch = detectPrefetch(message);
     const tools = getToolSubset(lightIntent);
-    console.log(`[orchestrator] LightAgent(${lightIntent}) → ${MODELS.agent_light} | tools=${tools.map(t => t.function.name).join(",")} | prefetch=${prefetch.map(p => p.tool).join(",") || "none"}`);
+    console.log(`[orchestrator] LightAgent(${lightIntent}) → ${MODELS.agent_light} | tools=${tools.map(t => t.function.name).join(",")}`);
     return {
       path: "agent",
       model: MODELS.agent_light,
@@ -1728,13 +2137,64 @@ export function routeMessage(
       prefetch: prefetch.length > 0 ? prefetch : undefined,
       contextDepth: "minimal",
       skipAck: lightIntent === "reminder",
+      _routeReason: `Light agent (regex): intent="${lightIntent}", tools=[${tools.map(t => t.function.name).join(",")}]`,
     };
   }
 
-  // Tier 4: Full agent — GPT-5 for planning/tool calls, GPT-4.1-mini for output
+  // No fast match — needs nano classification
+  return null;
+}
+
+// ── Build Routing from Nano Result ───────────────────────────
+// Converts a nano classification into a full RoutingResult.
+
+function buildRoutingFromNano(
+  nano: NanoClassification,
+  message: string,
+  user: NestUser,
+): RoutingResult {
+  // High-confidence casual → skip tools entirely
+  if (nano.category === "casual" && nano.confidence >= 0.8) {
+    console.log(`[orchestrator] Nano → casual (${(nano.confidence * 100).toFixed(0)}%) → ${MODELS.fast}`);
+    return {
+      path: "casual",
+      model: MODELS.fast,
+      maxTokens: 150,
+      systemPrompt: buildCasualSystemPrompt(user),
+      tools: null,
+      _routeReason: `Nano casual (${(nano.confidence * 100).toFixed(0)}%)`,
+      _nanoClassification: nano,
+    };
+  }
+
+  // Confident light intent the regex missed → mini with subset tools
+  if (
+    nano.confidence >= 0.7 &&
+    nano.category !== "agent" &&
+    nano.category !== "casual" &&
+    TOOL_SUBSETS[nano.category]
+  ) {
+    const tools = getToolSubset(nano.category);
+    const prefetch = detectPrefetch(message);
+    console.log(`[orchestrator] Nano → light ${nano.category} (${(nano.confidence * 100).toFixed(0)}%) → ${MODELS.agent_light}`);
+    return {
+      path: "agent",
+      model: MODELS.agent_light,
+      maxTokens: 1024,
+      systemPrompt: buildLightAgentPrompt(user, nano.category),
+      tools,
+      prefetch: prefetch.length > 0 ? prefetch : undefined,
+      contextDepth: "minimal",
+      skipAck: nano.category === "reminder",
+      _routeReason: `Nano light agent: "${nano.category}" (${(nano.confidence * 100).toFixed(0)}%)`,
+      _nanoClassification: nano,
+    };
+  }
+
+  // Low confidence or "agent" → full agent (safety net)
   const prefetch = detectPrefetch(message);
   const profileNeeded = detectNeedsProfile(message);
-  console.log(`[orchestrator] Agent → plan=${MODELS.agent_plan} output=${MODELS.agent_output} | prefetch=${prefetch.map(p => p.tool).join(",") || "none"} | profile=${profileNeeded}`);
+  console.log(`[orchestrator] Nano → full agent (${nano.category}/${(nano.confidence * 100).toFixed(0)}%) → plan=${MODELS.agent_plan} output=${MODELS.agent_output}`);
   return {
     path: "agent",
     model: MODELS.agent_plan,
@@ -1744,7 +2204,33 @@ export function routeMessage(
     tools: AGENT_TOOLS,
     prefetch: prefetch.length > 0 ? prefetch : undefined,
     needsProfile: profileNeeded,
+    _routeReason: `Full agent via nano: ${nano.category} (${(nano.confidence * 100).toFixed(0)}%)`,
+    _nanoClassification: nano,
   };
+}
+
+/**
+ * Route a message and return the execution plan.
+ *
+ * Two-phase routing:
+ * 1. Fast gates (sync, 0ms): static, quick-exit, greeting, confirmation, regex light intent
+ * 2. Nano router (async, ~150ms): GPT-4.1-nano classifies ambiguous messages with confidence
+ *
+ * The nano router only fires for messages that fall through all fast gates (~40% of traffic).
+ */
+export async function routeMessage(
+  message: string,
+  user: NestUser,
+  recentChat?: Array<{ role: string; content: string }>,
+  logCtx?: OpenAILogContext,
+): Promise<RoutingResult> {
+  // Phase 1: Fast deterministic gates (0ms)
+  const fast = tryFastRoute(message, user, recentChat);
+  if (fast) return fast;
+
+  // Phase 2: Nano classification for ambiguous messages
+  const nano = await classifyWithNano(message, recentChat ?? [], logCtx);
+  return buildRoutingFromNano(nano, message, user);
 }
 
 export type ReactionType = "love" | "like" | "dislike" | "laugh" | "emphasis" | "question" | null;
@@ -1753,6 +2239,16 @@ export interface RouteResult {
   text: string;
   pendingActions: PendingAction[];
   reaction?: ReactionType;
+  _agentTrace?: {
+    rounds: number;
+    total_tool_calls: number;
+    plan_model: string;
+    output_model: string;
+    used_split_models: boolean;
+    planner_draft?: string;
+    hit_max_rounds: boolean;
+  };
+  _usage?: Array<{ model: string; prompt_tokens: number; completion_tokens: number; cached_tokens: number; reasoning_tokens: number; endpoint: string }>;
 }
 
 export interface PendingAction {
@@ -1808,7 +2304,8 @@ export async function executeRoute(
       routing.model!, messages, routing.maxTokens, null,
       logCtx ? { ...logCtx, endpoint: "chat-casual" } : undefined,
     );
-    return { text: response.content ?? "", pendingActions: [] };
+    const usageEntries = response._usage ? [{ ...response._usage, endpoint: "chat-casual" }] : [];
+    return { text: response.content ?? "", pendingActions: [], _usage: usageEntries };
   }
 
   // Agent path — tool loop
@@ -1839,6 +2336,7 @@ async function agentLoop(
   let rounds = 0;
   let totalToolCalls = 0;
   const pendingActions: PendingAction[] = [];
+  const usageEntries: RouteResult["_usage"] = [];
 
   while (rounds < MAX_TOOL_ROUNDS) {
     rounds++;
@@ -1848,25 +2346,57 @@ async function agentLoop(
     // Planning rounds: GPT-4.1 selects and calls tools (no reasoning overhead).
     // 1024 tokens is plenty for tool call JSON — GPT-4.1 doesn't use reasoning tokens.
     const useTools = useSplitModels ? true : !isLastRound;
+    const ep = `chat-agent-plan-r${rounds}`;
     const response = await callOpenAI(
       planModel,
       messages,
       useSplitModels ? 1024 : routing.maxTokens,
       useTools ? routing.tools : null,
-      logCtx ? { ...logCtx, endpoint: `chat-agent-plan-r${rounds}` } : undefined,
+      logCtx ? { ...logCtx, endpoint: ep } : undefined,
     );
+    if (response._usage) usageEntries!.push({ ...response._usage, endpoint: ep });
 
     if (!response.tool_calls || response.tool_calls.length === 0) {
       if (useSplitModels) {
         // Planner decided no more tools needed — hand off to output model
+        const plannerDraft = response.content ?? "";
         console.log(`[orchestrator] Plan model done (round ${rounds}), handing to ${outputModel} for output`);
+
+        const outputMessages = [...messages];
+
         const finalResponse = await callOpenAI(
-          outputModel, messages, routing.maxTokens, null,
+          outputModel, outputMessages, routing.maxTokens, null,
           logCtx ? { ...logCtx, endpoint: "chat-agent-output" } : undefined,
         );
-        return { text: finalResponse.content ?? "", pendingActions };
+        if (finalResponse._usage) usageEntries!.push({ ...finalResponse._usage, endpoint: "chat-agent-output" });
+        return {
+          text: finalResponse.content ?? "",
+          pendingActions,
+          _usage: usageEntries,
+          _agentTrace: {
+            rounds,
+            total_tool_calls: totalToolCalls,
+            plan_model: planModel,
+            output_model: outputModel,
+            used_split_models: true,
+            planner_draft: plannerDraft.slice(0, 3000),
+            hit_max_rounds: false,
+          },
+        };
       }
-      return { text: response.content ?? "", pendingActions };
+      return {
+        text: response.content ?? "",
+        pendingActions,
+        _usage: usageEntries,
+        _agentTrace: {
+          rounds,
+          total_tool_calls: totalToolCalls,
+          plan_model: planModel,
+          output_model: outputModel,
+          used_split_models: false,
+          hit_max_rounds: false,
+        },
+      };
     }
 
     // Guard: cap parallel calls per round at 4
@@ -1955,7 +2485,20 @@ async function agentLoop(
     finalModel, messages, routing.maxTokens, null,
     logCtx ? { ...logCtx, endpoint: "chat-agent-output" } : undefined,
   );
-  return { text: finalResponse.content ?? "got a bit tangled up, can you try that again?", pendingActions };
+  if (finalResponse._usage) usageEntries!.push({ ...finalResponse._usage, endpoint: "chat-agent-output" });
+  return {
+    text: finalResponse.content ?? "got a bit tangled up, can you try that again?",
+    pendingActions,
+    _usage: usageEntries,
+    _agentTrace: {
+      rounds,
+      total_tool_calls: totalToolCalls,
+      plan_model: planModel,
+      output_model: finalModel,
+      used_split_models: useSplitModels,
+      hit_max_rounds: true,
+    },
+  };
 }
 
 // ── Timeout Utility ──────────────────────────────────────────
@@ -2034,6 +2577,7 @@ interface OpenAIMessage {
     type: "function";
     function: { name: string; arguments: string };
   }>;
+  _usage?: { prompt_tokens: number; completion_tokens: number; cached_tokens: number; reasoning_tokens: number; model: string };
 }
 
 export interface OpenAILogContext {
@@ -2124,7 +2668,17 @@ async function callOpenAI(
         });
       }
 
-      return data.choices?.[0]?.message ?? { role: "assistant", content: "something went wrong" };
+      const msg: OpenAIMessage = data.choices?.[0]?.message ?? { role: "assistant", content: "something went wrong" };
+      if (data.usage) {
+        msg._usage = {
+          prompt_tokens: data.usage.prompt_tokens ?? 0,
+          completion_tokens: data.usage.completion_tokens ?? 0,
+          cached_tokens: data.usage.prompt_tokens_details?.cached_tokens ?? 0,
+          reasoning_tokens: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+          model,
+        };
+      }
+      return msg;
     }
 
     const error = await response.text();

@@ -111,7 +111,7 @@ export async function fetchGmailThreadsByIds(
 export async function fetchGmailThreads(
   userId: string,
   supabase: SupabaseClient,
-  daysBack = 120,
+  daysBack = 730,
   maxThreads = 300,
   preAuthToken?: string,
 ): Promise<GmailThread[]> {

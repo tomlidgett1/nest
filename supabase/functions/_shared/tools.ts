@@ -254,6 +254,7 @@ async function dispatch(
     case "connect_meeting_notes": return connectMeetingNotes(userId, supabase, args);
     case "get_meeting_notes":     return getMeetingNotes(userId, supabase, args);
     case "manage_meeting_recording": return manageMeetingRecording(userId, supabase, args);
+    case "strava_search":           return stravaSearch(userId, supabase, args);
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -486,7 +487,7 @@ async function calendarLookup(
   }
 
   const now = new Date();
-  return events
+  const sorted = events
     .map((e: any) => {
       const start = new Date(e.start_iso);
       const end = new Date(e.end_iso);
@@ -503,6 +504,17 @@ async function calendarLookup(
       return { ...e, status };
     })
     .sort((a: any, b: any) => new Date(a.start_iso).getTime() - new Date(b.start_iso).getTime());
+
+  // Detect multi-day results and add formatting hint
+  const uniqueDays = new Set(sorted.map((e: any) => e.day_label ?? e.start_iso?.split("T")[0]));
+  if (uniqueDays.size > 1) {
+    return {
+      _format: "group_by_day",
+      _hint: "Group by day with bold headings (**Mon 3**, **Tue 4**), blank line between days. Multi-day spanning events at top. Each event = 'time — title' (use em dash). Skip empty days.",
+      events: sorted,
+    };
+  }
+  return sorted;
 }
 
 function formatMicrosoftCalendarEvent(e: any, tz?: string): Record<string, unknown> {
@@ -678,6 +690,50 @@ function resolveTimeRange(range: string, tz: string): { timeMin: string; timeMax
         return {
           timeMin: now.toISOString(),
           timeMax: makeDay(end.getFullYear(), end.getMonth() + 1, end.getDate()).timeMax,
+        };
+      }
+
+      // Backward-looking: "past/last N days"
+      const pastDaysMatch = lower.match(/(?:past|last)\s+(\d+)\s+days?/);
+      if (pastDaysMatch) {
+        const n = parseInt(pastDaysMatch[1], 10);
+        const start = new Date(todayLocal.year, todayLocal.month - 1, todayLocal.day - n);
+        return {
+          timeMin: makeDay(start.getFullYear(), start.getMonth() + 1, start.getDate()).timeMin,
+          timeMax: now.toISOString(),
+        };
+      }
+
+      // Backward-looking: "past/last N weeks"
+      const pastWeeksMatch = lower.match(/(?:past|last)\s+(\d+)\s+weeks?/);
+      if (pastWeeksMatch) {
+        const n = parseInt(pastWeeksMatch[1], 10);
+        const start = new Date(todayLocal.year, todayLocal.month - 1, todayLocal.day - n * 7);
+        return {
+          timeMin: makeDay(start.getFullYear(), start.getMonth() + 1, start.getDate()).timeMin,
+          timeMax: now.toISOString(),
+        };
+      }
+
+      // Backward-looking: "past/last N months"
+      const pastMonthsMatch = lower.match(/(?:past|last)\s+(\d+)\s+months?/);
+      if (pastMonthsMatch) {
+        const n = parseInt(pastMonthsMatch[1], 10);
+        const start = new Date(todayLocal.year, todayLocal.month - 1 - n, todayLocal.day);
+        return {
+          timeMin: makeDay(start.getFullYear(), start.getMonth() + 1, start.getDate()).timeMin,
+          timeMax: now.toISOString(),
+        };
+      }
+
+      // Backward-looking: "past/last N years" (for broad historical queries)
+      const pastYearsMatch = lower.match(/(?:past|last)\s+(\d+)\s+years?/);
+      if (pastYearsMatch) {
+        const n = parseInt(pastYearsMatch[1], 10);
+        const start = new Date(todayLocal.year - n, todayLocal.month - 1, todayLocal.day);
+        return {
+          timeMin: makeDay(start.getFullYear(), start.getMonth() + 1, start.getDate()).timeMin,
+          timeMax: now.toISOString(),
         };
       }
 
@@ -2832,8 +2888,7 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
         (fallback as Record<string, unknown>).origin = origin;
         (fallback as Record<string, unknown>).destination = destination;
         (fallback as Record<string, unknown>).mode = "transit";
-        (fallback as Record<string, unknown>)._format = "MANDATORY: Present using <nest-content> card even though this is web search data. Lead with short conversational line. Use 🚆 for trains. Show service names in bold, typical duration, frequency, fare if available. Format: 🚆 **Line Name** → Destination, 📍 From STATION → STATION, ⏱ ~DURATION · Runs every X min, 💴 ~FARE. Show multiple options if available.";
-        (fallback as Record<string, unknown>)._time_note = "CRITICAL INSTRUCTION: This is timetable data. Times shown are in LOCAL TIME at the destination (e.g. JST for Japan). These are RECURRING DAILY schedules, not past events. You MUST present this data using the <nest-content> card format. Do NOT say 'couldn't confirm' or 'want me to re-check'. Show the train services, frequency, duration, and fare. The user needs this info NOW.";
+        (fallback as Record<string, unknown>)._hint = "Build a MAGIC TRANSIT CARD from this timetable data. Include: service name, typical duration, frequency, fare, and a practical tip. Times are in LOCAL TIME at the destination. These are RECURRING DAILY schedules, not past events. Use <nest-content> card format. No emojis. Do NOT say 'couldn't confirm'. The user needs this info NOW.";
       }
       return fallback;
     }
@@ -2895,7 +2950,7 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
       (fallback as Record<string, unknown>).origin = origin;
       (fallback as Record<string, unknown>).destination = destination;
       (fallback as Record<string, unknown>).mode = "transit";
-      (fallback as Record<string, unknown>)._format = "MANDATORY: Present using <nest-content> card even though this is web search data. Use 🚆 for trains. Show service names in bold, typical duration, frequency, fare if available.";
+      (fallback as Record<string, unknown>)._hint = "Build a MAGIC TRANSIT CARD from this data. Include: service name, duration, frequency, fare, and a practical tip. Use <nest-content> card format. No emojis.";
     }
     return fallback;
   }
@@ -2914,9 +2969,15 @@ function parseTransitRoutes(routes: any[], origin: string, destination: string):
       arrive_at: leg.arrival_time?.text,
     };
 
+    // Extract fare if available
+    if (route.fare) {
+      option.fare = route.fare.text;
+      option.fare_currency = route.fare.currency;
+    }
+
     const transitSteps = (leg.steps ?? [])
       .filter((s: any) => s.travel_mode === "TRANSIT" || s.travel_mode === "WALKING")
-      .slice(0, 8)
+      .slice(0, 10)
       .map((s: any) => {
         const step: Record<string, unknown> = {
           mode: s.travel_mode?.toLowerCase(),
@@ -2924,20 +2985,44 @@ function parseTransitRoutes(routes: any[], origin: string, destination: string):
           distance: s.distance?.text,
           duration: s.duration?.text,
         };
+        if (s.travel_mode === "WALKING") {
+          step.start_location = s.start_location;
+          step.end_location = s.end_location;
+          // Include sub-steps for walking directions (landmarks, turns)
+          const walkDetails = (s.steps ?? []).slice(0, 4).map((ws: any) =>
+            ws.html_instructions?.replace(/<[^>]*>/g, "")
+          ).filter(Boolean);
+          if (walkDetails.length) step.walking_directions = walkDetails;
+        }
         if (s.transit_details) {
           const td = s.transit_details;
           step.line_name = td.line?.short_name || td.line?.name;
+          step.line_full_name = td.line?.name;
           step.vehicle_type = td.line?.vehicle?.type?.toLowerCase();
+          step.vehicle_name = td.line?.vehicle?.name;
           step.num_stops = td.num_stops;
           step.departure_stop = td.departure_stop?.name;
           step.arrival_stop = td.arrival_stop?.name;
           if (td.departure_time?.text) step.departs_at = td.departure_time.text;
           if (td.arrival_time?.text) step.arrives_at = td.arrival_time.text;
           if (td.headsign) step.direction = td.headsign;
+          // Platform info (where available — common in Japan, Europe)
+          if (td.departure_stop?.location) step.departure_location = td.departure_stop.location;
+          if (td.trip_short_name) step.trip_id = td.trip_short_name;
         }
         return step;
       });
-    if (transitSteps.length) option.transit_steps = transitSteps;
+    if (transitSteps.length) option.legs = transitSteps;
+
+    // Extract first walking leg separately for "Getting There" section
+    const firstWalk = transitSteps.find((s: any) => s.mode === "walking");
+    if (firstWalk) {
+      option.walk_to_station = {
+        duration: firstWalk.duration,
+        distance: firstWalk.distance,
+        directions: firstWalk.walking_directions,
+      };
+    }
 
     return option;
   });
@@ -2947,7 +3032,7 @@ function parseTransitRoutes(routes: any[], origin: string, destination: string):
     origin: options[0]?.origin ?? origin,
     destination: options[0]?.destination ?? destination,
     options,
-    _format: "MANDATORY: Present using <nest-content> card. Lead with short conversational line. Use emoji per leg: 🚆train 🚃metro 🚌bus 🚊tram ⛴ferry 🚶walk. Each leg: emoji **Line Name** → Direction, 🕐 Departs TIME from STOP, 🏁 Arrives TIME at STOP, ⏱ DURATION. Show alternatives as compact one-liners at bottom.",
+    _hint: "Build a MAGIC TRANSIT CARD. Include: Getting There (walk from origin to station with landmarks), Train/Bus name, Platform if known, Departure time, Arrival time, Duration, Fare, 1-2 alternatives as one-liners, and a practical Tip. Use <nest-content> card format. No emojis.",
   };
 }
 
@@ -3465,4 +3550,252 @@ async function manageMeetingRecording(
   }
 
   return { error: `Unknown action: ${action}. Use "status", "disconnect", or "decline_pitch".` };
+}
+
+// ── Strava Search ────────────────────────────────────────────
+
+async function stravaSearch(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const query = String(args.query ?? "");
+  const sportType = args.sport_type ? String(args.sport_type) : null;
+  const location = args.location ? String(args.location) : null;
+  const dateFrom = args.date_from ? String(args.date_from) : null;
+  const dateTo = args.date_to ? String(args.date_to) : null;
+  const metric = args.metric ? String(args.metric) : null;
+  const limit = Math.min(Number(args.limit) || 10, 50);
+
+  // Check if user has Strava connected
+  const { data: stravaAccount } = await supabase
+    .from("user_strava_accounts")
+    .select("id")
+    .eq("user_id", userId)
+    .limit(1)
+    .maybeSingle();
+
+  if (!stravaAccount) {
+    return {
+      error: "no_strava_account",
+      hint: "The user hasn't connected their Strava account. They can do this from the Nest dashboard under Connections.",
+    };
+  }
+
+  // ── Aggregate metric queries ───────────────────────────────
+  if (metric) {
+    return stravaAggregate(supabase, userId, metric, sportType, location, dateFrom, dateTo);
+  }
+
+  // ── Structured activity search ─────────────────────────────
+  let dbQuery = supabase
+    .from("strava_activities")
+    .select(
+      "strava_id, name, sport_type, start_date_local, distance_metres, " +
+      "moving_time_secs, elapsed_time_secs, total_elevation_gain_metres, " +
+      "elev_high, average_speed, max_speed, average_heartrate, max_heartrate, " +
+      "average_watts, weighted_average_watts, kilojoules, calories, " +
+      "average_temp, suffer_score, athlete_count, gear_name, device_name, " +
+      "pr_count, achievement_count, kudos_count, description, " +
+      "is_race, is_commute, is_trainer, workout_type, " +
+      "start_location_name, end_location_name",
+    )
+    .eq("user_id", userId)
+    .order("start_date_local", { ascending: false })
+    .limit(limit);
+
+  if (sportType) {
+    dbQuery = dbQuery.ilike("sport_type", sportType);
+  }
+  if (location) {
+    dbQuery = dbQuery.ilike("start_location_name", `%${location}%`);
+  }
+  if (dateFrom) {
+    dbQuery = dbQuery.gte("start_date_local", dateFrom);
+  }
+  if (dateTo) {
+    dbQuery = dbQuery.lte("start_date_local", dateTo);
+  }
+
+  const { data: activities, error: dbErr } = await dbQuery;
+
+  if (dbErr) {
+    console.error("[tools] strava_search DB error:", dbErr.message);
+    return { error: "search_failed", detail: dbErr.message };
+  }
+
+  if (!activities || activities.length === 0) {
+    // Fall back to semantic search on strava embeddings
+    return stravaSemanticFallback(userId, supabase, query, limit);
+  }
+
+  const formatted = (activities as any[]).map(formatStravaActivity);
+
+  // If query seems semantic (not just date/sport filtering), also do semantic search
+  const isSemanticQuery = query.length > 10 && !metric && !dateFrom && !dateTo;
+  if (isSemanticQuery) {
+    const semantic = await stravaSemanticFallback(userId, supabase, query, 5);
+    if (semantic && (semantic as any).results?.length > 0) {
+      return {
+        activities: formatted,
+        count: formatted.length,
+        semantic_matches: (semantic as any).results,
+      };
+    }
+  }
+
+  return { activities: formatted, count: formatted.length };
+}
+
+async function stravaAggregate(
+  supabase: SupabaseClient,
+  userId: string,
+  metric: string,
+  sportType: string | null,
+  location: string | null,
+  dateFrom: string | null,
+  dateTo: string | null,
+): Promise<unknown> {
+  let query = supabase
+    .from("strava_activities")
+    .select(
+      "distance_metres, moving_time_secs, elapsed_time_secs, " +
+      "total_elevation_gain_metres, calories, sport_type, name, " +
+      "start_date_local, average_heartrate, average_speed, athlete_count, " +
+      "start_location_name, average_watts, kilojoules, suffer_score",
+    )
+    .eq("user_id", userId);
+
+  if (sportType) query = query.ilike("sport_type", sportType);
+  if (location) query = query.ilike("start_location_name", `%${location}%`);
+  if (dateFrom) query = query.gte("start_date_local", dateFrom);
+  if (dateTo) query = query.lte("start_date_local", dateTo);
+
+  const { data: rows, error } = await query;
+  if (error) return { error: "aggregate_failed", detail: error.message };
+  if (!rows || rows.length === 0) return { count: 0, message: "No activities found for the given filters." };
+
+  const activities = rows as any[];
+  const count = activities.length;
+
+  const totalDistanceM = activities.reduce((s, a) => s + (a.distance_metres ?? 0), 0);
+  const totalMovingSecs = activities.reduce((s, a) => s + (a.moving_time_secs ?? 0), 0);
+  const totalElapsedSecs = activities.reduce((s, a) => s + (a.elapsed_time_secs ?? 0), 0);
+  const totalElevation = activities.reduce((s, a) => s + (a.total_elevation_gain_metres ?? 0), 0);
+  const totalCalories = activities.reduce((s, a) => s + (a.calories ?? 0), 0);
+
+  const hrActivities = activities.filter((a) => a.average_heartrate);
+  const avgHr = hrActivities.length > 0
+    ? Math.round(hrActivities.reduce((s, a) => s + a.average_heartrate, 0) / hrActivities.length)
+    : null;
+
+  const groupActivities = activities.filter((a) => (a.athlete_count ?? 1) > 1);
+
+  const result: Record<string, unknown> = {
+    activity_count: count,
+    total_distance_km: Number((totalDistanceM / 1000).toFixed(2)),
+    total_moving_time_hours: Number((totalMovingSecs / 3600).toFixed(2)),
+    total_elapsed_time_hours: Number((totalElapsedSecs / 3600).toFixed(2)),
+    total_elevation_m: Math.round(totalElevation),
+    total_calories: Math.round(totalCalories),
+    average_distance_km: Number((totalDistanceM / 1000 / count).toFixed(2)),
+    average_duration_mins: Math.round(totalMovingSecs / 60 / count),
+  };
+
+  if (avgHr) result.average_heartrate = avgHr;
+  if (groupActivities.length > 0) result.group_activities = groupActivities.length;
+
+  if (metric === "distance") {
+    result._summary = `${result.total_distance_km} km across ${count} activities`;
+  } else if (metric === "time") {
+    result._summary = `${result.total_moving_time_hours} hours across ${count} activities`;
+  } else if (metric === "elevation") {
+    result._summary = `${result.total_elevation_m} m elevation across ${count} activities`;
+  } else if (metric === "count") {
+    result._summary = `${count} activities`;
+  }
+
+  // Sport breakdown if no sport filter
+  if (!sportType) {
+    const sportCounts: Record<string, number> = {};
+    for (const a of activities) {
+      const st = a.sport_type ?? "Unknown";
+      sportCounts[st] = (sportCounts[st] ?? 0) + 1;
+    }
+    result.sport_breakdown = sportCounts;
+  }
+
+  if (dateFrom || dateTo) {
+    result.date_range = { from: dateFrom, to: dateTo };
+  }
+
+  return result;
+}
+
+async function stravaSemanticFallback(
+  userId: string,
+  supabase: SupabaseClient,
+  query: string,
+  limit: number,
+): Promise<unknown> {
+  try {
+    return await semanticSearch(userId, supabase, {
+      query,
+      source_filters: ["strava_summary", "strava_chunk"],
+      limit,
+    });
+  } catch (e) {
+    console.warn("[tools] strava semantic fallback failed:", (e as Error).message);
+    return { results: [], count: 0 };
+  }
+}
+
+function formatStravaActivity(a: any): Record<string, unknown> {
+  const distKm = Number(((a.distance_metres ?? 0) / 1000).toFixed(2));
+  const movingMins = Math.round((a.moving_time_secs ?? 0) / 60);
+  const sportType = a.sport_type ?? "Activity";
+
+  const result: Record<string, unknown> = {
+    name: a.name,
+    sport_type: sportType,
+    date: a.start_date_local,
+    distance_km: distKm,
+    duration_mins: movingMins,
+  };
+
+  if (a.start_location_name) result.location = a.start_location_name;
+  if (a.end_location_name && a.end_location_name !== a.start_location_name) {
+    result.end_location = a.end_location_name;
+  }
+  if (a.total_elevation_gain_metres > 0) result.elevation_m = Math.round(a.total_elevation_gain_metres);
+  if (a.elev_high) result.max_elevation_m = Math.round(a.elev_high);
+  if (a.average_heartrate) result.avg_hr = Math.round(a.average_heartrate);
+  if (a.max_heartrate) result.max_hr = Math.round(a.max_heartrate);
+  if (a.average_watts) result.avg_watts = Math.round(a.average_watts);
+  if (a.weighted_average_watts) result.normalised_power = Math.round(a.weighted_average_watts);
+  if (a.kilojoules) result.energy_kj = Math.round(a.kilojoules);
+  if (a.calories) result.calories = Math.round(a.calories);
+  if (a.average_temp != null) result.temp_c = Math.round(a.average_temp);
+  if (a.suffer_score) result.suffer_score = a.suffer_score;
+  if ((a.athlete_count ?? 1) > 1) result.group_size = a.athlete_count;
+  if (a.gear_name) result.gear = a.gear_name;
+  if (a.device_name) result.device = a.device_name;
+  if (a.pr_count > 0) result.prs = a.pr_count;
+  if (a.achievement_count > 0) result.achievements = a.achievement_count;
+  if (a.is_race) result.race = true;
+  if (a.is_commute) result.commute = true;
+  if (a.is_trainer) result.indoor = true;
+
+  if (a.average_speed) {
+    if (sportType.toLowerCase().includes("run") || sportType.toLowerCase().includes("walk")) {
+      const paceMinPerKm = 1000 / 60 / a.average_speed;
+      const paceMin = Math.floor(paceMinPerKm);
+      const paceSec = Math.round((paceMinPerKm - paceMin) * 60);
+      result.pace = `${paceMin}:${String(paceSec).padStart(2, "0")} /km`;
+    } else {
+      result.avg_speed_kmh = Number((a.average_speed * 3.6).toFixed(1));
+    }
+  }
+
+  return result;
 }

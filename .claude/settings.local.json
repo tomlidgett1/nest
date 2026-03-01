@@ -18,7 +18,8 @@
       "Bash(curl:*)",
       "Bash(python3:*)",
       "Bash(# Check what the function sees as the service role key - let''s look at how other functions authenticate\n# The v2-trigger function uses service role key auth too - let''s see how it''s called)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(git pull:*)"
     ]
   }
 }

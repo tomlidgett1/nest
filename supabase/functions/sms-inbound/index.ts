@@ -12,7 +12,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { handleMessage, type NestContext } from "../_shared/personality-agent.ts";
-import { routeMessage, type NestUser } from "../_shared/orchestrator.ts";
+import { tryFastRoute, type NestUser } from "../_shared/orchestrator.ts";
 import { getUserMemory, updateMemory, extractLearnings } from "../_shared/memory-service.ts";
 import { appendToConversation } from "../_shared/conversation-store.ts";
 import { serverSideRAG } from "../_shared/server-rag.ts";
@@ -347,9 +347,8 @@ async function processAndSend(
     timezoneHolder,
   };
 
-  // Pass recentChat to routeMessage (aligned with v2-chat-service)
-  const quickRoute = routeMessage(message, nestUser, recentChat);
-  const isAgent = quickRoute.path === "agent";
+  const quickRoute = tryFastRoute(message, nestUser, recentChat);
+  const isAgent = !quickRoute || quickRoute.path === "agent";
 
   let ackText: string | null = null;
 

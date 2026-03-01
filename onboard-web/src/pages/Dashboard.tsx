@@ -22,6 +22,8 @@ const GOOGLE_SCOPES = [
 
 const MS_SCOPES = 'openid email offline_access User.Read Calendars.ReadWrite Mail.ReadWrite Mail.Send Contacts.Read Files.Read.All'
 
+const STRAVA_CLIENT_ID = import.meta.env.VITE_STRAVA_CLIENT_ID as string
+
 interface GoogleAccount {
   id: string
   google_email: string
@@ -36,6 +38,12 @@ interface MicrosoftAccount {
   microsoft_name: string | null
   microsoft_avatar_url: string | null
   is_primary: boolean
+}
+
+interface StravaAccount {
+  id: string
+  strava_athlete_id: number
+  athlete_name: string | null
 }
 
 type Tab = 'accounts' | 'contact' | 'connections'
@@ -60,6 +68,8 @@ export default function Dashboard() {
   const [contactSaved, setContactSaved] = useState(false)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [activeTab, setActiveTab] = useState<Tab>('accounts')
+  const [stravaAccount, setStravaAccount] = useState<StravaAccount | null>(null)
+  const [stravaLoading, setStravaLoading] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -86,6 +96,22 @@ export default function Dashboard() {
         const resolvedName = metadataName || primaryGName || primaryMsName || user.email || ''
         console.log('[dashboard] Display name resolved:', resolvedName, '(metadata:', metadataName, ', google:', primaryGName, ', ms:', primaryMsName, ')')
         setDisplayName(resolvedName)
+
+        // Fetch Strava connection status
+        const { data: strava } = await supabase
+          .from('user_strava_accounts')
+          .select('id, strava_athlete_id, athlete_name')
+          .eq('user_id', user.id)
+          .limit(1)
+          .maybeSingle()
+        if (strava) setStravaAccount(strava)
+
+        // Handle ?strava=connected redirect
+        const params = new URLSearchParams(window.location.search)
+        if (params.get('strava') === 'connected') {
+          setActiveTab('connections')
+          window.history.replaceState({}, '', '/dashboard')
+        }
       } catch (err) {
         console.error('[dashboard] init() error:', err)
       } finally {
@@ -212,6 +238,39 @@ export default function Dashboard() {
       // Silently fail
     } finally {
       setRemoving(null)
+    }
+  }
+
+  async function handleConnectStrava() {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) return
+    setStravaLoading(true)
+    const callbackUrl = `${SUPABASE_URL}/functions/v1/strava-callback`
+    const stravaAuthUrl = new URL('https://www.strava.com/oauth/authorize')
+    stravaAuthUrl.searchParams.set('client_id', STRAVA_CLIENT_ID)
+    stravaAuthUrl.searchParams.set('redirect_uri', callbackUrl)
+    stravaAuthUrl.searchParams.set('response_type', 'code')
+    stravaAuthUrl.searchParams.set('approval_prompt', 'auto')
+    stravaAuthUrl.searchParams.set('scope', 'activity:read_all,profile:read_all')
+    stravaAuthUrl.searchParams.set('state', session.user.id)
+    window.location.href = stravaAuthUrl.toString()
+  }
+
+  async function handleDisconnectStrava() {
+    if (!stravaAccount) return
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) return
+    setStravaLoading(true)
+    try {
+      await supabase
+        .from('user_strava_accounts')
+        .delete()
+        .eq('id', stravaAccount.id)
+      setStravaAccount(null)
+    } catch {
+      // Silently fail
+    } finally {
+      setStravaLoading(false)
     }
   }
 
@@ -490,25 +549,69 @@ export default function Dashboard() {
               <p className="text-[13px] text-gray-500 mb-3">
                 Connect apps to give Nest more context about your life.
               </p>
-              <div className="rounded-2xl bg-white border border-gray-200/60 shadow-sm overflow-hidden divide-y divide-gray-100">
-                {[
-                  { name: 'Strava', desc: 'Fitness & activities', color: '#FC4C02', path: 'M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066l-2.084 4.116zm-7.98-5.743l2.615 5.157h3.064L8.22 6.672 3.033 17.358h3.065l2.31-5.157z' },
-                  { name: 'Slack', desc: 'Team messaging', color: '#4A154B', path: 'M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zm1.271 0a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zm0 1.271a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zm10.122 2.521a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zm-1.268 0a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zm-2.523 10.122a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zm0-1.268a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z' },
-                  { name: 'Notion', desc: 'Notes & docs', color: '#000000', path: 'M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L18.002 2.05c-.42-.326-.98-.7-2.055-.607L3.01 2.41c-.467.047-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.166V6.354c0-.606-.233-.933-.748-.886l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952l1.448.327s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.14c-.093-.514.28-.886.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z' },
-                ].map((app) => (
-                  <div key={app.name} className="flex items-center gap-3 px-4 py-3">
-                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
-                      <svg viewBox="0 0 24 24" className="h-4 w-4" fill={app.color}>
-                        <path d={app.path} />
-                      </svg>
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[13px] font-medium text-gray-900">{app.name}</p>
-                      <p className="text-[11px] text-gray-400">{app.desc}</p>
-                    </div>
-                    <span className="shrink-0 text-[11px] text-gray-400 bg-gray-100 px-2 py-0.5 rounded-md">Soon</span>
+              <div className="rounded-md bg-white border border-gray-200/60 shadow-sm overflow-hidden divide-y divide-gray-100">
+                {/* Strava — functional */}
+                <div className="flex items-center gap-3 px-4 py-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="#FC4C02">
+                      <path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066l-2.084 4.116zm-7.98-5.743l2.615 5.157h3.064L8.22 6.672 3.033 17.358h3.065l2.31-5.157z" />
+                    </svg>
                   </div>
-                ))}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13px] font-medium text-gray-900">Strava</p>
+                    <p className="text-[11px] text-gray-400">
+                      {stravaAccount ? stravaAccount.athlete_name ?? 'Connected' : 'Fitness & activities'}
+                    </p>
+                  </div>
+                  {stravaAccount ? (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md font-medium">Connected</span>
+                      <button
+                        onClick={() => void handleDisconnectStrava()}
+                        disabled={stravaLoading}
+                        className="text-[11px] text-gray-400 hover:text-red-500 transition-colors"
+                      >
+                        {stravaLoading ? '...' : 'Remove'}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => void handleConnectStrava()}
+                      disabled={stravaLoading}
+                      className="shrink-0 text-[11px] font-medium text-white bg-gray-900 px-3 py-1 rounded-md active:scale-[0.96] transition-all"
+                    >
+                      {stravaLoading ? '...' : 'Connect'}
+                    </button>
+                  )}
+                </div>
+
+                {/* Slack — coming soon */}
+                <div className="flex items-center gap-3 px-4 py-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="#4A154B">
+                      <path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zm1.271 0a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zm0 1.271a2.528 2.528 0 0 1 2.521 2.521 2.528 2.528 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312zm10.122 2.521a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zm-1.268 0a2.528 2.528 0 0 1-2.523 2.521 2.527 2.527 0 0 1-2.52-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.523 2.522v6.312zm-2.523 10.122a2.528 2.528 0 0 1 2.523 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.52-2.522v-2.522h2.52zm0-1.268a2.527 2.527 0 0 1-2.52-2.523 2.526 2.526 0 0 1 2.52-2.52h6.313A2.527 2.527 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.523h-6.313z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13px] font-medium text-gray-900">Slack</p>
+                    <p className="text-[11px] text-gray-400">Team messaging</p>
+                  </div>
+                  <span className="shrink-0 text-[11px] text-gray-400 bg-gray-100 px-2 py-0.5 rounded-md">Soon</span>
+                </div>
+
+                {/* Notion — coming soon */}
+                <div className="flex items-center gap-3 px-4 py-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="#000000">
+                      <path d="M4.459 4.208c.746.606 1.026.56 2.428.466l13.215-.793c.28 0 .047-.28-.046-.326L18.002 2.05c-.42-.326-.98-.7-2.055-.607L3.01 2.41c-.467.047-.56.28-.374.466zm.793 3.08v13.904c0 .747.373 1.027 1.214.98l14.523-.84c.841-.046.935-.56.935-1.166V6.354c0-.606-.233-.933-.748-.886l-15.177.887c-.56.047-.747.327-.747.933zm14.337.745c.093.42 0 .84-.42.888l-.7.14v10.264c-.608.327-1.168.514-1.635.514-.748 0-.935-.234-1.495-.933l-4.577-7.186v6.952l1.448.327s0 .84-1.168.84l-3.222.186c-.093-.186 0-.653.327-.746l.84-.233V9.854L7.822 9.76c-.094-.42.14-1.026.793-1.073l3.456-.233 4.764 7.279v-6.44l-1.215-.14c-.093-.514.28-.886.747-.933zM1.936 1.035l13.31-.98c1.634-.14 2.055-.047 3.082.7l4.249 2.986c.7.513.934.653.934 1.213v16.378c0 1.026-.373 1.634-1.68 1.726l-15.458.934c-.98.047-1.448-.093-1.962-.747l-3.129-4.06c-.56-.747-.793-1.306-.793-1.96V2.667c0-.839.374-1.54 1.447-1.632z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13px] font-medium text-gray-900">Notion</p>
+                    <p className="text-[11px] text-gray-400">Notes & docs</p>
+                  </div>
+                  <span className="shrink-0 text-[11px] text-gray-400 bg-gray-100 px-2 py-0.5 rounded-md">Soon</span>
+                </div>
               </div>
             </motion.div>
           )}

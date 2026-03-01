@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react'
-import { fetchDebugLogs, fetchUsers, type DebugLogEntry, type DebugUser } from '../lib/debug-api'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { fetchDebugLogs, fetchUsers, askDebugChat, calculateTraceCost, type DebugLogEntry, type DebugUser, type ChatMessage, type CostBreakdown } from '../lib/debug-api'
 
 // ── Styles ───────────────────────────────────────────────────
 
@@ -100,6 +100,9 @@ function TraceViewer({ log }: { log: DebugLogEntry }) {
   const response = t.response ?? {}
   const request = t.request ?? {}
   const ack = t.ack ?? {}
+  const agentLoop = t.agent_loop ?? null
+  const rawLlmResponse: string | null = t.raw_llm_response ?? null
+  const cost: CostBreakdown | null = calculateTraceCost(t.usage ?? null)
 
   const totalMs = timing.total_ms ?? 0
   const timingEntries = [
@@ -117,6 +120,11 @@ function TraceViewer({ log }: { log: DebugLogEntry }) {
           <span style={S.badge(PATH_COLORS[log.route_path] ?? '#555')}>{log.route_path}</span>
           <span style={S.badge('#333')}>{log.source}</span>
           {log.model && <span style={S.badge('#333')}>{log.model}</span>}
+          {routing.output_model && routing.output_model !== routing.model && (
+            <span style={S.badge('#7c3aed')}>→ {routing.output_model}</span>
+          )}
+          {agentLoop && <span style={S.badge('#059669')}>{agentLoop.rounds}r / {agentLoop.total_tool_calls}tc</span>}
+          {cost && <span style={S.badge('#d97706')}>${cost.totalCostUsd < 0.01 ? cost.totalCostUsd.toFixed(6) : cost.totalCostUsd.toFixed(4)}</span>}
           <span style={{ fontSize: 11, color: '#888' }}>{formatTime(log.created_at)}</span>
           <span style={{ fontSize: 11, color: '#555' }}>Total: {totalMs}ms</span>
         </div>
@@ -149,13 +157,34 @@ function TraceViewer({ log }: { log: DebugLogEntry }) {
 
       {/* Routing */}
       <Section title="Routing" badge={`${routing.path} → ${routing.model ?? 'none'}`}>
+        {routing.route_reason && (
+          <div style={{ padding: '8px 12px', marginBottom: 12, borderRadius: 6, background: '#1a1a0d', border: '1px solid #333', fontSize: 12, color: '#e0b040', lineHeight: 1.5 }}>
+            {routing.route_reason}
+          </div>
+        )}
         <KV data={{
           path: routing.path,
           model: routing.model ?? '—',
+          output_model: routing.output_model ?? '—',
           max_tokens: routing.max_tokens,
           has_tools: routing.has_tools,
           tool_count: routing.tool_count,
+          used_fast_gate: routing.used_fast_gate ? 'Yes (regex)' : 'No (nano router)',
         }} />
+        {routing.nano_classification && (
+          <div style={{ marginTop: 12, padding: '8px 12px', borderRadius: 6, background: '#0d1a1a', border: '1px solid #1a3a3a' }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: '#06b6d4', marginBottom: 6 }}>NANO ROUTER</div>
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+              <span style={S.badge('#06b6d4')}>{routing.nano_classification.category}</span>
+              <span style={{ fontSize: 12, color: '#aaa' }}>
+                Confidence: <span style={{ color: routing.nano_classification.confidence >= 0.8 ? '#22c55e' : routing.nano_classification.confidence >= 0.6 ? '#eab308' : '#ef4444', fontWeight: 600 }}>
+                  {(routing.nano_classification.confidence * 100).toFixed(0)}%
+                </span>
+              </span>
+              <span style={{ fontSize: 11, color: '#555' }}>{routing.nano_classification.latency_ms}ms</span>
+            </div>
+          </div>
+        )}
         {routing.prefetch_tasks?.length > 0 && (
           <div style={{ marginTop: 12 }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: '#888', marginBottom: 4 }}>Prefetch Tasks:</div>
@@ -165,6 +194,47 @@ function TraceViewer({ log }: { log: DebugLogEntry }) {
           </div>
         )}
       </Section>
+
+      {/* Agent Loop */}
+      {agentLoop && (
+        <Section title="Agent Loop" badge={`${agentLoop.rounds} rounds | ${agentLoop.total_tool_calls} tool calls${agentLoop.hit_max_rounds ? ' | HIT MAX' : ''}`}>
+          <KV data={{
+            rounds: agentLoop.rounds,
+            total_tool_calls: agentLoop.total_tool_calls,
+            plan_model: agentLoop.plan_model ?? '—',
+            output_model: agentLoop.output_model ?? '—',
+            used_split_models: agentLoop.used_split_models ? 'Yes (plan → output handoff)' : 'No (single model)',
+            hit_max_rounds: agentLoop.hit_max_rounds ? '⚠ YES' : 'No',
+          }} />
+          {agentLoop.planner_draft && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: '#888', marginBottom: 4 }}>Planner Draft (before output model):</div>
+              <pre style={{ ...S.pre, maxHeight: 300 }}>{agentLoop.planner_draft}</pre>
+            </div>
+          )}
+        </Section>
+      )}
+
+      {/* Cost Breakdown */}
+      {cost && (
+        <Section title="Cost" badge={`$${cost.totalCostUsd < 0.01 ? cost.totalCostUsd.toFixed(6) : cost.totalCostUsd.toFixed(4)} | ${cost.totalTokensIn.toLocaleString()} in / ${cost.totalTokensOut.toLocaleString()} out${cost.totalCached > 0 ? ` | ${cost.totalCached.toLocaleString()} cached` : ''}`}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {cost.calls.map((c, i) => (
+              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 10px', borderRadius: 6, background: '#111', border: '1px solid #222' }}>
+                <div>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: '#60a0ff' }}>{c.endpoint}</span>
+                  <span style={{ fontSize: 10, color: '#666', marginLeft: 8 }}>{c.model}</span>
+                </div>
+                <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 10 }}>
+                  <span style={{ color: '#888' }}>{c.tokensIn.toLocaleString()} in{c.cached > 0 ? ` (${c.cached.toLocaleString()} cached)` : ''}</span>
+                  <span style={{ color: '#888' }}>{c.tokensOut.toLocaleString()} out</span>
+                  <span style={{ color: '#d97706', fontWeight: 700 }}>${c.costUsd < 0.001 ? c.costUsd.toFixed(6) : c.costUsd.toFixed(4)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </Section>
+      )}
 
       {/* Context Loaded */}
       <Section title="Context Loaded" badge={`${context.recent_chat_count ?? 0} msgs | ${context.learnings_count ?? 0} learnings`}>
@@ -253,8 +323,16 @@ function TraceViewer({ log }: { log: DebugLogEntry }) {
         </Section>
       )}
 
+      {/* Raw LLM Response (before formatting) */}
+      {rawLlmResponse && (
+        <Section title="Raw LLM Response (before formatting)" badge="differs from final">
+          <div style={{ fontSize: 11, color: '#d97706', marginBottom: 8 }}>This is what the model returned before formatForIMessage() and post-processing changed it.</div>
+          <pre style={{ ...S.pre, maxHeight: 400 }}>{rawLlmResponse}</pre>
+        </Section>
+      )}
+
       {/* Response */}
-      <Section title="Response" badge={`${response.text_length ?? 0} chars`} defaultOpen={true}>
+      <Section title="Final Response" badge={`${response.text_length ?? 0} chars${rawLlmResponse ? ' (post-processed)' : ''}`} defaultOpen={true}>
         <div style={{ fontSize: 12, color: '#ddd', lineHeight: 1.6, whiteSpace: 'pre-wrap', marginBottom: 12 }}>{response.text}</div>
         <KV data={{
           reaction: response.reaction ?? 'none',
@@ -326,6 +404,130 @@ function ExpandableToolCall({ tc, index }: { tc: any, index: number }) {
   )
 }
 
+// ── Debug Chat Panel ─────────────────────────────────────────
+
+function DebugChatPanel({ log }: { log: DebugLogEntry }) {
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // Reset chat when log changes
+  useEffect(() => {
+    setMessages([])
+    setInput('')
+  }, [log.id])
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [messages])
+
+  const handleSend = async () => {
+    const q = input.trim()
+    if (!q || loading) return
+
+    setInput('')
+    setMessages(prev => [...prev, { role: 'user', content: q }])
+    setLoading(true)
+
+    try {
+      const answer = await askDebugChat(log.trace, q, messages)
+      setMessages(prev => [...prev, { role: 'assistant', content: answer }])
+    } catch (e) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${(e as Error).message}` }])
+    }
+
+    setLoading(false)
+    setTimeout(() => inputRef.current?.focus(), 50)
+  }
+
+  return (
+    <div style={{ borderTop: '1px solid #222', display: 'flex', flexDirection: 'column', height: 360, background: '#0a0a0a' }}>
+      <div style={{ padding: '8px 16px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: '#fff' }}>Ask about this trace</span>
+        <span style={{ fontSize: 9, color: '#555' }}>GPT-5.2</span>
+        {messages.length > 0 && (
+          <button
+            onClick={() => setMessages([])}
+            style={{ marginLeft: 'auto', fontSize: 10, color: '#666', background: 'none', border: '1px solid #333', borderRadius: 4, padding: '2px 8px', cursor: 'pointer' }}
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
+      <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: '8px 16px' }}>
+        {messages.length === 0 && (
+          <div style={{ color: '#444', fontSize: 11, padding: '16px 0' }}>
+            Ask anything about this message trace. e.g. "Why did this use the agent path?", "What data did semantic_search return?", "Could this have been cheaper?"
+          </div>
+        )}
+        {messages.map((m, i) => (
+          <div key={i} style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', alignItems: m.role === 'user' ? 'flex-end' : 'flex-start' }}>
+            <div style={{
+              maxWidth: '85%',
+              padding: '8px 12px',
+              borderRadius: 8,
+              fontSize: 11,
+              lineHeight: 1.6,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              background: m.role === 'user' ? '#1a1a2e' : '#111',
+              color: m.role === 'user' ? '#a0b0ff' : '#ccc',
+              border: `1px solid ${m.role === 'user' ? '#2a2a4e' : '#222'}`,
+            }}>
+              {m.content}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div style={{ fontSize: 11, color: '#555', padding: '4px 0' }}>Thinking...</div>
+        )}
+      </div>
+
+      <div style={{ padding: '8px 16px', borderTop: '1px solid #222', display: 'flex', gap: 8, flexShrink: 0 }}>
+        <input
+          ref={inputRef}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
+          placeholder="Ask about this trace..."
+          disabled={loading}
+          style={{
+            flex: 1,
+            padding: '8px 12px',
+            background: '#111',
+            color: '#ddd',
+            border: '1px solid #333',
+            borderRadius: 6,
+            fontSize: 12,
+            outline: 'none',
+          }}
+        />
+        <button
+          onClick={handleSend}
+          disabled={loading || !input.trim()}
+          style={{
+            padding: '8px 16px',
+            background: loading || !input.trim() ? '#222' : '#2563eb',
+            color: loading || !input.trim() ? '#555' : '#fff',
+            border: 'none',
+            borderRadius: 6,
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: loading || !input.trim() ? 'default' : 'pointer',
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // ── Main Dashboard ───────────────────────────────────────────
 
 export default function DebugDashboard() {
@@ -346,9 +548,15 @@ export default function DebugDashboard() {
         path: selectedPath || undefined,
         limit: 100,
       })
-      setLogs(data)
-      if (data.length > 0 && !selectedLogId) {
-        setSelectedLogId(data[0].id)
+      const seen = new Set<string>()
+      const deduped = data.filter((d: DebugLogEntry) => {
+        if (seen.has(d.id)) return false
+        seen.add(d.id)
+        return true
+      })
+      setLogs(deduped)
+      if (deduped.length > 0 && !selectedLogId) {
+        setSelectedLogId(deduped[0].id)
       }
     } catch (e) {
       console.error('Failed to load debug logs:', e)
@@ -407,33 +615,47 @@ export default function DebugDashboard() {
         <div style={S.msgList as any}>
           {loading && logs.length === 0 && <div style={{ padding: 16, color: '#555' }}>Loading...</div>}
           {!loading && logs.length === 0 && <div style={{ padding: 16, color: '#555' }}>No debug logs yet. Send a message to Nest to generate traces.</div>}
-          {logs.map(log => (
-            <div
-              key={log.id}
-              style={S.msgItem(log.id === selectedLogId)}
-              onClick={() => setSelectedLogId(log.id)}
-            >
-              <div style={S.msgText as any}>{log.user_message}</div>
-              <div style={S.msgMeta}>
-                <span style={S.badge(PATH_COLORS[log.route_path] ?? '#555')}>{log.route_path}</span>
-                {log.model && <span style={{ fontSize: 9, color: '#666' }}>{log.model}</span>}
-                <span style={{ fontSize: 9, color: '#555' }}>{log.trace?.timing?.total_ms ?? '?'}ms</span>
-                <span style={{ fontSize: 9, color: '#555', marginLeft: 'auto' }}>{timeAgo(log.created_at)}</span>
+          {logs.map(log => {
+            const logAgentLoop = log.trace?.agent_loop
+            const logRouteReason = log.trace?.routing?.route_reason
+            const logCost = calculateTraceCost(log.trace?.usage ?? null)
+            return (
+              <div
+                key={log.id}
+                style={S.msgItem(log.id === selectedLogId)}
+                onClick={() => setSelectedLogId(log.id)}
+              >
+                <div style={S.msgText as any}>{log.user_message}</div>
+                <div style={S.msgMeta}>
+                  <span style={S.badge(PATH_COLORS[log.route_path] ?? '#555')}>{log.route_path}</span>
+                  {log.trace?.routing?.nano_classification && <span style={{ fontSize: 9, color: '#06b6d4' }}>nano:{log.trace.routing.nano_classification.category}({(log.trace.routing.nano_classification.confidence * 100).toFixed(0)}%)</span>}
+                  {log.model && <span style={{ fontSize: 9, color: '#666' }}>{log.model}</span>}
+                  {logAgentLoop && <span style={{ fontSize: 9, color: '#059669' }}>{logAgentLoop.rounds}r/{logAgentLoop.total_tool_calls}tc</span>}
+                  <span style={{ fontSize: 9, color: '#555' }}>{log.trace?.timing?.total_ms ?? '?'}ms</span>
+                  {logCost && <span style={{ fontSize: 9, color: '#d97706' }}>${logCost.totalCostUsd < 0.01 ? logCost.totalCostUsd.toFixed(5) : logCost.totalCostUsd.toFixed(3)}</span>}
+                  <span style={{ fontSize: 9, color: '#555', marginLeft: 'auto' }}>{timeAgo(log.created_at)}</span>
+                </div>
+                {logRouteReason && (
+                  <div style={{ fontSize: 9, color: '#666', marginTop: 2, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{logRouteReason}</div>
+                )}
               </div>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </div>
 
       {/* Main content */}
-      <div style={S.main}>
-        {selectedLog ? (
-          <TraceViewer log={selectedLog} />
-        ) : (
-          <div style={S.empty}>
-            {logs.length > 0 ? 'Select a message to view its trace' : 'No debug logs yet'}
-          </div>
-        )}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ ...S.main, flex: 1, overflow: 'auto' }}>
+          {selectedLog ? (
+            <TraceViewer log={selectedLog} />
+          ) : (
+            <div style={S.empty}>
+              {logs.length > 0 ? 'Select a message to view its trace' : 'No debug logs yet'}
+            </div>
+          )}
+        </div>
+        {selectedLog && <DebugChatPanel log={selectedLog} />}
       </div>
     </div>
   )

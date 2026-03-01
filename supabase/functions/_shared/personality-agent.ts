@@ -12,9 +12,11 @@
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import {
   routeMessage,
+  tryFastRoute,
   executeRoute,
   truncateHistory,
   decideReaction,
+  detectPrefetch,
   callOpenAI,
   MODELS,
   type NestUser,
@@ -1466,15 +1468,107 @@ function buildToolExecutor(ctx: NestContext) {
 
 // ── Output Formatter ─────────────────────────────────────────
 
+function reformatFlatCalendarList(text: string): string {
+  const nestMatch = text.match(/<nest-content>([\s\S]*?)<\/nest-content>/);
+  if (!nestMatch) return text;
+
+  const nestContent = nestMatch[1];
+  const lines = nestContent.split("\n").map(l => l.trimEnd());
+
+  // Detect flat calendar list: 4+ lines starting with "March N" or "March N,"
+  const dateLinePattern = /^March \d{1,2}[,:\s]/;
+  const dateLines = lines.filter(l => dateLinePattern.test(l.replace(/^\*\*/, "")));
+  if (dateLines.length < 4) return text;
+
+  const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+  // Extract the heading (first bold line)
+  const headingMatch = nestContent.match(/\*\*([^*]+)\*\*/);
+  const heading = headingMatch ? `**${headingMatch[1]}**` : "";
+
+  // Parse events into day buckets
+  const spanningEvents: string[] = [];
+  const dayBuckets = new Map<string, string[]>();
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("**")) continue;
+
+    // Spanning event: "March 2–8: ..." or "March 2-8: ..."
+    const spanMatch = trimmed.match(/^March (\d{1,2})[–\-]\d{1,2}[,:]\s*(.+)/);
+    if (spanMatch) {
+      const dayNum = parseInt(spanMatch[1]);
+      const title = spanMatch[2].trim();
+      const date = new Date(2026, 2, dayNum);
+      const dayName = DAYS[date.getDay()];
+      const endMatch = trimmed.match(/^March \d{1,2}[–\-](\d{1,2})/);
+      const endNum = endMatch ? parseInt(endMatch[1]) : dayNum;
+      const endDate = new Date(2026, 2, endNum);
+      const endDayName = DAYS[endDate.getDay()];
+      spanningEvents.push(`${title} (${dayName}–${endDayName}, all day)`);
+      continue;
+    }
+
+    // All-day event: "March 3: Birthday (all day)" or "March 8: International Women's Day"
+    const allDayMatch = trimmed.match(/^March (\d{1,2})[,:]\s*(.+)/);
+    if (allDayMatch && !trimmed.match(/\d{1,2}:\d{2}\s*[ap]m/i)) {
+      const dayNum = parseInt(allDayMatch[1]);
+      const title = allDayMatch[2].replace(/\s*\(all day\)/i, "").trim();
+      const date = new Date(2026, 2, dayNum);
+      const dayKey = `${dayNum}`;
+      if (!dayBuckets.has(dayKey)) dayBuckets.set(dayKey, []);
+      dayBuckets.get(dayKey)!.push(title + (allDayMatch[2].includes("all day") ? " (all day)" : ""));
+      continue;
+    }
+
+    // Timed event: "March 4, 8:30 am–9:30 am: Chat about Japan trip" or "March 4, 8:30 am: ..."
+    const timedMatch = trimmed.match(/^March (\d{1,2}),?\s*(\d{1,2}:\d{2}\s*[ap]m)(?:[–\-]\d{1,2}:\d{2}\s*[ap]m)?[,:]\s*(.+)/i);
+    if (timedMatch) {
+      const dayNum = parseInt(timedMatch[1]);
+      const time = timedMatch[2].trim();
+      const title = timedMatch[3].trim();
+      const dayKey = `${dayNum}`;
+      if (!dayBuckets.has(dayKey)) dayBuckets.set(dayKey, []);
+      dayBuckets.get(dayKey)!.push(`${time} — ${title}`);
+      continue;
+    }
+  }
+
+  // Build grouped output
+  let result = heading ? `${heading}\n` : "";
+
+  if (spanningEvents.length > 0) {
+    result += "\n" + spanningEvents.join("\n") + "\n";
+  }
+
+  const sortedDays = [...dayBuckets.keys()].sort((a, b) => parseInt(a) - parseInt(b));
+  for (const dayKey of sortedDays) {
+    const dayNum = parseInt(dayKey);
+    const date = new Date(2026, 2, dayNum);
+    const dayName = DAYS[date.getDay()];
+    const events = dayBuckets.get(dayKey)!;
+    result += `\n**${dayName} ${dayNum}**\n`;
+    for (const event of events) {
+      result += `${event}\n`;
+    }
+  }
+
+  const newNestContent = `<nest-content>\n${result.trim()}\n</nest-content>`;
+  return text.replace(/<nest-content>[\s\S]*?<\/nest-content>/, newNestContent);
+}
+
 function formatForIMessage(raw: string): string {
-  return raw
+  let text = raw
     .trim()
     .replace(/<\/?assistant[^>]*>/g, "")
     .replace(/<pending_action>[\s\S]*?<\/pending_action>/g, "")
     .replace(/\n{3,}/g, "\n\n")
-    .replace(/\s*\u2014\s*/g, ", ")  // em dash → comma + space
     .replace(/ +([,.\?!;:])/g, "$1")  // "sure , tom" → "sure, tom"
     .trim();
+
+  text = reformatFlatCalendarList(text);
+  return text;
 }
 
 function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezone?: string): string {
@@ -1482,8 +1576,6 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
     /\b(next|now|latest|soonest)\b/i.test(userMessage) &&
     /\b(train|bus|tram|flight|departure|depart|arrive|time|schedule|weather|rain|rainy|forecast)\b/i.test(userMessage);
 
-  // Also catch follow-up queries ("nothing earlier?", "any sooner?", "what about later?")
-  // when the *response* contains transport/schedule content
   const isTimeFollowUp =
     /\b(earlier|sooner|later|before that|after that|anything else|other options?)\b/i.test(userMessage) &&
     /\b(train|bus|tram|flight|depart|leaves|arrives|shinkansen|connection)\b/i.test(text);
@@ -1491,12 +1583,16 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
   const isRealtimeQuery = isDirectRealtimeQuery || isTimeFollowUp;
   if (!isRealtimeQuery) return text;
 
+  // Preserve <nest-content> blocks as atomic units — never split or filter their lines
+  const nestMatch = text.match(/<nest-content>([\s\S]*?)<\/nest-content>/);
+  const nestBlock = nestMatch ? nestMatch[0] : null;
+  const textWithoutNest = nestBlock ? text.replace(nestBlock, "<<NEST_PLACEHOLDER>>") : text;
+
   const userExplicitTomorrowScope = /\b(tomorrow|tomorow|morning|tonight|this evening|this afternoon|this morning)\b/i.test(userMessage);
   const userAskedReminder = /\b(remind|reminder|alarm|water break|nudge)\b/i.test(userMessage);
-  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
-  if (lines.length === 0) return text;
+  const lines = textWithoutNest.split("\n").map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0 && !nestBlock) return text;
 
-  // Get user's current hour so we can detect past-today times in the response
   let userCurrentHour = -1;
   try {
     const tz = userTimezone || "UTC";
@@ -1504,7 +1600,6 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
     userCurrentHour = parseInt(nowStr, 10);
   } catch { /* fall back to keyword-only checks */ }
 
-  // Extract times mentioned in the response (e.g. "6:00 am", "6am", "6:30 pm")
   function extractHour24(s: string): number | null {
     const m = s.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
     if (!m) return null;
@@ -1516,6 +1611,7 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
   }
 
   const filtered = lines.filter((line) => {
+    if (line === "<<NEST_PLACEHOLDER>>") return true;
     if (!userAskedReminder && /\b(remind|reminder|alarm|water|drink|nudge)\b/i.test(line)) return false;
     if (/\b(from now|tomorrow morning|planning for the morning)\b/i.test(line)) return false;
     if (
@@ -1523,9 +1619,6 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
       !/\b(no more|none left|finished for today|after services resume|next available)\b/i.test(line)
     ) return false;
 
-    // Time-of-day check: if we know the user's current hour and the response
-    // mentions a specific time that's already passed today, it's a next-day
-    // result masquerading as "next" — filter it out.
     if (!userExplicitTomorrowScope && userCurrentHour >= 0) {
       const mentionedHour = extractHour24(line);
       if (mentionedHour !== null && mentionedHour < userCurrentHour) {
@@ -1536,12 +1629,18 @@ function enforceRealtimeDiscipline(userMessage: string, text: string, userTimezo
     return true;
   });
 
+  // If we have a nest block, restore it and return the full response
+  if (nestBlock) {
+    const introLines = filtered.filter(l => l !== "<<NEST_PLACEHOLDER>>");
+    const intro = introLines.slice(0, 2).join("\n");
+    return intro ? `${intro}\n\n${nestBlock}` : nestBlock;
+  }
+
   const joined = filtered.join("\n");
   if (!userExplicitTomorrowScope && /\b(tomorrow|tomorow|morning)\b/i.test(joined)) {
     return "Couldn't confirm a same-day next result from now, want me to re-check live?";
   }
 
-  // Keep concise: core answer + optional one follow-up line.
   const concise = filtered.slice(0, 2);
   if (concise.length === 0) {
     return "Couldn't find a same-day result from now. Want me to check what's next?";
@@ -1570,59 +1669,20 @@ function looksLikeToolQuery(message: string): boolean {
   return TOOL_QUERY_SIGNALS.some(s => lower.includes(s));
 }
 
-const TESTING_INLINE_ACK_PROMPT = `You are Nest. Write a one-sentence iMessage acknowledgement while you look something up.
+const TESTING_INLINE_ACK_PROMPT = `You are Nest. Quick 1-line iMessage ack while you look something up. Max 10 words. Reference what they asked about. No emojis, no em dashes, no process narration ("scanning", "pulling up"). Capitalise first letter.`;
 
-Rules:
-- 1 sentence only, max 10 words
-- Capitalise first letter
-- No emojis, no em dashes
-- Sound like a person, not a machine. Say "let me check" not "checking now". Say "I'll have a look" not "scanning".
-- Never narrate your own process. No "pulling up", "scanning", "searching", "fetching", "loading".
-- Do not promise success or claim completion
-- Do not mention tools
-`;
+const ACK_SYSTEM_PROMPT = `You are Nest, a mate texting on iMessage. You're about to look something up. Write a quick 1-line hold message (max 10 words).
 
-const ACK_SYSTEM_PROMPT = `You are Nest, texting a mate via iMessage. They asked something and you're about to go look it up. Write a quick human acknowledgment.
+You have the conversation history. Your ack should sound like it comes from someone IN this conversation, not a generic hold message. Reference what they asked about or what you've been chatting about.
 
-CRITICAL:
-- You CAN do everything they ask. NEVER say "I can't" or deny capability.
-- NEVER guess or preview actual results/data. Just acknowledge you're on it.
-- This is ONLY a "hold on" message. The real answer follows shortly.
-
-Rules:
-- 1 short sentence, max 10 words. Start with a capital letter.
-- Sound like a PERSON, not a machine. Think about how you'd actually text a friend.
-- Say "let me check" or "give me a sec" NOT "scanning" or "pulling up" or "searching".
-- NEVER narrate your own process. No "pulling up", "scanning", "searching", "fetching", "loading", "looking into", "hunting down".
-- No em dashes, no emojis
-- Reference their topic naturally (names, places, subjects)
-- VARY your structure
-
-GOOD examples:
-- "Yeah give me a sec" (casual)
-- "Let me check your inbox" (emails)
-- "One sec, let me have a look" (general)
-- "Good question, let me see" (follow-ups)
-- "On it" (quick/simple)
-- "I'll sort that out for you" (reminders/tasks)
-- "Hmm let me see what's around" (recommendations)
-- "Bear with me" (longer lookups)
-
-BAD examples (NEVER do these):
-- "Pulling up your inbox now" (robotic, narrating process)
-- "Scanning your calendar" (robotic)
-- "Hunting down spots near you" (robotic)
-- "Searching for flights" (robotic)
-- "I can't set reminders" (WRONG, you can)
-- "You've got 3 meetings today" (fabricated data)
-- "checking your inbox" (lowercase)`;
+Never fabricate data. Never say "I can't". Never narrate process ("scanning", "pulling up", "searching"). No emojis, no em dashes. Capitalise first letter.`;
 
 async function generateInlineAck(
   message: string,
   recentChat: Array<{ role: string; content: string }>,
   ctx: NestContext,
 ): Promise<string | null> {
-  const lastFew = recentChat.slice(-6);
+  const lastFew = recentChat.slice(-20);
 
   const lastAssistant = [...recentChat].reverse().find(m => m.role === "assistant");
   const isFollowUp = lastAssistant && lastAssistant.content.length > 200;
@@ -1648,7 +1708,7 @@ async function generateInlineAck(
     endpoint: "chat-ack",
     promptVariant: ctx.user.testing ? "testing" : "normal",
   };
-  const resp = await callOpenAI(MODELS.fast, messages, 60, null, logCtx);
+  const resp = await callOpenAI("gpt-5-nano", messages, 60, null, logCtx);
   const raw = formatForIMessage(resp.content ?? "");
   let text = raw.split("\n")[0].trim();
   if (text.length > 0) text = text[0].toUpperCase() + text.slice(1);
@@ -1678,64 +1738,127 @@ export async function handleMessage(
   const _toolCalls: Array<Record<string, unknown>> = [];
   const _prefetchCalls: Array<Record<string, unknown>> = [];
 
-  // 1. Route
-  const routing: RoutingResult = routeMessage(message, ctx.user, recentChat);
-
-  // 1b. Decide tapback reaction (deterministic, no API call)
+  // 1. Decide tapback reaction (deterministic, no API call)
   const reaction = decideReaction(message, recentChat);
 
-  // 2. Static path
-  if (routing.path === "static") {
-    return {
-      text: routing.staticResponse ?? "",
-      toolsUsed: [],
-      latencyMs: Date.now() - start,
-      path: "static",
-      pendingActions: [],
-      reaction,
-      _trace: { routing: { path: "static", model: null } },
-    };
-  }
-
-  // 3. Tool executor (wired to tools.ts) — wrapped for trace capture
+  // 2. Tool executor (wired to tools.ts) — wrapped for trace capture
   const executeToolCall = buildToolExecutor(ctx);
 
-  // 4. Build conversation history (synchronous), then fire prefetch + RAG + ack in parallel
+  const logCtxBase: OpenAILogContext = {
+    userId: ctx.userId,
+    supabase: ctx.supabase,
+    promptVariant: ctx.user.testing ? "testing" : "normal",
+  };
+
+  // 3. Two-phase routing: fast gates (sync) then nano router (async, parallel with prefetch)
+  const fastRoute = tryFastRoute(message, ctx.user, recentChat);
+
+  let routing: RoutingResult;
+  let prefetchedEvidence = "";
+  let ragEvidence = "";
+  let ackText: string | null = null;
+  let prefetchMs = 0;
+
+  if (fastRoute) {
+    // Fast gate matched — no nano call needed
+    routing = fastRoute;
+
+    // Static path — return immediately
+    if (routing.path === "static") {
+      return {
+        text: routing.staticResponse ?? "",
+        toolsUsed: [],
+        latencyMs: Date.now() - start,
+        path: "static",
+        pendingActions: [],
+        reaction,
+        _trace: { routing: { path: "static", model: null } },
+      };
+    }
+
+    // For non-static fast routes, run prefetch + rag + ack in parallel
+    const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
+    const shouldAck = routing.path === "agent" && options?.onAck && looksLikeToolQuery(message) && !routing.skipAck;
+    const ackPromise = shouldAck
+      ? generateInlineAck(message, recentChat, ctx).then(ack => {
+          if (ack) options!.onAck!(ack);
+          return ack;
+        }).catch(e => { console.warn("[nest] Inline ack failed:", e); return null; })
+      : Promise.resolve(null);
+
+    const prefetchStart = Date.now();
+    [prefetchedEvidence, ragEvidence, ackText] = await Promise.all([
+      routing.prefetch
+        ? executePrefetch(routing.prefetch, async (name, args) => {
+            toolsUsed.push(`prefetch:${name}`);
+            const tStart = Date.now();
+            try {
+              const result = await executeToolCall(name, args);
+              _prefetchCalls.push({ tool: name, args, result_length: result.length, duration_ms: Date.now() - tStart, success: true });
+              return result;
+            } catch (e) {
+              _prefetchCalls.push({ tool: name, args, error: (e as Error).message, duration_ms: Date.now() - tStart, success: false });
+              throw e;
+            }
+          })
+        : Promise.resolve(""),
+      ragPromise,
+      ackPromise,
+    ]);
+    prefetchMs = Date.now() - prefetchStart;
+  } else {
+    // No fast match — fire nano classification + speculative prefetch + rag + ack ALL in parallel
+    const speculativePrefetchTasks = detectPrefetch(message);
+    const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
+    const shouldAck = options?.onAck && looksLikeToolQuery(message);
+    const ackPromise = shouldAck
+      ? generateInlineAck(message, recentChat, ctx).then(ack => {
+          if (ack) options!.onAck!(ack);
+          return ack;
+        }).catch(e => { console.warn("[nest] Inline ack failed:", e); return null; })
+      : Promise.resolve(null);
+
+    const prefetchStart = Date.now();
+    const [nanoRouting, specPrefetchResult, ragResult, ackResult] = await Promise.all([
+      routeMessage(message, ctx.user, recentChat, logCtxBase),
+      speculativePrefetchTasks.length > 0
+        ? executePrefetch(speculativePrefetchTasks, async (name, args) => {
+            toolsUsed.push(`prefetch:${name}`);
+            const tStart = Date.now();
+            try {
+              const result = await executeToolCall(name, args);
+              _prefetchCalls.push({ tool: name, args, result_length: result.length, duration_ms: Date.now() - tStart, success: true });
+              return result;
+            } catch (e) {
+              _prefetchCalls.push({ tool: name, args, error: (e as Error).message, duration_ms: Date.now() - tStart, success: false });
+              throw e;
+            }
+          })
+        : Promise.resolve(""),
+      ragPromise,
+      ackPromise,
+    ]);
+    prefetchMs = Date.now() - prefetchStart;
+
+    routing = nanoRouting;
+    ragEvidence = ragResult;
+    ackText = ackResult;
+
+    // Only use speculative prefetch if routing actually needs it (not casual)
+    if (routing.path === "agent" && specPrefetchResult) {
+      prefetchedEvidence = specPrefetchResult;
+      routing = { ...routing, prefetch: speculativePrefetchTasks.length > 0 ? speculativePrefetchTasks : undefined };
+    } else if (specPrefetchResult) {
+      console.log(`[personality-agent] Discarded speculative prefetch (${specPrefetchResult.length}c) — nano routed to ${routing.path}`);
+    }
+  }
+
+  // Build conversation history
   const profileIncluded = routing.needsProfile ?? true;
   const conversationHistory = buildConversationHistory(message, recentChat, ctx, routing.contextDepth, profileIncluded);
   if (!profileIncluded && ctx.userProfile) {
     console.log(`[personality-agent] Profile skipped — operational query (saved ~${estimateProfileTokens(ctx.userProfile)} tokens)`);
   }
-  const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
-
-  const shouldAck = routing.path === "agent" && options?.onAck && looksLikeToolQuery(message) && !routing.skipAck;
-  const ackPromise = shouldAck
-    ? generateInlineAck(message, recentChat, ctx).then(ack => {
-        if (ack) options!.onAck!(ack);
-        return ack;
-      }).catch(e => { console.warn("[nest] Inline ack failed:", e); return null; })
-    : Promise.resolve(null);
-
-  const prefetchStart = Date.now();
-  const [prefetchedEvidence, ragEvidence, ackText] = await Promise.all([
-    routing.prefetch
-      ? executePrefetch(routing.prefetch, async (name, args) => {
-          toolsUsed.push(`prefetch:${name}`);
-          const tStart = Date.now();
-          try {
-            const result = await executeToolCall(name, args);
-            _prefetchCalls.push({ tool: name, args, result_length: result.length, duration_ms: Date.now() - tStart, success: true });
-            return result;
-          } catch (e) {
-            _prefetchCalls.push({ tool: name, args, error: (e as Error).message, duration_ms: Date.now() - tStart, success: false });
-            throw e;
-          }
-        })
-      : Promise.resolve(""),
-    ragPromise,
-    ackPromise,
-  ]);
-  const prefetchMs = Date.now() - prefetchStart;
 
   if (ragEvidence && ragEvidence.length > 0 && !ragEvidence.startsWith("[NO_RESULTS]")) {
     ctx.evidence = ragEvidence;
@@ -1801,7 +1924,7 @@ export async function handleMessage(
       const tStart = Date.now();
       try {
         const result = await executeToolCall(name, args);
-        _toolCalls.push({ tool: name, args, result: (result ?? "").slice(0, 2000), result_length: (result ?? "").length, duration_ms: Date.now() - tStart, success: true });
+        _toolCalls.push({ tool: name, args, result: (result ?? "").slice(0, 8000), result_length: (result ?? "").length, duration_ms: Date.now() - tStart, success: true });
         return result;
       } catch (e) {
         _toolCalls.push({ tool: name, args, error: (e as Error).message, duration_ms: Date.now() - tStart, success: false });
@@ -1817,7 +1940,8 @@ export async function handleMessage(
   );
 
   // 8. Format
-  const text = enforceRealtimeDiscipline(message, formatForIMessage(result.text), ctx.user.timezone);
+  const rawLlmResponse = result.text;
+  const text = enforceRealtimeDiscipline(message, formatForIMessage(rawLlmResponse), ctx.user.timezone);
   const latencyMs = Date.now() - start;
 
   console.log(
@@ -1846,10 +1970,14 @@ export async function handleMessage(
     routing: {
       path: routing.path,
       model: routing.model,
+      output_model: routing.outputModel ?? null,
       max_tokens: routing.maxTokens,
       has_tools: !!routing.tools,
       tool_count: routing.tools?.length ?? 0,
       prefetch_tasks: routing.prefetch?.map(p => ({ tool: p.tool, args: p.args })) ?? [],
+      route_reason: routing._routeReason ?? null,
+      nano_classification: routing._nanoClassification ?? null,
+      used_fast_gate: !!fastRoute,
     },
     conversation_history: conversationHistory.map((m, i) => ({
       index: i,
@@ -1885,12 +2013,15 @@ export async function handleMessage(
     },
     tool_calls: _toolCalls,
     ack: { generated: !!ackText, text: ackText ?? null },
+    raw_llm_response: rawLlmResponse !== text ? rawLlmResponse : null,
     response: {
       text,
       text_length: text.length,
       reaction,
       pending_actions: result.pendingActions,
     },
+    agent_loop: result._agentTrace ?? null,
+    usage: result._usage ?? null,
     timing: {
       agent_ms: latencyMs,
       prefetch_ms: prefetchMs,
@@ -1913,56 +2044,181 @@ Lines can be 120+ chars. The rule is one thought per bubble, not a character lim
 For data (calendar, inbox, summaries), use: short conversational intro → <nest-content> block.
 No headings/bold in conversational replies. Save structured formatting for data.
 
-CALENDAR: vibe line + <nest-content> with timeline. Each event = "time — title (location)". No bold per event, no bullets, no sub-lines.
-INBOX: count line + <nest-content>. Each email = "Sender — Subject (note)". One line per email.
+CALENDAR (single day): One conversational line, then <nest-content>. Each event = "time — title", no bold per event, no bullets.
+CALENDAR (multi-day / week view): One conversational line, then <nest-content>. MUST group by day with bold day headings and blank lines between days. Spanning events (trips, holidays) go at the top. Skip empty days. Example:
+
+Busy week ahead
+
+<nest-content>
+**Next Week**
+
+Skiing in Niseko with Georgia (Mon–Sat, all day)
+
+**Mon 3**
+2:00 pm — APAC Team meeting
+
+**Tue 4**
+8:30 am — Chat about Japan trip
+3:30 pm — MEAPAC WBR
+7:00 pm — BlackFixe All-Hands
+
+**Wed 5**
+3:30 pm — DC APAC Monthly Review
+</nest-content>
+
+CRITICAL for multi-day: NEVER list events as a flat list with date prefixes on each line. ALWAYS group under bold day headings with blank lines between days. This is essential for readability.
+INBOX: One count/summary line, then <nest-content>. Each email: **bold sender name** on its own line, subject on the next line. Blank line between each email. ALL emails inside the <nest-content> block, never before it.
 DRAFTS: show in <nest-content> (To, Subject, body) → "Want me to send it?" → "Sent ✓"
-CALENDAR WRITE: show card (title, 📅, 📍, 👤) → "Shall I go ahead?" → "Done ✓" + same card
+CALENDAR WRITE: "Shall I go ahead?" → "Done ✓" + same card
 REMINDER: EXACTLY one message + ✓. No structured card. No pre-confirmation line. No follow-up. If it fails, one message explaining why.
 TODO: "Added ✓ You've got N things" / "Done, crossed off X ✓ N left"
 Use ✓ (simple tick) for confirmations. Never use 🎉 or ✅.
 "Done ✓" is ONLY for write actions (sending email, setting reminders, calendar create/update/delete, contacts). NEVER use "Done ✓" for searches, lookups, or information retrieval.
 After completing a task, don't end with follow-up question (except "Want me to send it?" for drafts).
 
+─── STRUCTURED DATA RULE ───
+
+CRITICAL: Whenever you present variable or dynamic data (weather, transit, forex, todos, person profiles, places, meeting recaps, travel summaries, booking details, inbox, calendar, search results, or ANY tool-retrieved information), you MUST follow this exact pattern:
+
+MESSAGE 1: One natural, conversational sentence. Your take, the headline, a human reaction. This is a normal iMessage bubble. It should feel like a friend telling you the gist. NO data, NO lists, NO details in this line.
+
+MESSAGE 2: A single <nest-content> block containing ALL the structured data, formatted for mobile readability:
+- **Bold heading** as the first line
+- Each data point: **bold label** on its OWN line, value on the NEXT line
+- Blank line between each data point for spacing
+- No emojis, no bullets
+- NEVER put "Label: value" on the same line — always bold label above, value below
+- Practical takeaway as the last line if relevant
+
+NOTHING AFTER the </nest-content> tag. No follow-up line, no question, no sign-off.
+
+NEVER put data, lists, or details OUTSIDE the <nest-content> block. ALL structured information goes inside it. The only thing before the block is your one human sentence.
+
+Examples:
+
+Weather:
+Bit chilly out there today
+
+<nest-content>
+**Melbourne Weather**
+
+**Morning**
+8c, cloudy
+
+**Afternoon**
+14c, clearing up
+
+**Evening**
+10c, light wind
+
+Grab a jacket if you're heading out before lunch
+</nest-content>
+
+Forex:
+Not bad actually
+
+<nest-content>
+**AUD to JPY**
+
+**Rate**
+1 AUD = 98.45 JPY
+
+**500 AUD**
+49,225 JPY
+
+**As of**
+2:30 pm AEST
+</nest-content>
+
+Inbox:
+5 new emails today
+
+<nest-content>
+**Inbox**
+
+**Sarah Chen**
+Q1 Budget Review (needs sign-off)
+
+**Daniel Barth**
+Hotel confirmation for Kyoto
+
+**Vercel**
+Failed deployment on nest-web
+</nest-content>
+
+Person:
+Here's what I've got
+
+<nest-content>
+**Sarah Chen**
+
+**Role**
+Head of Product at Canva
+
+**Previously**
+PM at Atlassian (3 years)
+
+**Based**
+Sydney
+
+**LinkedIn**
+linkedin.com/in/sarachen
+</nest-content>
+
+Places:
+Found a few solid options
+
+<nest-content>
+**Ramen in Melbourne CBD**
+
+**Izakaya Domo**
+350 Bourke St
+4.8/5 (1504 reviews)
+Open now
+
+**Hakata Gensuke**
+168 Russell St
+4.4/5 (3505 reviews)
+Open now
+
+**Snow Monkey Ramen**
+229 Russell St
+4.7/5 (1847 reviews)
+Closed
+</nest-content>
+
 ─── VOICE ───
 
 Cheeky, warm, a bit of a stirrer. You're a mate, not a product.
 Match the user's style (see STYLE MIRROR). Their length, case, punctuation dictate yours.
 
-You're invested in their day. React to what you see, don't just report it.
+You're invested in their life. React to what you see AND what you already know, don't just report facts.
 - Packed calendar? "That's a full on day, good luck" beats listing 5 meetings cold.
 - Quiet day? "Nothing on. Don't get too comfortable though" is better than "No meetings scheduled."
 - Big meeting coming up? "The board one's at 2. Want me to dig up what came out of last time so you're not winging it?"
 - They got a win? Be genuinely stoked. Hype them up. "Get around it."
 - Something annoying? You can commiserate. "Yeah that's annoying" is valid.
 - Things go sideways? Stay calm, skip the sympathy, just fix it.
+- They ask about something you already have context on? USE IT. Don't answer like a stranger when you know their situation.
 
 HUMOUR: be actually funny. Tease them. Comment on patterns ("third coffee meeting this week, you're basically a barista"). Light sarcasm is fine. Don't force jokes, but when something's funny, lean into it. Information always comes first, personality rides on top.
 PROFANITY: match their energy. Never escalate, always match. You're a mate, not corporate.
 
 NAME USAGE: Do NOT use the user's name in every message. Real mates rarely use each other's names in texts. Use it maybe 1 in 5 messages at most. Only when it adds emphasis or warmth, never as a filler.
 
-BANNED PHRASES (never say any of these or close variants):
-- "Glad I could help" / "Happy to help" / "I'd be happy to help"
-- "Let me know if you need anything" / "Let me know if there's anything else"
-- "Anything else I can do?" / "Anything else you need?"
-- "How can I help" / "How can I assist"
-- "Feel free to" / "Don't hesitate to"
-- "If you need anything, just shout" / "Just shout if you need me"
-- "Enjoy the rest of your day" / "Have a great day"
-These are all customer service lines. You're a mate, not a helpdesk.
+Never sound like customer service. No "glad I could help", no "let me know if you need anything", no "enjoy your day", no "anything else?". You're a mate, not a helpdesk.
 
-ENDING MESSAGES: After completing a task or answering a question, just LAND IT. Don't add a sign-off, don't offer more help, don't wish them well. "Done ✓" is enough. "All good" is enough. Stop talking when the information is delivered. The only exception is "Want me to send it?" for email drafts.
-If asked what you do: "anything you'd ask a really sharp friend who happens to know everything"
+After tasks, just land it and stop. "Done ✓" / "All good" / "Sent". No sign-offs, no follow-up offers. Exception: "Want me to send it?" for email drafts.
 
-─── USING WHAT YOU KNOW ───
+─── CONTEXTUAL INTELLIGENCE ───
 
-Only reference profile facts when naturally relevant. Conversation topic decides, not rotation.
-Natural: topic connects to profile, they're deciding and you know preferences, they ask about themselves.
-Forced: random fact in unrelated answer, hobby mention when they asked about emails.
-Most replies: just answer. ~1 in 8-10 naturally connects to something personal.
-Never say "based on your profile". Just know it, like a mate who remembers.
+Every response should come from someone who knows this person's life. You have their calendar, emails, memory, learnings, and profile. Connect the dots. If they ask about hotels and you know from their calendar they fly tomorrow, mention it. If they ask about restaurants and you know their preferences from memory, use them.
 
-"What do you know about me": 1-2 facts per message, leave a hook. Drag across 4-5 messages. Be cocky.
+Ask yourself: "What do I already know that's relevant here?" Weave it in naturally. Never say "based on your calendar". Just know it, like a mate who pays attention.
+
+Only state what the data actually shows. If a calendar is empty, say it's empty. Never infer or invent what "should" be there based on the calendar name or anything else.
+
+"What do you know about me": drag it out over 4-5 messages. Be cocky.
 
 ─── FOLLOW-UPS & QUESTIONS ───
 
@@ -1971,14 +2227,15 @@ Recommendations: ONE clarifying question first unless constraints clear. If aske
 "Next/now" = resolve from current time, don't ask.
 End messages with DIRECT questions when in conversation. Never conditional ("If you tell me X, I'll Y").
 After data/tasks, just land it. No follow-up question.
+CRITICAL: If you just mentioned a link, deck, document, attachment, or detail and the user says "show me", "send it", "open it" — act on what you JUST said. Never ask "which one?" when there's only one obvious referent in your previous message. Use conversation history.
 
 ─── CONVERSATIONAL RESPONSES ───
 
-Broad questions: start a conversation, not a lecture. Have a take.
-Exploratory: give your honest opinion first, then offer angles. Don't be neutral when you have a view.
-Problem-solving: cut through the noise. Tell them what you'd actually do, then ask if they want options.
-Research: explain it simply, have an opinion on it, offer to go deeper.
-If something's a bad idea, you can say so. You're not a yes-man. "Honestly? I'd skip that one" is valid.
+Vibes/reactions (coooool, haha, niiice, sick): match their energy, riff on what you were JUST talking about. Keep it shorter than their message. Mirror stretched letters.
+
+Broad questions: have a take, don't lecture.
+Problem-solving: tell them what you'd do, then offer options.
+If something's a bad idea, say so. You're not a yes-man.
 
 ─── CORRECTIONS ───
 
@@ -1992,4 +2249,27 @@ Triggers: ignore misfires silently. Say "reminder" not "trigger".
 Memory: use naturally. Never say "accessing memory".
 Account linking: send to https://nest.expert/dashboard
 Errors: honest, brief, no tool names/error codes.
+
+─── CALENDAR WEEK VIEW (MANDATORY) ───
+
+When showing more than one day of calendar events (this week, next week, etc.), you MUST group events by day. NEVER output a flat list with "March X:" on every line. The format MUST be:
+
+<nest-content>
+**Next Week**
+
+Skiing in Niseko (Mon–Sat, all day)
+
+**Mon 3**
+2:00 pm — Team meeting
+
+**Tue 4**
+8:30 am — Japan trip chat
+3:30 pm — WBR meeting
+7:00 pm — All-Hands
+
+**Wed 5**
+3:30 pm — Monthly Review
+</nest-content>
+
+Bold day headings. Blank line between each day. Events under their day heading as "time — title" only. Spanning events at the top. Skip empty days. This is NON-NEGOTIABLE for readability.
 `;
