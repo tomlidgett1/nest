@@ -131,6 +131,7 @@ Deno.serve(async (req: Request) => {
     let groupVibe: string | undefined;
     let senderProfile: string | undefined;
     let isFirstGroupInteraction = false;
+    let canShowNestLink = false;
 
     if (isGroup) {
       // Group mode: load persisted history from DB, supplement with bridge buffer
@@ -211,12 +212,32 @@ Deno.serve(async (req: Request) => {
         try {
           const { data: groupChat } = await supabaseAdmin
             .from("group_chats")
-            .select("id, group_vibe")
+            .select("id, group_vibe, last_nest_link_at, messages_since_link")
             .eq("chat_guid", chatGuid)
             .maybeSingle();
 
           if (groupChat) {
             groupVibe = (groupChat.group_vibe as string) || undefined;
+
+            // Determine if we can show the Nest link:
+            // - At least 50 messages since last link share
+            // - At least 3 hours since last link share
+            // - Or never shared before
+            const messagesSinceLink = (groupChat.messages_since_link as number) ?? 0;
+            const lastLinkAt = groupChat.last_nest_link_at as string | null;
+            const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+
+            if (!lastLinkAt) {
+              canShowNestLink = true; // Never shared before
+            } else if (messagesSinceLink >= 50 && lastLinkAt < threeHoursAgo) {
+              canShowNestLink = true; // Both conditions met
+            }
+
+            // Increment message counter (fire-and-forget)
+            supabaseAdmin.from("group_chats").update({
+              messages_since_link: messagesSinceLink + 1,
+              updated_at: new Date().toISOString(),
+            }).eq("id", groupChat.id).then(() => {}).catch(() => {});
 
             // Load participant profiles
             const { data: members } = await supabaseAdmin
@@ -586,6 +607,7 @@ Deno.serve(async (req: Request) => {
       isFirstGroupInteraction: isGroup ? isFirstGroupInteraction : undefined,
       senderPhone: isGroup ? payload.sender_phone : undefined,
       isChimeIn: isGroup ? !!payload.is_chime_in : undefined,
+      canShowNestLink: isGroup ? canShowNestLink : undefined,
     };
 
     const realMessageCount = isGroup ? 0 : (recentChat.length);
@@ -702,6 +724,15 @@ Deno.serve(async (req: Request) => {
                   user_id: userId, role: "assistant", content: response.text,
                   source: "group", chat_guid: chatGuidStream, sender_name: "Nest",
                 }).then(() => {}).catch(() => {});
+
+                // If response contains the Nest link, reset the counter
+                if (response.text.includes("nest.expert")) {
+                  supabaseAdmin.from("group_chats").update({
+                    last_nest_link_at: new Date().toISOString(),
+                    messages_since_link: 0,
+                    updated_at: new Date().toISOString(),
+                  }).eq("chat_guid", chatGuidStream).then(() => {}).catch(() => {});
+                }
               }
             } else {
               const { data: insertedRow } = await supabaseAdmin
@@ -831,6 +862,15 @@ Deno.serve(async (req: Request) => {
           chat_guid: chatGuidForSave,
           sender_name: "Nest",
         }).then(() => {}).catch(() => {});
+
+        // If response contains the Nest link, reset the counter
+        if (response.text.includes("nest.expert")) {
+          supabaseAdmin.from("group_chats").update({
+            last_nest_link_at: new Date().toISOString(),
+            messages_since_link: 0,
+            updated_at: new Date().toISOString(),
+          }).eq("chat_guid", chatGuidForSave).then(() => {}).catch(() => {});
+        }
       }
     } else {
       let savedContent = response.text;

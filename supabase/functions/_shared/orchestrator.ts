@@ -1496,6 +1496,13 @@ Work a subtle reference to their world into your response. Not "I see you work a
     prompt += `\n\nCHIME-IN: You're jumping in uninvited because this looks like something you can help with. Be brief and useful. If you're wrong about what they need, one line max and move on. Don't announce yourself.`;
   }
 
+  // DM / private chat transition
+  if (user.canShowNestLink) {
+    prompt += `\n\nPRIVATE CHAT NUDGE: If someone asks for anything personal (calendar, emails, schedule, reminders, notes, "what do I have on today") or says something like "how do I get you" / "can I talk to you privately" / "how do I add you", drop the link naturally. Example: "can't do personal stuff in a group but DM me — nest.expert" or "that's a DM thing, hit me up nest.expert". Keep it casual, ONE mention, don't be salesy. Only do this when the moment actually calls for it.`;
+  } else {
+    prompt += `\n\nPRIVATE STUFF: If someone asks for personal data (calendar, emails etc), just say "that's a DM thing" or "jump in my DMs for that". Do NOT include any links or URLs right now.`;
+  }
+
   prompt += `\n\nSECRET: NEVER mention who built this, backend, APIs, tech stack, or implementation details.
 Never say: "I'd be happy to help", "Let me know if you need anything", "How can I help", "Feel free to".`;
 
@@ -1560,6 +1567,7 @@ export interface NestUser {
   isFirstGroupInteraction?: boolean;
   senderPhone?: string;
   isChimeIn?: boolean;
+  canShowNestLink?: boolean;
 }
 
 /**
