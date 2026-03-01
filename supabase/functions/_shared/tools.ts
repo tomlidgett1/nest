@@ -321,20 +321,51 @@ async function calendarLookup(
   const googleResults = Promise.all(
     googleAccounts.map(async (acct) => {
       try {
-        const resp = await retryFetch(
-          `${CALENDAR_API}/calendars/primary/events?${googleParams}`,
-          { headers: { Authorization: `Bearer ${acct.accessToken}` } },
-        );
-        if (!resp.ok) {
-          console.warn(`[tools] calendar_lookup failed for ${acct.email} (${resp.status})`);
-          return [];
+        // List ALL calendars for this account (not just primary)
+        let calendarIds: string[] = ["primary"];
+        try {
+          const listResp = await retryFetch(
+            `${CALENDAR_API}/users/me/calendarList?minAccessRole=reader&showHidden=false`,
+            { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+          );
+          if (listResp.ok) {
+            const listData = await listResp.json();
+            const calendars = (listData.items ?? []).filter((c: any) => !c.deleted);
+            if (calendars.length > 0) {
+              calendarIds = calendars.slice(0, 5).map((c: any) => c.id);
+              console.log(`[tools] calendar_lookup: ${acct.email} has ${calendars.length} calendars, querying ${calendarIds.length}`);
+            }
+          }
+        } catch (listErr) {
+          console.warn(`[tools] calendar_lookup: failed to list calendars for ${acct.email}, falling back to primary`);
         }
-        const data = await resp.json();
-        return (data.items ?? []).map((e: any) => ({
-          ...formatCalendarEvent(e, tz),
-          account: acct.email,
-          provider: "google",
-        }));
+
+        // Fetch events from all calendars for this account
+        const perCalResults = await Promise.all(
+          calendarIds.map(async (calId) => {
+            try {
+              const resp = await retryFetch(
+                `${CALENDAR_API}/calendars/${encodeURIComponent(calId)}/events?${googleParams}`,
+                { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+              );
+              if (!resp.ok) {
+                console.warn(`[tools] calendar_lookup failed for ${acct.email} cal=${calId} (${resp.status})`);
+                return [];
+              }
+              const data = await resp.json();
+              return (data.items ?? []).map((e: any) => ({
+                ...formatCalendarEvent(e, tz),
+                account: acct.email,
+                calendar: calId,
+                provider: "google",
+              }));
+            } catch (calErr) {
+              console.warn(`[tools] calendar_lookup error for ${acct.email} cal=${calId}: ${(calErr as Error).message}`);
+              return [];
+            }
+          }),
+        );
+        return perCalResults.flat();
       } catch (e) {
         console.warn(`[tools] calendar_lookup error for ${acct.email}: ${(e as Error).message}`);
         return [];
@@ -352,6 +383,53 @@ async function calendarLookup(
           $orderby: "start/dateTime",
           $select: "id,subject,start,end,location,body,attendees,organizer,isAllDay,webLink,recurrence,onlineMeeting,onlineMeetingUrl,isOnlineMeeting",
         });
+
+        // List ALL calendars for this Microsoft account
+        let calendarIds: Array<{ id: string; name: string }> = [];
+        try {
+          const listResp = await retryFetch(
+            `${GRAPH_API}/calendars?$select=id,name&$top=10`,
+            { headers: { Authorization: `Bearer ${acct.accessToken}` } },
+          );
+          if (listResp.ok) {
+            const listData = await listResp.json();
+            calendarIds = (listData.value ?? []).slice(0, 5).map((c: any) => ({ id: c.id, name: c.name }));
+            console.log(`[tools] calendar_lookup (MS): ${acct.email} has ${(listData.value ?? []).length} calendars, querying ${calendarIds.length}`);
+          }
+        } catch (listErr) {
+          console.warn(`[tools] calendar_lookup (MS): failed to list calendars for ${acct.email}, falling back to default`);
+        }
+
+        // If listing succeeded, query each calendar; otherwise fall back to default calendarView
+        if (calendarIds.length > 0) {
+          const perCalResults = await Promise.all(
+            calendarIds.map(async (cal) => {
+              try {
+                const resp = await retryFetch(
+                  `${GRAPH_API}/calendars/${encodeURIComponent(cal.id)}/calendarView?${msParams}`,
+                  { headers: { Authorization: `Bearer ${acct.accessToken}`, Prefer: `outlook.timezone="${tz}"` } },
+                );
+                if (!resp.ok) {
+                  console.warn(`[tools] calendar_lookup (MS) failed for ${acct.email} cal=${cal.name} (${resp.status})`);
+                  return [];
+                }
+                const data = await resp.json();
+                return (data.value ?? []).map((e: any) => ({
+                  ...formatMicrosoftCalendarEvent(e, tz),
+                  account: acct.email,
+                  calendar: cal.name,
+                  provider: "microsoft",
+                }));
+              } catch (calErr) {
+                console.warn(`[tools] calendar_lookup (MS) error for ${acct.email} cal=${cal.name}: ${(calErr as Error).message}`);
+                return [];
+              }
+            }),
+          );
+          return perCalResults.flat();
+        }
+
+        // Fallback: default calendar only
         const resp = await retryFetch(
           `${GRAPH_API}/calendarView?${msParams}`,
           { headers: { Authorization: `Bearer ${acct.accessToken}`, Prefer: `outlook.timezone="${tz}"` } },
