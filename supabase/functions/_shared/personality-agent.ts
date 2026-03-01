@@ -1772,11 +1772,17 @@ export async function handleMessage(
 
   const routingWithFormat: RoutingResult = { ...routing, systemPrompt: fullSystemPrompt };
 
+  // If an ack was already sent to the user, inject it into the conversation
+  // so the LLM knows it already acknowledged and won't duplicate it.
+  const finalHistory = ackText
+    ? [...conversationHistory, { role: "assistant", content: ackText }]
+    : conversationHistory;
+
   // 7. Execute (with tool call tracing)
   let _toolRound = 0;
   const result: RouteResult = await executeRoute(
     routingWithFormat,
-    conversationHistory,
+    finalHistory,
     async (name, args) => {
       toolsUsed.push(name);
       const tStart = Date.now();
