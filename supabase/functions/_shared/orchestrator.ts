@@ -1577,32 +1577,18 @@ export function routeMessage(
 ): RoutingResult {
   const cleaned = message.toLowerCase().replace(/[^\w\s']/g, "").trim();
 
-  // Group chat: upgraded routing with selective tools for substantive queries
+  // Group chat: always gpt-4.1-mini with tools — let the model decide when to use them
   if (user.isGroup) {
-    // Check if the message needs tools (weather, web search, places, etc.)
-    const groupNeedsTools = /\b(weather|forecast|temperature|rain|how far|how long|distance|restaurant|bar|cafe|place|directions|search|look up|find|google|score|results?|price)\b/i.test(message);
-
-    if (groupNeedsTools) {
-      const groupTools = getGroupToolSubset();
-      console.log(`[orchestrator] Group (substantive) → ${MODELS.agent_light} with ${groupTools.length} tools`);
-      return {
-        path: "agent",
-        model: MODELS.agent_light,
-        maxTokens: 400,
-        systemPrompt: buildGroupSystemPrompt(user),
-        tools: groupTools,
-        contextDepth: "minimal",
-        skipAck: true,
-      };
-    }
-
-    console.log(`[orchestrator] Group (casual) → ${MODELS.agent_light} (no tools)`);
+    const groupTools = getGroupToolSubset();
+    console.log(`[orchestrator] Group → ${MODELS.agent_light} with ${groupTools.length} tools`);
     return {
-      path: "casual",
+      path: "agent",
       model: MODELS.agent_light,
-      maxTokens: 300,
+      maxTokens: 400,
       systemPrompt: buildGroupSystemPrompt(user),
-      tools: null,
+      tools: groupTools,
+      contextDepth: "minimal",
+      skipAck: true,
     };
   }
 
