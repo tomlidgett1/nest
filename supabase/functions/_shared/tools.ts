@@ -322,19 +322,21 @@ async function calendarLookup(
     googleAccounts.map(async (acct) => {
       try {
         // List ALL calendars for this account (not just primary)
-        let calendarIds: string[] = ["primary"];
+        let calEntries: Array<{ id: string; name: string }> = [{ id: "primary", name: "Primary" }];
         try {
           const listResp = await retryFetch(
-            `${CALENDAR_API}/users/me/calendarList?minAccessRole=reader&showHidden=false`,
+            `${CALENDAR_API}/users/me/calendarList?showHidden=true&showDeleted=false`,
             { headers: { Authorization: `Bearer ${acct.accessToken}` } },
           );
           if (listResp.ok) {
             const listData = await listResp.json();
             const calendars = (listData.items ?? []).filter((c: any) => !c.deleted);
             if (calendars.length > 0) {
-              calendarIds = calendars.slice(0, 5).map((c: any) => c.id);
-              console.log(`[tools] calendar_lookup: ${acct.email} has ${calendars.length} calendars, querying ${calendarIds.length}`);
+              calEntries = calendars.slice(0, 15).map((c: any) => ({ id: c.id, name: c.summary || c.id }));
+              console.log(`[tools] calendar_lookup: ${acct.email} has ${calendars.length} calendars, querying ${calEntries.length}: ${calEntries.map(c => c.name).join(', ')}`);
             }
+          } else {
+            console.warn(`[tools] calendar_lookup: calendarList API returned ${listResp.status} for ${acct.email}`);
           }
         } catch (listErr) {
           console.warn(`[tools] calendar_lookup: failed to list calendars for ${acct.email}, falling back to primary`);
@@ -342,25 +344,29 @@ async function calendarLookup(
 
         // Fetch events from all calendars for this account
         const perCalResults = await Promise.all(
-          calendarIds.map(async (calId) => {
+          calEntries.map(async (cal) => {
             try {
               const resp = await retryFetch(
-                `${CALENDAR_API}/calendars/${encodeURIComponent(calId)}/events?${googleParams}`,
+                `${CALENDAR_API}/calendars/${encodeURIComponent(cal.id)}/events?${googleParams}`,
                 { headers: { Authorization: `Bearer ${acct.accessToken}` } },
               );
               if (!resp.ok) {
-                console.warn(`[tools] calendar_lookup failed for ${acct.email} cal=${calId} (${resp.status})`);
+                console.warn(`[tools] calendar_lookup failed for ${acct.email} cal=${cal.name} (${resp.status})`);
                 return [];
               }
               const data = await resp.json();
-              return (data.items ?? []).map((e: any) => ({
+              const items = data.items ?? [];
+              if (items.length > 0) {
+                console.log(`[tools] calendar_lookup: ${acct.email} cal="${cal.name}" returned ${items.length} events`);
+              }
+              return items.map((e: any) => ({
                 ...formatCalendarEvent(e, tz),
                 account: acct.email,
-                calendar: calId,
+                calendar: cal.name,
                 provider: "google",
               }));
             } catch (calErr) {
-              console.warn(`[tools] calendar_lookup error for ${acct.email} cal=${calId}: ${(calErr as Error).message}`);
+              console.warn(`[tools] calendar_lookup error for ${acct.email} cal=${cal.name}: ${(calErr as Error).message}`);
               return [];
             }
           }),
@@ -388,13 +394,13 @@ async function calendarLookup(
         let calendarIds: Array<{ id: string; name: string }> = [];
         try {
           const listResp = await retryFetch(
-            `${GRAPH_API}/calendars?$select=id,name&$top=10`,
+            `${GRAPH_API}/calendars?$select=id,name&$top=15`,
             { headers: { Authorization: `Bearer ${acct.accessToken}` } },
           );
           if (listResp.ok) {
             const listData = await listResp.json();
-            calendarIds = (listData.value ?? []).slice(0, 5).map((c: any) => ({ id: c.id, name: c.name }));
-            console.log(`[tools] calendar_lookup (MS): ${acct.email} has ${(listData.value ?? []).length} calendars, querying ${calendarIds.length}`);
+            calendarIds = (listData.value ?? []).slice(0, 15).map((c: any) => ({ id: c.id, name: c.name }));
+            console.log(`[tools] calendar_lookup (MS): ${acct.email} has ${(listData.value ?? []).length} calendars, querying ${calendarIds.length}: ${calendarIds.map(c => c.name).join(', ')}`);
           }
         } catch (listErr) {
           console.warn(`[tools] calendar_lookup (MS): failed to list calendars for ${acct.email}, falling back to default`);
