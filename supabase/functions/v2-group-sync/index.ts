@@ -3,8 +3,8 @@
 // Fully idempotent: duplicate calls with the same phones/group are no-ops.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { enrichByPhone } from "../_shared/pdl-enrichment.ts";
-import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
+// PDL enrichment removed from sync — happens on-demand in v2-chat-service
+// when someone actually engages Nest, not when they're just in the group.
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -20,9 +20,7 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// Rate limits for PDL enrichment
-const MAX_PDL_PER_INVOCATION = 5;
-const MAX_PDL_PER_HOUR = 50;
+// No PDL enrichment here — only participant registration.
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -68,7 +66,6 @@ Deno.serve(async (req: Request) => {
     // ── 2. Process each phone number ───────────────────────────
     let newProspects = 0;
     let existingProspects = 0;
-    const pendingEnrichment: Array<{ id: string; phone: string }> = [];
 
     for (const phone of phones) {
       if (!phone || phone.length < 7) continue;
@@ -76,7 +73,7 @@ Deno.serve(async (req: Request) => {
       // Check if prospect already exists (dedup)
       const { data: existing } = await supabase
         .from("group_prospects")
-        .select("id, pdl_enrichment_status, is_nest_user")
+        .select("id")
         .eq("phone_number", phone)
         .maybeSingle();
 
@@ -93,11 +90,6 @@ Deno.serve(async (req: Request) => {
           .eq("id", prospectId)
           .then(() => {})
           .catch(() => {});
-
-        // Queue for enrichment if still pending
-        if (existing.pdl_enrichment_status === "pending") {
-          pendingEnrichment.push({ id: prospectId, phone });
-        }
       } else {
         // New prospect — check if they're already a Nest user
         const { data: imsgUser } = await supabase
@@ -119,18 +111,14 @@ Deno.serve(async (req: Request) => {
           .single();
 
         if (insErr) {
-          // Likely a race condition duplicate — try to fetch
           const { data: raceExisting } = await supabase
             .from("group_prospects")
-            .select("id, pdl_enrichment_status")
+            .select("id")
             .eq("phone_number", phone)
             .maybeSingle();
 
           if (raceExisting) {
             prospectId = raceExisting.id;
-            if (raceExisting.pdl_enrichment_status === "pending") {
-              pendingEnrichment.push({ id: prospectId, phone });
-            }
           } else {
             console.warn(`[group-sync] Failed to insert prospect ${phone}: ${insErr.message}`);
             continue;
@@ -138,11 +126,6 @@ Deno.serve(async (req: Request) => {
         } else {
           prospectId = inserted!.id;
           newProspects++;
-
-          // Queue for PDL enrichment (skip Nest users — they already have profiles)
-          if (!isNestUser) {
-            pendingEnrichment.push({ id: prospectId, phone });
-          }
         }
       }
 
@@ -175,102 +158,12 @@ Deno.serve(async (req: Request) => {
       .then(() => {})
       .catch(() => {});
 
-    // ── 5. PDL enrichment (rate-limited) ─────────────────────
-    let enriched = 0;
-    let skippedRateLimit = 0;
-
-    if (pendingEnrichment.length > 0) {
-      // Check hourly rate limit
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-      const { count: recentCount } = await supabase
-        .from("group_prospects")
-        .select("id", { count: "exact", head: true })
-        .not("pdl_enriched_at", "is", null)
-        .gte("pdl_enriched_at", oneHourAgo);
-
-      const hourlyRemaining = MAX_PDL_PER_HOUR - (recentCount ?? 0);
-      const batchLimit = Math.min(MAX_PDL_PER_INVOCATION, hourlyRemaining);
-
-      if (batchLimit <= 0) {
-        skippedRateLimit = pendingEnrichment.length;
-        console.log(`[group-sync] PDL rate limit hit (${recentCount}/${MAX_PDL_PER_HOUR} in last hour), skipping ${skippedRateLimit} enrichments`);
-      } else {
-        const toEnrich = pendingEnrichment.slice(0, batchLimit);
-        skippedRateLimit = pendingEnrichment.length - toEnrich.length;
-
-        for (const { id, phone } of toEnrich) {
-          try {
-            // Mark as enriching to prevent double-processing
-            await supabase
-              .from("group_prospects")
-              .update({ pdl_enrichment_status: "enriching", updated_at: new Date().toISOString() })
-              .eq("id", id);
-
-            const profile = await enrichByPhone(phone);
-
-            if (profile && profile.job_title) {
-              await supabase
-                .from("group_prospects")
-                .update({
-                  pdl_profile: profile as unknown as Record<string, unknown>,
-                  pdl_enrichment_status: "success",
-                  pdl_enriched_at: new Date().toISOString(),
-                  display_name: profile.full_name ?? null,
-                  updated_at: new Date().toISOString(),
-                })
-                .eq("id", id);
-              enriched++;
-              console.log(`[group-sync] PDL: ${profile.full_name} | ${profile.job_title} @ ${profile.job_company_name}`);
-            } else if (profile) {
-              // Profile found but no job title — still store it
-              await supabase
-                .from("group_prospects")
-                .update({
-                  pdl_profile: profile as unknown as Record<string, unknown>,
-                  pdl_enrichment_status: "success",
-                  pdl_enriched_at: new Date().toISOString(),
-                  display_name: profile.full_name ?? null,
-                  updated_at: new Date().toISOString(),
-                })
-                .eq("id", id);
-              enriched++;
-            } else {
-              await supabase
-                .from("group_prospects")
-                .update({
-                  pdl_enrichment_status: "not_found",
-                  pdl_enriched_at: new Date().toISOString(),
-                  updated_at: new Date().toISOString(),
-                })
-                .eq("id", id);
-            }
-          } catch (e) {
-            console.error(`[group-sync] PDL enrichment failed for ${phone}:`, e);
-            await supabase
-              .from("group_prospects")
-              .update({
-                pdl_enrichment_status: "error",
-                pdl_enriched_at: new Date().toISOString(),
-                updated_at: new Date().toISOString(),
-              })
-              .eq("id", id)
-              .catch(() => {});
-          }
-        }
-      }
-    }
-
-    console.log(
-      `[group-sync] Done: ${newProspects} new, ${existingProspects} existing, ` +
-      `${enriched} enriched, ${skippedRateLimit} rate-limited`,
-    );
+    console.log(`[group-sync] Done: ${newProspects} new, ${existingProspects} existing`);
 
     return json({
       group_chat_id: groupChatId,
       new_prospects: newProspects,
       existing_prospects: existingProspects,
-      enriched,
-      rate_limited: skippedRateLimit,
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : "unknown";

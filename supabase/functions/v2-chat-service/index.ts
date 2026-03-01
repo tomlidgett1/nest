@@ -16,7 +16,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { handleMessage, type NestContext } from "../_shared/personality-agent.ts";
 import { routeMessage, type NestUser } from "../_shared/orchestrator.ts";
 import { getUserMemory, updateMemory, extractLearnings } from "../_shared/memory-service.ts";
-import { enrichByIdentity, profileToContext } from "../_shared/pdl-enrichment.ts";
+import { enrichByIdentity, enrichByPhone, profileToContext } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { appendToConversation } from "../_shared/conversation-store.ts";
 import { serverSideRAG } from "../_shared/server-rag.ts";
@@ -259,14 +259,60 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Check first interaction for sender
+      // Check first interaction + on-demand PDL enrichment for sender
       if (senderPhone) {
         try {
           const { data: prospect } = await supabaseAdmin
             .from("group_prospects")
-            .select("first_interaction_at, interaction_count")
+            .select("id, first_interaction_at, interaction_count, pdl_enrichment_status, pdl_profile")
             .eq("phone_number", senderPhone)
             .maybeSingle();
+
+          // On-demand PDL enrichment: only enrich when they actually engage Nest
+          if (prospect && prospect.pdl_enrichment_status === "pending") {
+            // Fire-and-forget enrichment
+            (async () => {
+              try {
+                await supabaseAdmin.from("group_prospects")
+                  .update({ pdl_enrichment_status: "enriching", updated_at: new Date().toISOString() })
+                  .eq("id", prospect.id);
+
+                const profile = await enrichByPhone(senderPhone);
+                if (profile) {
+                  await supabaseAdmin.from("group_prospects").update({
+                    pdl_profile: profile as unknown as Record<string, unknown>,
+                    pdl_enrichment_status: "success",
+                    pdl_enriched_at: new Date().toISOString(),
+                    display_name: profile.full_name ?? null,
+                    updated_at: new Date().toISOString(),
+                  }).eq("id", prospect.id);
+                  console.log(`[chat] On-demand PDL: ${profile.full_name} | ${profile.job_title} @ ${profile.job_company_name}`);
+                  // Make profile available for THIS request if enrichment was fast
+                  if (profile.job_title) {
+                    senderProfile = profileToContext(profile);
+                    isFirstGroupInteraction = true;
+                  }
+                } else {
+                  await supabaseAdmin.from("group_prospects").update({
+                    pdl_enrichment_status: "not_found",
+                    pdl_enriched_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                  }).eq("id", prospect.id);
+                }
+              } catch (e) {
+                console.warn("[chat] On-demand PDL enrichment failed:", e);
+                await supabaseAdmin.from("group_prospects").update({
+                  pdl_enrichment_status: "error", updated_at: new Date().toISOString(),
+                }).eq("id", prospect.id).catch(() => {});
+              }
+            })();
+          } else if (prospect?.pdl_profile && !senderProfile) {
+            // Already enriched — use cached profile
+            const pdl = prospect.pdl_profile as Record<string, any>;
+            if (pdl.job_title) {
+              senderProfile = profileToContext(pdl as PDLProfile);
+            }
+          }
 
           if (prospect && !prospect.first_interaction_at) {
             isFirstGroupInteraction = true;
