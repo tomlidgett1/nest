@@ -16,22 +16,13 @@ const LONG_MSG_MIN_DELAY = 4.0;
 const LONG_MSG_MAX_DELAY = 4.8;
 const LONG_MSG_WORD_THRESHOLD = 18;
 
-// ── Bold Unicode Conversion ──────────────────────────────────
-
-const BOLD_MAP: Record<string, string> = {};
-for (let c = 65; c <= 90; c++) BOLD_MAP[String.fromCharCode(c)] = String.fromCharCode(0x1D5D4 + (c - 65));
-for (let c = 97; c <= 122; c++) BOLD_MAP[String.fromCharCode(c)] = String.fromCharCode(0x1D5EE + (c - 97));
-for (let c = 48; c <= 57; c++) BOLD_MAP[String.fromCharCode(c)] = String.fromCharCode(0x1D7EC + (c - 48));
-
-function toUnicodeBold(text: string): string {
-  return [...text].map((ch) => BOLD_MAP[ch] ?? ch).join("");
-}
-
 // ── Markdown Stripping ───────────────────────────────────────
+// SMS does not render bold, italic, or any markdown formatting.
+// Strip everything to plain text.
 
 export function stripMarkdown(text: string): string {
   let out = text;
-  out = out.replace(/\*\*(.+?)\*\*/g, (_m, p1) => toUnicodeBold(p1));
+  out = out.replace(/\*\*(.+?)\*\*/g, "$1");
   out = out.replace(/\*(.+?)\*/g, "$1");
   out = out.replace(/^#{1,4}\s+/gm, "");
   out = out.replace(/^- /gm, "• ");
