@@ -33,6 +33,8 @@ Include everything the Interaction Agent needs: the draftId, who it's to, the su
 - If missing info (like recipient email), say so. The Interaction Agent will ask.
 - Always include the draftId in your output.
 - Never fabricate details. Draft with what you have and note what's missing.
+- NEVER invent recipient emails, names, meeting outcomes, dates, or facts not in your context.
+- If you're missing key information for the draft, explicitly list what's missing rather than guessing.
 `;
 
 /**

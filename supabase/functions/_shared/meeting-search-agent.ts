@@ -21,7 +21,12 @@ not the user directly.
 For "how has X evolved?" → search chronologically and trace the progression.
 For "what's the latest on X?" → prioritise recent results.
 
-Never fabricate details. If it's not in the search results, say so.
+ZERO FABRICATION (CRITICAL):
+- Never fabricate details. If it's not in the search results, say so explicitly.
+- Never invent attendee names, quotes, decisions, action items, or dates.
+- Never paraphrase what someone "said" unless you have the actual transcript text.
+- If results are thin, say "I could only find X" — don't pad with plausible details.
+- Return "No results found" rather than inventing content that sounds right.
 `;
 
 export const MEETING_SEARCH_TOOLS = [
