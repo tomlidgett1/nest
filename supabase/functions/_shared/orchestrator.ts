@@ -1090,6 +1090,8 @@ You react to things. A calendar with 8 meetings gets a "Jesus, that's a day" bef
 
 You remember the thread. If they asked about a meeting earlier and now say "should I prep anything?", you already know which meeting. You don't ask, you just answer.
 
+CONVERSATION CONTINUITY: Short follow-up messages (single words, numbers, "X?") ALWAYS refer to the active conversation topic. Interpret them in context of what you were JUST discussing, not through unrelated evidence or background context. "800?" after discussing Boeing = "what about the 737-800?" — not flight times. A bare word or number after a detailed answer is a follow-up, not a new topic.
+
 You're biased towards action. Don't ask permission when the answer is obvious. If they say "remind me to call Sarah at 3", just set it. Don't ask "shall I create a reminder?" If they say "what's the weather", just tell them. Don't offer to look it up.
 
 When something's interesting, be interested. When something's boring, be quick. When something's funny, be funny about it. Your energy matches the moment, not a template.
@@ -1790,6 +1792,8 @@ You're texting with ${user.name}. This is casual chat, not a task. Be a person.
 
 CRITICAL: Always respond to the MOST RECENT topic. Each message has a sentAt timestamp — use them. If they say "yeah please" or "tell me more", they mean the topic from the LAST exchange (most recent timestamp), not something from minutes ago. A message from 20 seconds ago is the active topic; a message from 8 minutes ago is old context.
 
+CONVERSATION CONTINUITY: Short messages (single words, numbers, "X?") are follow-ups to whatever you were JUST talking about. Interpret them in context of the active conversation thread, NOT through injected context like briefings, calendar, or profile data. "800?" after discussing Boeing planes means "what about the 737-800?" — not anything about flight boarding times.
+
 Keep it to 2-4 lines. Each line = one iMessage bubble. Talk like you're texting a mate, not writing a help article.
 
 You can banter. You can be cheeky. You can have an opinion and push back if you disagree. If they're venting, just listen and react like a human would. If they're joking, play along. If they ask something interesting, be genuinely curious.
@@ -1953,6 +1957,8 @@ Categories:
 - agent: needs data lookup, search, complex reasoning, multi-step task, or anything you're unsure about
 
 IMPORTANT: Messages have timestamps. Short follow-ups ("yeah please", "tell me more", "go on") refer to the MOST RECENT topic by timestamp, not older topics. Classify based on what the active conversation is about.
+
+CRITICAL: Short messages like "800?", "what about X?", "and the other one?", bare numbers, or single words with "?" are almost ALWAYS follow-up questions about the topic Nest just discussed. Classify them as "agent" so the model gets full conversation context. Do NOT classify these as "casual".
 
 If unsure, pick "agent" with low confidence.`;
 
@@ -2124,7 +2130,24 @@ export function tryFastRoute(
   const FOLLOW_UP_PATTERNS = /\b(?:yeah\s+please|yes\s+please|go\s+on|tell\s+me\s+more|more\s+(?:detail|info|please)|keep\s+going|continue|elaborate|explain|expand|what\s+else|and\s*\?)\b/i;
   const lastAssistantForCasual = recentChat
     ?.slice().reverse().find((m) => m.role === "assistant")?.content ?? "";
-  const isFollowUp = FOLLOW_UP_PATTERNS.test(message) && lastAssistantForCasual.length > 80;
+  const isExplicitFollowUp = FOLLOW_UP_PATTERNS.test(message) && lastAssistantForCasual.length > 80;
+
+  // CONTINUITY GUARD: Short messages ending in "?" after a substantive assistant
+  // response are almost always follow-up questions about the active topic (e.g.
+  // "800?" after discussing Boeing planes = "what about the 737-800?"). These
+  // must NOT be routed to casual/nano which lacks conversational continuity.
+  // Similarly, bare words/numbers that reference something the assistant just
+  // discussed should be treated as follow-ups, not casual chat.
+  const isImplicitFollowUp = lastAssistantForCasual.length > 100 && (
+    // Ends with "?" — it's a question about what was just said
+    /\?\s*$/.test(cleaned) ||
+    // Pure number or number-word ("800", "the second one", "3rd") — likely a reference
+    /^\d+$/.test(cleaned) ||
+    // "and X?" or "what about X?" patterns
+    /^(?:and|but|or|what about|how about)\b/i.test(cleaned)
+  );
+
+  const isFollowUp = isExplicitFollowUp || isImplicitFollowUp;
 
   if (
     cleaned.split(/\s+/).length <= 3 &&
@@ -2139,7 +2162,7 @@ export function tryFastRoute(
       maxTokens: 150,
       systemPrompt: buildCasualSystemPrompt(user),
       tools: null,
-      _routeReason: `Short casual: ${cleaned.split(/\s+/).length} words, ${cleaned.length} chars, no substance keywords`,
+      _routeReason: `Short casual: ${cleaned.split(/\s+/).length} words, ${cleaned.length} chars, no substance keywords, no follow-up signals`,
     };
   }
 
