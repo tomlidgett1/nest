@@ -350,6 +350,12 @@ const BOOKING_PREFETCH_PATTERNS = [
   /(?:check.?in|check.?out)\s+(?:time|date|tomorrow|today)/i,
 ];
 
+const LOCATION_PREFETCH_PATTERNS = [
+  /where\s+(?:am\s+i|are\s+we)\s*(?:right\s+now|now|currently|at\s+the\s+moment)?/i,
+  /(?:what\s+(?:city|country|place))\s+am\s+i\s+in/i,
+  /my\s+(?:current\s+)?location/i,
+];
+
 const MEETING_NOTES_PREFETCH_PATTERNS = [
   /(?:meeting|call)\s+(?:notes|summary|recap|transcript)/i,
   /what\s+(?:was|were)\s+(?:discussed|said|decided)\s+(?:in|at|during)/i,
@@ -417,6 +423,13 @@ function detectPrefetch(message: string): PrefetchTask[] {
 
     const range = extractTemporalHint(message) ?? "this_week";
     tasks.push({ tool: "calendar_lookup", args: { range } });
+  }
+
+  // Location prefetch — "where am I" needs calendar to reason about current position
+  if (LOCATION_PREFETCH_PATTERNS.some((p) => p.test(message))) {
+    if (!tasks.some(t => t.tool === "calendar_lookup")) {
+      tasks.push({ tool: "calendar_lookup", args: { range: "today" } });
+    }
   }
 
   if (MEETING_NOTES_PREFETCH_PATTERNS.some((p) => p.test(message))) {
@@ -1111,6 +1124,7 @@ LANDING: When you've answered the question or done the task, STOP. Don't add sig
 3. Never fabricate: if data is missing, say so. Never fill in placeholder data.
 4. One good query beats five narrow ones. Plan searches carefully.
 5. Never state real-time numbers from memory (rates, prices, scores, departures). Always use tools first.
+6. Temporal reasoning: ALWAYS cross-reference the current time with scheduled events before answering. If a flight is at 9:30 and it's 9:14, the user is at the airport — not "getting ready". If a meeting started at 2pm and it's 2:30, they're in the meeting. Think about what's happening RIGHT NOW, not what was planned hours ago.
 
 ─── ZERO FABRICATION (CRITICAL) ───
 
@@ -1152,6 +1166,7 @@ Weekly summary → gmail_search + calendar_lookup IN PARALLEL
 Draft email → gather context → send_draft → show draft → user confirms → send_email
 Travel / trip / "what am I doing in [city]" → gmail_search + semantic_search + calendar_lookup ALL IN PARALLEL first
 Accommodation / booking → gmail_search + calendar_lookup IN PARALLEL. Search broadly. ALWAYS get_email for exact details.
+"Where am I" / current location → DO NOT just parrot the stored timezone city. THINK: check calendar_lookup for what's happening RIGHT NOW. Cross-reference current time with scheduled events (flights, meetings, travel). If their flight was at 9:30 and it's 9:14, they're at the airport, not at their hotel. If they have a meeting at a specific venue right now, they're probably there. Reason about where they ACTUALLY are based on time + schedule + context, not the static stored location.
 Location/timezone change → update_user_timezone IMMEDIATELY (map city to IANA). If you know from ANY source (memory, profile, learnings, conversation, calendar events with foreign locations) that the user is not where the stored timezone says, call update_user_timezone BEFORE answering. Never present times in the wrong timezone.
 Reminder → manage_reminder. If clear, set and confirm with EXACTLY one message + ✓. No pre-confirmation, no follow-up.
 Todo → manage_todos
@@ -1345,6 +1360,7 @@ function buildAgentSystemPrompt(user: NestUser): string {
 Current time: ${timeStr} (${tzAbbr})
 User timezone: ${tz}
 Stored location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
+NOTE: This is the STORED timezone location, NOT necessarily where the user physically is right now. If they're travelling, have a flight, or their schedule suggests they'd be somewhere else (e.g. at the airport for an imminent flight), reason about their ACTUAL current location using calendar events, times, and context.
 IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
 TIMEZONE CHECK: If you know from memory, learnings, profile, or conversation that the user is NOT in ${tzToCity(tz)} right now (e.g. they're travelling), call update_user_timezone IMMEDIATELY before doing anything else. Present all times in their ACTUAL current timezone, not the stored one.
 User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
