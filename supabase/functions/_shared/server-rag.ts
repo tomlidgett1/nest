@@ -38,6 +38,10 @@ const SOURCE_DISPLAY: Record<string, string> = {
   email_summary: "Email Summary",
   email_chunk: "Email Snippet",
   calendar_summary: "Calendar",
+  conversation_summary: "Conversation",
+  conversation_chunk: "Conversation Snippet",
+  learning: "Memory",
+  thread_summary: "Ongoing Thread",
 };
 
 // ── Types ────────────────────────────────────────────────────
@@ -142,18 +146,19 @@ function isCasualMessage(msg: string): boolean {
 export async function calendarOnlyRAG(
   message: string,
   userId: string,
-  supabase: SupabaseClient
+  supabase: SupabaseClient,
+  timezone = "UTC",
 ): Promise<string> {
   const start = Date.now();
 
-  let temporalRange = resolveTemporalRange(message);
+  let temporalRange = resolveTemporalRange(message, timezone);
 
   // Default to upcoming 7 days if no temporal hint resolved
   if (!temporalRange) {
     const now = new Date();
-    const localDateStr = now.toLocaleDateString("en-CA", { timeZone: "Australia/Sydney" });
+    const localDateStr = now.toLocaleDateString("en-CA", { timeZone: timezone });
     const [y, m, d] = localDateStr.split("-").map(Number);
-    const localTimeStr = now.toLocaleString("sv-SE", { timeZone: "Australia/Sydney" });
+    const localTimeStr = now.toLocaleString("sv-SE", { timeZone: timezone });
     const localParsed = new Date(localTimeStr + "Z");
     const offsetMs = localParsed.getTime() - now.getTime();
     const startOfToday = new Date(Date.UTC(y, m - 1, d) - offsetMs);
@@ -164,8 +169,8 @@ export async function calendarOnlyRAG(
     };
   }
 
-  const results = await temporalCalendarSearch(temporalRange, supabase, userId);
-  const evidence = buildEvidenceBlocks(results, MAX_EVIDENCE_BLOCKS);
+  const results = await temporalCalendarSearch(temporalRange, supabase, userId, timezone);
+  const evidence = buildEvidenceBlocks(results, MAX_EVIDENCE_BLOCKS, timezone);
 
   const elapsed = Date.now() - start;
   console.log(`[server-rag] Calendar-only RAG: ${evidence.length} events (${elapsed}ms)`);
@@ -173,7 +178,7 @@ export async function calendarOnlyRAG(
   if (evidence.length === 0) {
     return `[NO_RESULTS] Calendar search returned NO events for ${temporalRange.label}.`;
   }
-  return formatEvidence(evidence, temporalRange);
+  return formatEvidence(evidence, temporalRange, timezone);
 }
 
 /**
@@ -186,7 +191,8 @@ export async function targetedRAG(
   userId: string,
   supabase: SupabaseClient,
   searchQueries: string[],
-  sourceFilters: string[] | null
+  sourceFilters: string[] | null,
+  timezone = "UTC",
 ): Promise<string> {
   const start = Date.now();
   const embedCache = new EmbeddingCache();
@@ -229,9 +235,9 @@ export async function targetedRAG(
   let allResults = searchResults.flat();
 
   // Also check calendar if there's a temporal signal
-  const temporalRange = resolveTemporalRange(message);
+  const temporalRange = resolveTemporalRange(message, timezone);
   if (temporalRange) {
-    const calendarResults = await temporalCalendarSearch(temporalRange, supabase, userId);
+    const calendarResults = await temporalCalendarSearch(temporalRange, supabase, userId, timezone);
     allResults.push(...calendarResults);
   }
 
@@ -239,7 +245,7 @@ export async function targetedRAG(
   allResults = deduplicateResults(allResults);
   const TARGETED_MAX_BLOCKS = 8;
   const diverse = applyMMR(allResults, TARGETED_MAX_BLOCKS * 2);
-  const evidence = buildEvidenceBlocks(diverse, TARGETED_MAX_BLOCKS);
+  const evidence = buildEvidenceBlocks(diverse, TARGETED_MAX_BLOCKS, timezone);
 
   const elapsed = Date.now() - start;
   console.log(
@@ -248,7 +254,7 @@ export async function targetedRAG(
   );
 
   if (evidence.length === 0) return "[NO_RESULTS]";
-  return formatEvidence(evidence, temporalRange);
+  return formatEvidence(evidence, temporalRange, timezone);
 }
 
 /**
@@ -258,7 +264,8 @@ export async function serverSideRAG(
   message: string,
   recentChat: Array<{ role: string; content: string }>,
   userId: string,
-  supabase: SupabaseClient
+  supabase: SupabaseClient,
+  timezone = "UTC",
 ): Promise<string> {
   const start = Date.now();
 
@@ -277,7 +284,7 @@ export async function serverSideRAG(
   const subQueries = generateSubQueries(enrichedQuery);
 
   // 4. Temporal resolution (fast, local)
-  const temporalRange = resolveTemporalRange(message);
+  const temporalRange = resolveTemporalRange(message, timezone);
 
   // 5. Batch-embed all sub-queries in ONE API call + start planner concurrently
   const [, plan] = await Promise.all([
@@ -295,7 +302,7 @@ export async function serverSideRAG(
   // 6b. Temporal-aware calendar search — direct DB query when date range detected
   if (temporalRange) {
     const calendarResults = await temporalCalendarSearch(
-      temporalRange, supabase, userId
+      temporalRange, supabase, userId, timezone
     );
     if (calendarResults.length > 0) {
       console.log(`[server-rag] Temporal calendar search: ${calendarResults.length} events for ${temporalRange.label}`);
@@ -316,7 +323,7 @@ export async function serverSideRAG(
       end: new Date(now.getTime() + 7 * 86400000).toISOString(),
       label: "next 7 days",
     };
-    const upcomingResults = await temporalCalendarSearch(weekAhead, supabase, userId);
+    const upcomingResults = await temporalCalendarSearch(weekAhead, supabase, userId, timezone);
     if (upcomingResults.length > 0) {
       console.log(`[server-rag] Upcoming calendar search: ${upcomingResults.length} events`);
       allResults.push(...upcomingResults);
@@ -349,7 +356,7 @@ export async function serverSideRAG(
   const diverseResults = applyMMR(allResults, MAX_EVIDENCE_BLOCKS * 2);
 
   // 10. Build evidence blocks
-  let evidence = buildEvidenceBlocks(diverseResults, MAX_EVIDENCE_BLOCKS);
+  let evidence = buildEvidenceBlocks(diverseResults, MAX_EVIDENCE_BLOCKS, timezone);
 
   // 11. Agentic fallback — second round if evidence is thin
   if (evidence.length < 3 && enrichedQuery.length > 0) {
@@ -365,7 +372,7 @@ export async function serverSideRAG(
       fallbackQuery, embedCache, supabase, userId
     );
     const fallbackEvidence = buildEvidenceBlocks(
-      deduplicateResults(fallbackResults), MAX_EVIDENCE_BLOCKS
+      deduplicateResults(fallbackResults), MAX_EVIDENCE_BLOCKS, timezone
     );
     if (fallbackEvidence.length > evidence.length) {
       evidence = fallbackEvidence;
@@ -379,7 +386,7 @@ export async function serverSideRAG(
     return "[NO_RESULTS]";
   }
 
-  const formatted = formatEvidence(evidence, temporalRange);
+  const formatted = formatEvidence(evidence, temporalRange, timezone);
   console.log(
     `[server-rag] ${evidence.length} evidence blocks, ` +
     `${allResults.length} total results, ${elapsed}ms` +
@@ -507,13 +514,13 @@ async function planQuery(
   logCtx?: { userId: string; supabase: SupabaseClient },
 ): Promise<QueryPlan | null> {
   try {
-    const prompt = `You are a query planning agent for a personal productivity app. The user has notes, meeting transcripts, emails, and calendar events indexed.
+    const prompt = `You are a query planning agent for a personal productivity app. The user has notes, meeting transcripts, emails, calendar events, conversation history, personal memories/learnings, and ongoing life threads indexed.
 
 Given the user's question, produce a JSON object with these fields:
-- "sources": array of data types to search. Values: "notes", "transcripts", "emails", "calendar". Use "notes" for meeting notes/summaries, "transcripts" for spoken words from meetings, "emails" for email threads, "calendar" for calendar events/invites. Include ALL relevant types. For meeting-related queries, ALWAYS include both "notes" and "transcripts". If the user mentions a person by name, also include "emails" (to find threads with that person).
+- "sources": array of data types to search. Values: "notes", "transcripts", "emails", "calendar", "conversations", "memory", "threads". Use "notes" for meeting notes/summaries, "transcripts" for spoken words from meetings, "emails" for email threads, "calendar" for calendar events/invites, "conversations" for past chat sessions with the user, "memory" for stored facts/preferences/relationships about the user, "threads" for ongoing multi-session topics (house hunt, job search, trip planning etc). Include ALL relevant types. For meeting-related queries, ALWAYS include both "notes" and "transcripts". If the user mentions a person by name, also include "emails" and "memory". For personal questions ("what did I say about X", "do I like Y", "who is Z"), ALWAYS include "memory" and "conversations". For ongoing topics ("how's the X going", "update on Y"), ALWAYS include "threads".
 - "search_queries": array of 2-3 short, precise search queries (3-8 words each) optimised for embedding similarity. Strip filler words, temporal references, and question syntax. Focus on topic nouns, entities, and proper nouns.
 - "rewritten_query": a single best search query (3-8 words) for the core topic.
-- "intent": one of "find", "summarise", "draft", "schedule", "compare", "list", "explain".
+- "intent": one of "find", "summarise", "draft", "schedule", "compare", "list", "explain", "recall".
 
 Return ONLY valid JSON, no markdown, no explanation.
 
@@ -577,19 +584,16 @@ function parseQueryPlan(raw: string): QueryPlan | null {
 
 // ── Temporal Resolution ──────────────────────────────────────
 
-function resolveTemporalRange(query: string): TemporalRange | null {
+function resolveTemporalRange(query: string, tz = "UTC"): TemporalRange | null {
   const lower = query.toLowerCase();
   const now = new Date();
 
-  // Get today's date string in user's timezone (Australia/Sydney)
-  const localDateStr = now.toLocaleDateString("en-CA", { timeZone: "Australia/Sydney" });
+  const localDateStr = now.toLocaleDateString("en-CA", { timeZone: tz });
   const [y, m, d] = localDateStr.split("-").map(Number);
 
   // Compute midnight in user's timezone as UTC
-  // Australia/Sydney is UTC+11 (AEDT) or UTC+10 (AEST)
-  // We find the offset by comparing local time string to UTC
-  const localTimeStr = now.toLocaleString("sv-SE", { timeZone: "Australia/Sydney" });
-  const localParsed = new Date(localTimeStr + "Z"); // treat local time as if UTC
+  const localTimeStr = now.toLocaleString("sv-SE", { timeZone: tz });
+  const localParsed = new Date(localTimeStr + "Z");
   const offsetMs = localParsed.getTime() - now.getTime();
 
   // Midnight local in UTC = midnight UTC of local date minus the offset
@@ -655,24 +659,31 @@ function resolveTemporalRange(query: string): TemporalRange | null {
 }
 
 // ── Temporal Calendar Search ─────────────────────────────────
-// Queries calendar events directly by metadata start/end dates.
+// DISABLED: Indexed calendar_summary entries are stale. The live calendar_lookup
+// tool queries Google Calendar and Microsoft Outlook APIs in real time and is
+// the authoritative source for schedule data. Returning stale indexed summaries
+// here causes the agent to hallucinate events that no longer exist.
 
 async function temporalCalendarSearch(
-  range: TemporalRange,
-  supabase: SupabaseClient,
-  userId: string
+  _range: TemporalRange,
+  _supabase: SupabaseClient,
+  _userId: string,
+  _tz = "UTC",
 ): Promise<SearchResult[]> {
-  try {
-    console.log(`[server-rag] Temporal calendar search: ${range.label} [${range.start} → ${range.end}]`);
+  return [];
 
-    const { data, error } = await supabase
+  /* Original implementation preserved for reference:
+  try {
+    console.log(`[server-rag] Temporal calendar search: ${_range.label} [${_range.start} → ${_range.end}]`);
+
+    const { data, error } = await _supabase
       .from("search_documents")
       .select("id, source_type, source_id, title, summary_text, chunk_text, metadata")
-      .eq("user_id", userId)
+      .eq("user_id", _userId)
       .eq("source_type", "calendar_summary")
       .eq("is_deleted", false)
-      .filter("metadata->>start", "gte", range.start)
-      .filter("metadata->>start", "lt", range.end)
+      .filter("metadata->>start", "gte", _range.start)
+      .filter("metadata->>start", "lt", _range.end)
       .order("metadata->>start" as any, { ascending: true })
       .limit(20);
 
@@ -698,7 +709,7 @@ async function temporalCalendarSearch(
       const startDate = d.metadata?.start
         ? new Date(d.metadata.start).toLocaleDateString("en-AU", {
             weekday: "short", day: "numeric", month: "short", year: "numeric",
-            hour: "2-digit", minute: "2-digit", timeZone: "Australia/Sydney",
+            hour: "2-digit", minute: "2-digit", timeZone: tz,
           })
         : "";
       const attendees = d.metadata?.attendees || "";
@@ -738,6 +749,7 @@ async function temporalCalendarSearch(
     console.warn("[server-rag] temporal calendar search failed:", e);
     return [];
   }
+  */
 }
 
 // ── Cached Search Functions ──────────────────────────────────
@@ -807,6 +819,9 @@ function buildSourceFilters(plan: QueryPlan): string[][] {
   const wantsTranscripts = plan.sources.includes("transcripts");
   const wantsEmails = plan.sources.includes("emails");
   const wantsCalendar = plan.sources.includes("calendar");
+  const wantsConversations = plan.sources.includes("conversations");
+  const wantsMemory = plan.sources.includes("memory");
+  const wantsThreads = plan.sources.includes("threads");
   const wantsAll = plan.sources.includes("all");
 
   if (wantsAll) return [];
@@ -818,8 +833,17 @@ function buildSourceFilters(plan: QueryPlan): string[][] {
   if (wantsEmails) {
     filterSets.push(["email_summary", "email_chunk"]);
   }
-  if (wantsCalendar) {
-    filterSets.push(["calendar_summary"]);
+  // calendar_summary excluded from RAG — live calendar_lookup is the authoritative source.
+  // Indexed calendar summaries are stale and cause hallucinations when the agent
+  // presents them as real upcoming events.
+  if (wantsConversations) {
+    filterSets.push(["conversation_summary", "conversation_chunk"]);
+  }
+  if (wantsMemory) {
+    filterSets.push(["learning"]);
+  }
+  if (wantsThreads) {
+    filterSets.push(["thread_summary"]);
   }
   return filterSets;
 }
@@ -892,9 +916,20 @@ async function keywordSourceSearchCached(
   const noteKeywords = ["meeting", "meetings", "note", "notes", "transcript",
     "discussed", "call", "standup", "sync", "recap"];
   const emailKeywords = ["email", "emails", "inbox", "thread", "replied", "wrote"];
+  const conversationKeywords = ["said", "told", "mentioned", "talked", "chatted",
+    "conversation", "discussed with me", "i said", "you said", "we talked",
+    "last time", "remember when"];
+  const memoryKeywords = ["my name", "my dog", "my cat", "i like", "i hate",
+    "i prefer", "do i", "who is", "what's my", "favourite", "favorite",
+    "preference", "remember"];
+  const threadKeywords = ["how's the", "update on", "progress on", "what happened with",
+    "did i end up", "ongoing", "still"];
 
   const wantsNotes = noteKeywords.some((k) => lower.includes(k));
   const wantsEmails = emailKeywords.some((k) => lower.includes(k));
+  const wantsConversations = conversationKeywords.some((k) => lower.includes(k));
+  const wantsMemory = memoryKeywords.some((k) => lower.includes(k));
+  const wantsThreads = threadKeywords.some((k) => lower.includes(k));
 
   const promises: Promise<SearchResult[]>[] = [];
 
@@ -910,6 +945,36 @@ async function keywordSourceSearchCached(
   }
   if (wantsEmails) {
     const filters = ["email_summary", "email_chunk"];
+    for (const q of subQueries) {
+      if (cache.has(q)) {
+        promises.push(
+          searchWithCachedEmbedding(q, cache, supabase, userId, filters).catch(() => [])
+        );
+      }
+    }
+  }
+  if (wantsConversations) {
+    const filters = ["conversation_summary", "conversation_chunk"];
+    for (const q of subQueries) {
+      if (cache.has(q)) {
+        promises.push(
+          searchWithCachedEmbedding(q, cache, supabase, userId, filters).catch(() => [])
+        );
+      }
+    }
+  }
+  if (wantsMemory) {
+    const filters = ["learning"];
+    for (const q of subQueries) {
+      if (cache.has(q)) {
+        promises.push(
+          searchWithCachedEmbedding(q, cache, supabase, userId, filters).catch(() => [])
+        );
+      }
+    }
+  }
+  if (wantsThreads) {
+    const filters = ["thread_summary"];
     for (const q of subQueries) {
       if (cache.has(q)) {
         promises.push(
@@ -969,10 +1034,13 @@ function applyMMR(results: SearchResult[], maxResults: number): SearchResult[] {
 
 // ── Evidence Block Building ──────────────────────────────────
 
-function buildEvidenceBlocks(results: SearchResult[], max: number): EvidenceBlock[] {
+function buildEvidenceBlocks(results: SearchResult[], max: number, tz = "UTC"): EvidenceBlock[] {
   const blocks: EvidenceBlock[] = [];
 
-  for (const r of results.slice(0, max)) {
+  // Filter out calendar_summary — live calendar_lookup is the authoritative source
+  const filtered = results.filter(r => r.source_type !== "calendar_summary");
+
+  for (const r of filtered.slice(0, max)) {
     let body = (r.chunk_text ?? r.summary_text ?? "").trim();
     if (!body) continue;
 
@@ -992,11 +1060,11 @@ function buildEvidenceBlocks(results: SearchResult[], max: number): EvidenceBloc
 
         const dateLabel = startDate.toLocaleDateString("en-AU", {
           weekday: "short", day: "numeric", month: "short", year: "numeric",
-          timeZone: "Australia/Sydney",
+          timeZone: tz,
         });
         const timeLabel = startDate.toLocaleTimeString("en-AU", {
           hour: "2-digit", minute: "2-digit", hour12: true,
-          timeZone: "Australia/Sydney",
+          timeZone: tz,
         });
         const attendees = r.metadata?.attendees || "";
         body = `${timeTag}${r.title || "Event"}: ${dateLabel} at ${timeLabel}`;
@@ -1026,16 +1094,19 @@ function buildEvidenceBlocks(results: SearchResult[], max: number): EvidenceBloc
 
 function formatEvidence(
   evidence: EvidenceBlock[],
-  temporalRange: TemporalRange | null
+  temporalRange: TemporalRange | null,
+  tz = "UTC",
 ): string {
   const now = new Date();
   const currentTime = now.toLocaleString("en-AU", {
     weekday: "long", day: "numeric", month: "long", year: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: true,
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
+  const tzAbbr = new Intl.DateTimeFormat("en-AU", { timeZone: tz, timeZoneName: "short" })
+    .formatToParts(now).find(p => p.type === "timeZoneName")?.value ?? tz.split("/").pop() ?? "UTC";
   const parts: string[] = [
-    `Current time: ${currentTime} (AEDT)\n`,
+    `Current time: ${currentTime} (${tzAbbr})\n`,
     "Cited context (from semantic search, ordered by relevance):\n",
   ];
 

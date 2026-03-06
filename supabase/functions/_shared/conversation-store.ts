@@ -7,6 +7,7 @@
  */
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { embedClosedSession } from "./conversation-embedder.ts";
 
 const CONVERSATION_GAP_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -57,6 +58,13 @@ export async function appendToConversation(
     now.getTime() - new Date(latest.last_message_at).getTime() > CONVERSATION_GAP_MS;
 
   if (shouldCreateNew) {
+    // Previous session is now closed — embed it for semantic search (fire-and-forget)
+    if (latest && userId) {
+      embedClosedSession(supabase, userId, latest.id).catch(e =>
+        console.error("[conversation-store] Session embed failed:", (e as Error).message),
+      );
+    }
+
     const { data: row, error } = await supabase
       .from("imessage_conversations")
       .insert({

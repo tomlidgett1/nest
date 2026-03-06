@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { fetchGrantedScopes, mergeScopes, BASE_SCOPES } from "../_shared/google-scopes.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -51,7 +52,7 @@ async function authenticate(req: Request) {
 async function handleList(userId: string) {
   const { data, error } = await admin
     .from("user_google_accounts")
-    .select("id, google_email, google_name, google_avatar_url, is_primary, created_at")
+    .select("id, google_email, google_name, google_avatar_url, is_primary, scopes, created_at")
     .eq("user_id", userId)
     .order("is_primary", { ascending: false })
     .order("created_at", { ascending: true });
@@ -115,13 +116,22 @@ async function handleAddCallback(req: Request) {
       }, 409);
     }
 
+    // Fetch granted scopes from the access token
+    const grantedScopes = await fetchGrantedScopes(provider_token);
+    const resolvedScopes = grantedScopes.length > 0 ? grantedScopes : [...BASE_SCOPES];
+
     // Check if this account already exists (re-add vs fresh add)
     const { data: existingAcct } = await admin
       .from("user_google_accounts")
-      .select("id, is_primary")
+      .select("id, is_primary, scopes")
       .eq("user_id", original_user_id)
       .eq("google_email", profile.email)
       .maybeSingle();
+
+    // Merge with existing scopes on re-add so we never lose previously granted scopes
+    const finalScopes = existingAcct?.scopes?.length
+      ? mergeScopes(existingAcct.scopes, resolvedScopes)
+      : resolvedScopes;
 
     // If re-adding an existing account, preserve its primary status
     // If fresh add and no other accounts exist, make it primary
@@ -142,6 +152,7 @@ async function handleAddCallback(req: Request) {
         google_avatar_url: profile.picture ?? "",
         refresh_token: provider_refresh_token,
         is_primary: shouldBePrimary,
+        scopes: finalScopes,
         updated_at: new Date().toISOString(),
       },
       { onConflict: "user_id,google_email" },

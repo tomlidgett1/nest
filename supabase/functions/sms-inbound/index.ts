@@ -18,7 +18,7 @@ import { appendToConversation } from "../_shared/conversation-store.ts";
 import { serverSideRAG } from "../_shared/server-rag.ts";
 import { sendSmsResponse, sendQuickSms } from "../_shared/sms-sender.ts";
 import { getGoogleAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
-import { resolveTimezone, TimezoneHolder } from "../_shared/timezone-resolver.ts";
+import { resolveTimezone, TimezoneHolder, DEFAULT_TZ } from "../_shared/timezone-resolver.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -165,7 +165,7 @@ async function processAndSend(
     .eq("user_id", userId)
     .eq("is_primary", true)
     .maybeSingle();
-  const _prefetchTz = (_tzRow?.timezone as string) || "Australia/Sydney";
+  const _prefetchTz = (_tzRow?.timezone as string) || DEFAULT_TZ;
   const today = new Date().toLocaleDateString("en-CA", { timeZone: _prefetchTz });
   const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString("en-CA", { timeZone: _prefetchTz });
 
@@ -255,7 +255,7 @@ async function processAndSend(
   const primaryAccount = googleAccounts.find((a: any) => a.is_primary) ?? googleAccounts[0];
   const userName = primaryAccount?.google_name ?? displayName ?? "there";
   const userEmail = primaryAccount?.google_email ?? "";
-  let dbTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
+  let dbTimezone = (primaryAccount?.timezone as string) ?? DEFAULT_TZ;
 
   // Timezone backfill (aligned with v2-chat-service)
   if (!primaryAccount?.timezone && primaryAccount) {
@@ -282,11 +282,9 @@ async function processAndSend(
     emotionalWeight: (l.emotional_weight as string) ?? "medium",
   }));
 
-  // ── Three-layer timezone resolution ──
+  // ── Authoritative timezone resolution (DB only for SMS — no client device) ──
   const tzResult = await resolveTimezone({
     dbTimezone,
-    recentMessages: [...recentChat, { role: "user", content: message }],
-    learnings: userLearnings,
     userId,
     supabase: supabaseAdmin,
   });

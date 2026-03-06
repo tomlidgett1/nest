@@ -1,0 +1,14 @@
+[project]
+name = "probe-bridge"
+version = "0.1.0"
+description = "iMessage bridge that probes another chatbot to reverse-engineer its system prompt"
+requires-python = ">=3.9"
+dependencies = [
+    "watchdog>=4.0",
+    "httpx>=0.27",
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+probe-bridge = "probe_bridge.__main__:main"

@@ -2,6 +2,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { enrichByIdentity } from "../_shared/pdl-enrichment.ts";
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { linkConversationsToUser } from "../_shared/conversation-store.ts";
+import { fetchGrantedScopes, mergeScopes, BASE_SCOPES } from "../_shared/google-scopes.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -354,6 +355,23 @@ async function handlePost(req: Request) {
       }
       console.log(`[onboard] Stored account ${profile.email} in user_microsoft_accounts`);
     } else {
+      // Resolve granted scopes from the access token
+      const grantedScopes = provider_token
+        ? await fetchGrantedScopes(provider_token)
+        : [];
+      const resolvedScopes = grantedScopes.length > 0 ? grantedScopes : [...BASE_SCOPES];
+
+      // Merge with any existing scopes (returning user)
+      const { data: existingGAcct } = await admin
+        .from("user_google_accounts")
+        .select("scopes")
+        .eq("user_id", uid)
+        .eq("google_email", profile.email)
+        .maybeSingle();
+      const finalScopes = existingGAcct?.scopes?.length
+        ? mergeScopes(existingGAcct.scopes, resolvedScopes)
+        : resolvedScopes;
+
       const { error: gUpsertErr } = await admin.from("user_google_accounts").upsert(
         {
           user_id: uid,
@@ -362,6 +380,7 @@ async function handlePost(req: Request) {
           google_avatar_url: profile.picture,
           refresh_token: refreshToken,
           is_primary: true,
+          scopes: finalScopes,
           updated_at: new Date().toISOString(),
         },
         { onConflict: "user_id,google_email" },

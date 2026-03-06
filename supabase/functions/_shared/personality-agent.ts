@@ -30,6 +30,7 @@ import {
 } from "./orchestrator.ts";
 import { executeTool } from "./tools.ts";
 import { TimezoneHolder } from "./timezone-resolver.ts";
+import { embedLearning } from "./conversation-embedder.ts";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -394,7 +395,7 @@ function buildTimeGapBlock(
  * Build a context block with the current local time-of-day and day-of-week
  * so the model can adjust tone appropriately (e.g. no work talk on weekends).
  */
-function buildTimeContextBlock(tz: string): string {
+function buildTimeContextBlock(tz: string, currentLocation?: string): string {
   const now = new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
@@ -417,7 +418,11 @@ function buildTimeContextBlock(tz: string): string {
   else if (hour < 23) timeOfDay = "late evening";
   else timeOfDay = "late night";
 
-  const lines = [`── TIME CONTEXT ──`, `It's ${weekday} ${timeOfDay} for the user.`];
+  const locationSuffix = currentLocation ? ` in ${currentLocation}` : "";
+  const lines = [`── TIME & LOCATION CONTEXT ──`, `It's ${weekday} ${timeOfDay} for the user${locationSuffix}.`];
+  if (currentLocation) {
+    lines.push(`The user is currently in ${currentLocation}. Use this for any location-dependent reasoning (weather, nearby places, travel times, transit).`);
+  }
 
   if (isWeekend) {
     lines.push("WEEKEND RULES: This is their time off. NEVER reference work, meetings, deadlines, or professional topics unless they bring it up first. Keep it relaxed. Reference hobbies, plans, rest, sport, social life, or just be warm and chill.");
@@ -756,9 +761,12 @@ async function saveLearnings(
           })
           .eq("id", existing.id);
         if (updateErr) console.error(`[learning] Reinforce failed:`, updateErr.message, updateErr.details);
-        else console.log(`[learning] Reinforced: ${l.category} — "${l.content.slice(0, 60)}"`);
+        else {
+          console.log(`[learning] Reinforced: ${l.category} — "${l.content.slice(0, 60)}"`);
+          embedLearning(supabase, userId, existing.id, l.category, l.content, l.context || null).catch(() => {});
+        }
       } else {
-        const { error: insertErr } = await supabase.from("v2_user_learnings").insert({
+        const { data: inserted, error: insertErr } = await supabase.from("v2_user_learnings").insert({
           user_id: userId,
           category: l.category,
           content: l.content,
@@ -766,9 +774,14 @@ async function saveLearnings(
           emotional_weight: l.emotionalWeight,
           confidence: l.confidence,
           source: l.source,
-        });
+        }).select("id").single();
         if (insertErr) console.error(`[learning] Insert failed:`, insertErr.message, insertErr.details, JSON.stringify(l));
-        else console.log(`[learning] New: ${l.category} — "${l.content.slice(0, 60)}"`);
+        else {
+          console.log(`[learning] New: ${l.category} — "${l.content.slice(0, 60)}"`);
+          if (inserted?.id) {
+            embedLearning(supabase, userId, inserted.id, l.category, l.content, l.context || null).catch(() => {});
+          }
+        }
       }
     } catch (e) {
       console.error(`[learning] Save exception for ${l.category}:`, (e as Error).message);
@@ -883,10 +896,11 @@ function buildSituationalBlock(
   }
 
   lines.push("");
-  lines.push("IMPORTANT: These commitments are things the user told you about in conversation. They are NOT in their calendar.");
-  lines.push("- If they ask \"what do I have on today/this week/tomorrow\", you MUST include these commitments in your answer alongside any calendar events. They are part of the answer.");
-  lines.push("- If a commitment has a target_date matching the day they're asking about, it's relevant. Include it.");
-  lines.push("- If they ask something tangentially related, weave in what you know");
+  lines.push("IMPORTANT: These commitments are things the user told you about in conversation. They are NOT in their calendar and are NOT calendar events.");
+  lines.push("- For schedule questions, FIRST show calendar_lookup results (the live calendar data), THEN mention relevant commitments separately.");
+  lines.push("- NEVER present commitments as calendar events. NEVER invent times, durations, or details for commitments that don't have them.");
+  lines.push("- NEVER fabricate calendar event details (times, attendees, etc.) from commitments. If a commitment has no time, don't add one.");
+  lines.push("- If calendar_lookup returns empty and you have commitments, say the calendar is clear but mention the commitment casually.");
   lines.push("- Don't recite the list. Be a friend who just... knows what's going on");
 
   return lines.join("\n");
@@ -1149,16 +1163,14 @@ function buildToneDirective(
 
 // ── Conversation History Builder ─────────────────────────────
 
-// COST OPTIMISATION: Reduced from 80K. The rolling memory summary already
-// captures older context — that's its job. 15K is enough for ~20 recent
-// messages plus injected context blocks. Saves significant input tokens.
-const HISTORY_TOKEN_BUDGET = 15_000;
+// With 70 raw messages loaded, we need a larger budget to keep the full
+// conversation window available alongside injected context blocks.
+const HISTORY_TOKEN_BUDGET = 30_000;
 
 function buildConversationHistory(
   currentMessage: string,
   recentChat: Array<{ role: string; content: string; created_at?: string }>,
   ctx: NestContext,
-  contextDepth: "full" | "minimal" = "full",
   needsProfile = true,
 ): Array<{ role: string; content: string }> {
   // Use user's local time for sentAt tags so the model sees the correct date
@@ -1167,35 +1179,28 @@ function buildConversationHistory(
   const messages: Array<{ role: string; content: string }> = [];
 
   // ── Merged context injection ──────────────────────────────────
-  // COST OPTIMISATION: All context blocks merged into a SINGLE user/assistant
-  // turn pair. For "minimal" depth (light agent, confirmations), skip heavy
-  // blocks (identity model, learnings, relationship, profile, meeting pitch)
-  // saving ~1,500 tokens. Keep: memory summary, open loops, situational context.
+  // All context blocks merged into a SINGLE user/assistant turn pair.
+  // Every query gets full context — identity, learnings, profile — because
+  // even "simple" questions can require reasoning about the user's life.
 
-  const isMinimal = contextDepth === "minimal";
   const contextSections: string[] = [];
 
-  // Identity model (Layer 3) — WHO they are (skip for minimal)
-  if (!isMinimal) {
-    const identityBlock = buildIdentityBlock(ctx.memory?.identityModel);
-    if (identityBlock) {
-      contextSections.push(identityBlock);
-    }
+  const identityBlock = buildIdentityBlock(ctx.memory?.identityModel);
+  if (identityBlock) {
+    contextSections.push(identityBlock);
   }
 
-  // Memory summary + emotional arc + writing style (always — needed for continuity)
   if (ctx.memory?.summary) {
     let mem = `CONVERSATION SUMMARY:\n${ctx.memory.summary}`;
-    if (!isMinimal && ctx.memory.emotionalArc) {
+    if (ctx.memory.emotionalArc) {
       mem += `\n\nEmotional arc: ${ctx.memory.emotionalArc}`;
     }
-    if (!isMinimal && ctx.memory.writingStyle) {
+    if (ctx.memory.writingStyle) {
       mem += `\n\nWriting style: ${ctx.memory.writingStyle}`;
     }
     contextSections.push(mem);
   }
 
-  // Open loops — unresolved conversation threads (always — relevant to any query)
   if (ctx.memory?.openLoops && ctx.memory.openLoops.length > 0) {
     const activeLoops = ctx.memory.openLoops
       .filter(l => l.status === "open")
@@ -1209,37 +1214,27 @@ function buildConversationHistory(
     }
   }
 
-  // Learned knowledge (Layer 1) — skip for minimal
-  if (!isMinimal) {
-    const learnedBlock = buildLearnedKnowledgeBlock(ctx.learnings);
-    if (learnedBlock) {
-      contextSections.push(learnedBlock);
-    }
+  const learnedBlock = buildLearnedKnowledgeBlock(ctx.learnings);
+  if (learnedBlock) {
+    contextSections.push(learnedBlock);
   }
 
-  // Relationship memory (Layer 2) — skip for minimal
-  if (!isMinimal) {
-    const relationshipBlock = buildRelationshipBlock(
-      ctx.memory?.relationshipNotes,
-      ctx.memory?.keyMoments,
-    );
-    if (relationshipBlock) {
-      contextSections.push(relationshipBlock);
-    }
+  const relationshipBlock = buildRelationshipBlock(
+    ctx.memory?.relationshipNotes,
+    ctx.memory?.keyMoments,
+  );
+  if (relationshipBlock) {
+    contextSections.push(relationshipBlock);
   }
 
-  // Situational context — what's happening in their life right now (always — needed for calendar merging)
   const situationalBlock = buildSituationalBlock(ctx.dailyBriefing, ctx.activeCommitments);
   if (situationalBlock) {
     contextSections.push(situationalBlock);
   }
 
-  // Meeting notes pitch — skip for minimal
-  if (!isMinimal) {
-    const meetingPitchBlock = buildMeetingNotesPitchBlock(currentMessage, ctx);
-    if (meetingPitchBlock) {
-      contextSections.push(meetingPitchBlock);
-    }
+  const meetingPitchBlock = buildMeetingNotesPitchBlock(currentMessage, ctx);
+  if (meetingPitchBlock) {
+    contextSections.push(meetingPitchBlock);
   }
 
   // User context
@@ -1269,21 +1264,23 @@ function buildConversationHistory(
   }
 
   // User profile (rich profile from email/calendar/web scanning)
-  // Skip for: minimal context, or when the query doesn't benefit from profile data
-  if (!isMinimal && needsProfile && ctx.userProfile) {
+  if (needsProfile && ctx.userProfile) {
     const p = ctx.userProfile as Record<string, any>;
     const profileParts: string[] = [];
 
     if (p.summary) profileParts.push(`SUMMARY: ${p.summary}`);
 
+    if (ctx.user.currentLocation) {
+      profileParts.push(`CURRENT LOCATION: ${ctx.user.currentLocation}`);
+    }
     if (p.identity) {
       const id = p.identity;
-      if (id.location) profileParts.push(`LOCATION: ${id.location}`);
+      if (id.location && id.location !== ctx.user.currentLocation) {
+        profileParts.push(`HOME BASE: ${id.location}`);
+      }
     }
-    if (ctx.user.timezone && ctx.user.timezone !== "Australia/Sydney") {
+    if (ctx.user.timezone && ctx.user.timezone !== "UTC") {
       profileParts.push(`TIMEZONE: ${ctx.user.timezone}`);
-    } else if (ctx.user.timezone) {
-      profileParts.push(`TIMEZONE: ${ctx.user.timezone} (Australia)`);
     }
 
     if (p.professional) {
@@ -1341,13 +1338,11 @@ function buildConversationHistory(
     }
   }
 
-  // Profile freshly loaded — nudge to show off (only when profile is injected)
-  if (!isMinimal && needsProfile && ctx.profileIsNew && ctx.userProfile) {
+  if (needsProfile && ctx.profileIsNew && ctx.userProfile) {
     contextSections.push(`PROFILE JUST LOADED: Subtly show you've been paying attention. Drop 1-2 specific hints per response. Make them think "wait, how does it know that?" Be cheeky, not creepy.`);
   }
 
-  // PDL welcome context (first message only, if no rich profile yet)
-  if (!isMinimal && needsProfile && ctx.pdlWelcomeContext?.trim() && !ctx.userProfile) {
+  if (needsProfile && ctx.pdlWelcomeContext?.trim() && !ctx.userProfile) {
     contextSections.push(`FIRST MESSAGE INTEL REVEAL: Answer their question first, then casually weave in ONE detail from this profile. Cheeky, not creepy. Don't dump their CV.\n\nPROFILE INTEL:\n${ctx.pdlWelcomeContext}`);
   }
 
@@ -1456,14 +1451,16 @@ async function executePrefetch(
 
 function buildToolExecutor(ctx: NestContext) {
   const tzHolder = ctx.timezoneHolder;
-  return (name: string, args: Record<string, unknown>): Promise<string> =>
-    executeTool(
+  return (name: string, args: Record<string, unknown>): Promise<string> => {
+    if (name === "weather_lookup" && !args.location && ctx.user.currentLocation) {
+      args.location = ctx.user.currentLocation;
+    }
+    return executeTool(
       name, args, ctx.userId, ctx.supabase,
-      // Use the mutable timezone holder if available, otherwise fall back to static user.timezone
       tzHolder ? tzHolder.tz : ctx.user.timezone,
-      // When update_user_timezone fires, update the holder so subsequent tools use the new tz
       tzHolder ? (newTz: string) => tzHolder.update(newTz) : undefined,
     );
+  };
 }
 
 // ── Output Formatter ─────────────────────────────────────────
@@ -1565,6 +1562,8 @@ function formatForIMessage(raw: string): string {
     .replace(/<pending_action>[\s\S]*?<\/pending_action>/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .replace(/ +([,.\?!;:])/g, "$1")  // "sure , tom" → "sure, tom"
+    .replace(/\u2014/g, "-")           // em dash → hyphen
+    .replace(/\u2013/g, "-")           // en dash → hyphen
     .trim();
 
   text = reformatFlatCalendarList(text);
@@ -1678,22 +1677,23 @@ const SUSPICIOUS_PATTERNS = [
   /\b[A-Z]{2}\d{3,4}\b/,
 ];
 
-function applyHallucinationGuard(text: string, toolsUsed: string[], hasEvidence: boolean): string {
-  // If no tools were used and no evidence was provided, the model is flying blind
-  // on factual queries. Check more aggressively.
+function applyHallucinationGuard(
+  text: string,
+  toolsUsed: string[],
+  hasEvidence: boolean,
+  toolResults?: Array<{ tool: string; args?: Record<string, unknown>; result: string; success: boolean }>,
+  userMessage?: string,
+): string {
   const isUnsourced = toolsUsed.length === 0 && !hasEvidence;
 
   let cleaned = text;
 
   // Strip lines that contain hedged fabrication phrases
-  // (e.g. "From memory, your flight is QF430 at 6am" — almost certainly made up)
   for (const pattern of HALLUCINATION_PHRASES) {
     if (pattern.test(cleaned)) {
-      // Replace the entire line containing the phrase with nothing
       const lines = cleaned.split("\n");
       const filtered = lines.filter(line => !pattern.test(line));
 
-      // If we'd remove everything, just flag it instead
       if (filtered.length === 0 || filtered.every(l => !l.trim())) {
         console.warn(`[hallucination-guard] Entire response matched fabrication pattern: ${pattern}`);
         return "I don't have that info right now. Want me to look it up?";
@@ -1709,6 +1709,37 @@ function applyHallucinationGuard(text: string, toolsUsed: string[], hasEvidence:
     for (const pattern of SUSPICIOUS_PATTERNS) {
       if (pattern.test(cleaned)) {
         console.warn(`[hallucination-guard] Suspicious unsourced pattern in response: ${pattern}`);
+      }
+    }
+  }
+
+  // Entity-based fabrication check: if the user asked about a specific person/thing
+  // and that entity doesn't appear in ANY tool results, but the model talks about
+  // them confidently, that's fabrication.
+  if (toolResults && toolResults.length > 0 && userMessage) {
+    const entityMatch = userMessage.match(/(?:about|what's|whats|who is|who's|whos|tell me about|know about|find|search|look up)\s+(.{2,40}?)(?:\?|$|\.|\s+(?:in|on|from|at|for))/i);
+    const nameMatch = userMessage.match(/(?:^|\s)([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})(?:\s|$|\?|'s)/);
+    const entity = (entityMatch?.[1] || nameMatch?.[1] || "").trim().toLowerCase();
+
+    if (entity && entity.length >= 3) {
+      const entityWords = entity.split(/\s+/).filter(w => w.length >= 3);
+
+      // Check if the entity actually appears in any tool result
+      const allResultsText = toolResults
+        .filter(tr => tr.success)
+        .map(tr => (tr.result || "").toLowerCase())
+        .join(" ");
+
+      const entityFoundInResults = entityWords.some(w => allResultsText.includes(w));
+
+      if (!entityFoundInResults) {
+        // The entity the user asked about is NOT in any tool results
+        const confidentClaims = /\b(?:popped up|been cc'd|cc'd|mentioned in|involved in|shown up|been in the mix|tied to|linked to|connected to|flagged in|appeared in|part of|included in|ops chatter|in a few threads|in some emails|in your inbox|in recent|in the loop|on a few|in several|not showing up as|isn't listed|not listed)\b/i;
+        if (confidentClaims.test(cleaned)) {
+          const entityDisplay = entityWords.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+          console.warn(`[hallucination-guard] Entity "${entity}" NOT found in any tool results but model claims involvement. Blocking.`);
+          return `Drawing a blank on ${entityDisplay}, what are you referring to?`;
+        }
       }
     }
   }
@@ -1923,7 +1954,7 @@ export async function handleMessage(
 
   // Build conversation history
   const profileIncluded = routing.needsProfile ?? true;
-  const conversationHistory = buildConversationHistory(message, recentChat, ctx, routing.contextDepth, profileIncluded);
+  const conversationHistory = buildConversationHistory(message, recentChat, ctx, profileIncluded);
   if (!profileIncluded && ctx.userProfile) {
     console.log(`[personality-agent] Profile skipped — operational query (saved ~${estimateProfileTokens(ctx.userProfile)} tokens)`);
   }
@@ -1940,34 +1971,37 @@ export async function handleMessage(
   const humourLevel = computeHumourLevel(style, routing.path, message);
   const styleMirror = buildStyleMirrorBlock(style, rhythm, persistentStyle, humourLevel);
 
-  // 6. Build unified tone directive + append channel formatting
-  // COST OPTIMISATION: For minimal contextDepth (light agent, confirmations), skip
-  // IMESSAGE_RULES and time context blocks. The compact prompt already has formatting rules.
+  // 6. Build unified tone directive + append channel formatting + time context
   // ORDER: tone FIRST (so tool dispatch rules get recency advantage), then dynamic context.
-  const isMinimalPrompt = routing.contextDepth === "minimal";
   let fullSystemPrompt = routing.systemPrompt!;
 
-  // Tone directive (style mirror + dynamic signals merged into one block)
   const toneDirective = buildToneDirective(style, rhythm, persistentStyle, humourLevel, ctx, recentChat);
   fullSystemPrompt += "\n\n" + toneDirective;
 
-  if (!isMinimalPrompt) {
-    // Channel formatting rules (compact IMESSAGE_RULES)
-    fullSystemPrompt += "\n\n" + IMESSAGE_RULES;
+  // COST OPTIMISATION: Pick the right iMessage rules tier based on route path.
+  // Casual/greeting/quick-exit → tiny voice-only (~30 tokens)
+  // Light agent (subset tools) → slim with action formats (~350 tokens)
+  // Full agent (all tools) → full rules with all data examples (~1,200 tokens)
+  const isLightAgent = routing.path === "agent" && routing.tools && routing.tools.length < 10;
+  const channelRules = routing.path === "casual"
+    ? IMESSAGE_RULES_CASUAL
+    : isLightAgent
+      ? IMESSAGE_RULES_LIGHT
+      : IMESSAGE_RULES;
+  fullSystemPrompt += "\n\n" + channelRules;
 
-    const timeContextBlock = buildTimeContextBlock(ctx.user.timezone);
-    const timeGapBlock = buildTimeGapBlock(recentChat);
-    const recentlyReferenced = buildRecentlyReferencedBlock(recentChat, ctx.userProfile);
+  const timeContextBlock = buildTimeContextBlock(ctx.user.timezone, ctx.user.currentLocation);
+  const timeGapBlock = buildTimeGapBlock(recentChat);
+  const recentlyReferenced = buildRecentlyReferencedBlock(recentChat, ctx.userProfile);
 
-    fullSystemPrompt += "\n\n" + timeContextBlock;
+  fullSystemPrompt += "\n\n" + timeContextBlock;
 
-    if (timeGapBlock) {
-      fullSystemPrompt += "\n\n" + timeGapBlock;
-    }
+  if (timeGapBlock) {
+    fullSystemPrompt += "\n\n" + timeGapBlock;
+  }
 
-    if (recentlyReferenced) {
-      fullSystemPrompt += "\n\n" + recentlyReferenced;
-    }
+  if (recentlyReferenced) {
+    fullSystemPrompt += "\n\n" + recentlyReferenced;
   }
 
   if (ctx._qa_variation) {
@@ -2011,7 +2045,7 @@ export async function handleMessage(
   const rawLlmResponse = result.text;
   const formatted = enforceRealtimeDiscipline(message, formatForIMessage(rawLlmResponse), ctx.user.timezone);
   const hasEvidence = !!(prefetchedEvidence || ragEvidence || ctx.evidence);
-  const text = applyHallucinationGuard(formatted, toolsUsed, hasEvidence);
+  const text = applyHallucinationGuard(formatted, toolsUsed, hasEvidence, _toolCalls, message);
   const latencyMs = Date.now() - start;
 
   console.log(
@@ -2040,7 +2074,7 @@ export async function handleMessage(
     routing: {
       path: routing.path,
       model: routing.model,
-      output_model: routing.outputModel ?? null,
+      output_model: routing.model ?? null,
       max_tokens: routing.maxTokens,
       has_tools: !!routing.tools,
       tool_count: routing.tools?.length ?? 0,
@@ -2102,14 +2136,68 @@ export async function handleMessage(
 }
 
 // ── iMessage Channel Rules ───────────────────────────────────
-// Compact version (~80 lines, ~1,200 tokens). Down from ~490 lines (~4,500 tokens)
-// + ~140-line testing variant. Single unified prompt for both production and testing.
+// Three tiers to avoid paying for formatting examples on paths that don't need them:
+//   CASUAL (~30 tokens): voice only — for casual, greeting, quick-exit paths
+//   LIGHT  (~350 tokens): voice + action formats — for light agent paths
+//                         (data examples already in LIGHT_INTENT_INSTRUCTIONS)
+//   FULL   (~1,200 tokens): everything — for full agent paths
+
+const IMESSAGE_RULES_CASUAL = `
+─── IMESSAGE FORMAT ───
+Each line = separate iMessage bubble. 2-4 lines is natural. One thought per bubble.
+No headings/bold in conversational replies. Match the user's style.
+NEVER use em dashes (—) or en dashes (–). Use hyphens (-) or commas instead.
+Never sound like customer service. No "glad I could help", no "let me know if you need anything", no "anything else?".
+After tasks, just land it and stop. No sign-offs, no follow-up offers.
+If you don't understand what they're referring to, ask a short clarification question instead of guessing.`;
+
+const IMESSAGE_RULES_LIGHT = `
+─── IMESSAGE FORMAT ───
+
+Each line = separate iMessage bubble. One complete thought per line. 2-4 lines is natural.
+Lines can be 120+ chars. The rule is one thought per bubble, not a character limit.
+NEVER use em dashes (—) or en dashes (–). Use hyphens (-) or commas instead.
+
+For data (calendar, inbox, summaries), use: short conversational intro → <nest-content> block.
+No headings/bold in conversational replies. Save structured formatting for data.
+
+CALENDAR WRITE: "Shall I go ahead?" → "Done ✓" + same card
+REMINDER: EXACTLY one message + ✓. No structured card. No pre-confirmation. No follow-up.
+TODO: "Added ✓ You've got N things" / "Done, crossed off X ✓ N left"
+DRAFTS: show in <nest-content> (To, Subject, body) → "Want me to send it?" → "Sent ✓"
+Use ✓ for confirmations. Never use 🎉 or ✅.
+"Done ✓" is ONLY for write actions. NEVER for searches or lookups.
+After completing a task, don't end with follow-up question (except "Want me to send it?" for drafts).
+
+─── VOICE ───
+
+Cheeky, warm, a bit of a stirrer. You're a mate, not a product.
+Match the user's style (see STYLE MIRROR). Their length, case, punctuation dictate yours.
+React to what you see AND what you already know, don't just report facts.
+HUMOUR: be actually funny when the moment's right. Information first, personality rides on top.
+PROFANITY: match their energy. Never escalate, always match.
+NAME USAGE: Maybe 1 in 5 messages. Only when it adds emphasis or warmth.
+Never sound like customer service. No "glad I could help", no "let me know if you need anything", no "anything else?".
+After tasks, just land it and stop. No sign-offs, no follow-up offers.
+
+─── FOLLOW-UPS ───
+
+Most of the time, DON'T ask a follow-up. Just answer and stop. Let the user drive.
+Only ask when genuinely blocked. Make it specific, not generic.
+NEVER end with: "Anything else?", "Want more details?", "Need help with anything?"
+BIAS TO ACTION. Make your best guess, execute, let them correct.
+
+─── CORRECTIONS ───
+
+Wrong: own it fast (2-3 words), fix immediately. No grovelling.
+"The other one": use context, don't ask them to re-explain.`;
 
 const IMESSAGE_RULES = `
 ─── IMESSAGE FORMAT ───
 
-Each line = separate iMessage bubble. One complete thought per line. 3-6 lines is natural.
+Each line = separate iMessage bubble. One complete thought per line. 2-4 lines is natural.
 Lines can be 120+ chars. The rule is one thought per bubble, not a character limit.
+NEVER use em dashes (—) or en dashes (–). Use hyphens (-) or commas instead.
 
 For data (calendar, inbox, summaries), use: short conversational intro → <nest-content> block.
 No headings/bold in conversational replies. Save structured formatting for data.
@@ -2292,11 +2380,16 @@ Only state what the data actually shows. If a calendar is empty, say it's empty.
 
 ─── FOLLOW-UPS & QUESTIONS ───
 
-BIAS TO ACTION. Only ask when truly blocked. Make your best guess, execute, let them correct.
+MOST IMPORTANT: Most of the time, DON'T ask a follow-up. Just answer and stop. Let the user drive the conversation. When delivering information (calendar, weather, inbox, lists, search results), just deliver it. No follow-up needed. They'll ask if they want more.
+
+Only ask a follow-up when you are genuinely blocked and cannot proceed without clarification. Even then, make it specific and useful ("What vibe are you going for?"), not generic ("Would you like more information?").
+
+NEVER end with: "Anything else?", "Want more details?", "Need help with anything?", "Let me know!", "Want to know more?" These are dead-end corporate phrases. You're a mate, not a helpdesk.
+
+BIAS TO ACTION. Make your best guess, execute, let them correct.
 Recommendations: ONE clarifying question first unless constraints clear. If asked, STOP and wait.
 "Next/now" = resolve from current time, don't ask.
 End messages with DIRECT questions when in conversation. Never conditional ("If you tell me X, I'll Y").
-After data/tasks, just land it. No follow-up question.
 CRITICAL: If you just mentioned a link, deck, document, attachment, or detail and the user says "show me", "send it", "open it" — act on what you JUST said. Never ask "which one?" when there's only one obvious referent in your previous message. Use conversation history.
 
 ─── CONVERSATIONAL RESPONSES ───
@@ -2318,6 +2411,31 @@ If corrected recently, state assumptions before acting.
 Triggers: ignore misfires silently. Say "reminder" not "trigger".
 Memory: use naturally. Never say "accessing memory".
 Account linking: send to https://nest.expert/dashboard
+Automations: you can manage automations directly via the manage_automations tool. When the user asks about automations, scheduled summaries, recurring tasks, inbox summaries, daily briefings, email monitor, or anything related to automated actions:
+1. Use manage_automations with action "list" to show their current automations and status.
+2. Present the list clearly: group by category (Daily, Weekly, Always On, Custom). For each, show the title, whether it's active or inactive, and the scheduled time if set.
+3. To enable/disable, use the tool directly - don't send them to a URL.
+4. You can also mention they can manage automations visually at nest.expert/automations if they prefer.
+5. CUSTOM AUTOMATIONS: Users can create their own automations by describing what they want. Parse their request into prompt, frequency, time, label. Use create_custom. After creating, confirm and offer to test. For event-driven ("let me know when X emails"), use frequency "event" with watch_senders/watch_keywords.
+Format automations neatly. Example:
+"Here are your automations:
+
+Daily
+- Inbox Summary: Active, 8:00 AM
+- Follow-Up Nudge: Inactive
+- Daily Wrap: Active, 6:00 PM
+- Meeting Intel: Inactive
+
+Weekly
+- Weekly Digest: Active, Sundays 7:00 PM
+- Relationship Radar: Inactive
+
+Always On
+- Email Monitor: Active
+
+Custom
+- Pipeline Check: Active, Daily 9:00 AM
+- Sarah Contract Watch: Active, Event-driven"
 Errors: honest, brief, no tool names/error codes.
 
 ─── CALENDAR WEEK VIEW (MANDATORY) ───

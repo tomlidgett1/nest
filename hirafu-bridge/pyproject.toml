@@ -1,0 +1,14 @@
+[project]
+name = "hirafu-bridge"
+version = "0.1.0"
+description = "Hirafu iMessage bridge — local daemon for macOS"
+requires-python = ">=3.9"
+dependencies = [
+    "watchdog",
+    "httpx",
+    "python-dotenv",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"

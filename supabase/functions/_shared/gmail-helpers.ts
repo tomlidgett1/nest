@@ -105,6 +105,7 @@ export interface AccountToken {
   email: string;
   accessToken: string;
   isPrimary: boolean;
+  scopes: string[];
 }
 
 /**
@@ -118,13 +119,13 @@ export async function getAllAccountTokens(
 ): Promise<AccountToken[]> {
   const { data: accounts } = await supabase
     .from("user_google_accounts")
-    .select("id, google_email, refresh_token, is_primary")
+    .select("id, google_email, refresh_token, is_primary, scopes")
     .eq("user_id", userId)
     .order("is_primary", { ascending: false });
 
   if (!accounts?.length) {
     const token = await getGoogleAccessToken(supabase, userId);
-    return [{ accountId: "legacy", email: "primary", accessToken: token, isPrimary: true }];
+    return [{ accountId: "legacy", email: "primary", accessToken: token, isPrimary: true, scopes: [] }];
   }
 
   const results = await Promise.allSettled(
@@ -141,6 +142,7 @@ export async function getAllAccountTokens(
         email: acct.google_email,
         accessToken: result.token,
         isPrimary: !!acct.is_primary,
+        scopes: acct.scopes ?? [],
       } as AccountToken;
     }),
   );
@@ -201,6 +203,10 @@ export async function getTokenForEmail(
 export async function refreshAccessToken(
   refreshToken: string,
 ): Promise<{ token: string; _newRefreshToken?: string }> {
+  if (!refreshToken) {
+    throw new Error("GOOGLE_REAUTH_REQUIRED: No refresh token available — full re-consent required");
+  }
+
   const body = new URLSearchParams({
     client_id: googleClientId,
     client_secret: googleClientSecret,
@@ -557,6 +563,7 @@ export async function getAllMicrosoftAccountTokens(
         email: acct.microsoft_email,
         accessToken: result.token,
         isPrimary: !!acct.is_primary,
+        scopes: [],
       } as AccountToken;
     }),
   );

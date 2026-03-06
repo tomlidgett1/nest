@@ -126,17 +126,17 @@ export function buildCalendarSummary(event: {
   start: string;
   end: string;
   attendees: string;
-}): string {
+}, tz = "UTC"): string {
   const startDate = new Date(event.start);
   const endDate = new Date(event.end);
   const dateStr = startDate.toLocaleDateString("en-AU", {
     weekday: "short", day: "numeric", month: "short", year: "numeric",
     hour: "2-digit", minute: "2-digit", hour12: true,
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
   const endStr = endDate.toLocaleTimeString("en-AU", {
     hour: "2-digit", minute: "2-digit", hour12: true,
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
   let summary = `${event.title}\n${dateStr} – ${endStr}`;
   if (event.attendees) summary += `\nAttendees: ${event.attendees}`;
@@ -163,10 +163,11 @@ export function noteContextHeader(
   noteType: string,
   attendees: string[],
   createdAt: string,
+  tz = "UTC",
 ): string {
   const date = new Date(createdAt).toLocaleDateString("en-AU", {
     weekday: "short", day: "numeric", month: "short", year: "numeric",
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
   const parts = [`Note: ${title}`, `Type: ${noteType}`, `Date: ${date}`];
   if (attendees.length > 0) parts.push(`Attendees: ${attendees.join(", ")}`);
@@ -177,10 +178,11 @@ export function transcriptContextHeader(
   noteTitle: string,
   speakers: string[],
   createdAt: string,
+  tz = "UTC",
 ): string {
   const date = new Date(createdAt).toLocaleDateString("en-AU", {
     weekday: "short", day: "numeric", month: "short", year: "numeric",
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
   const parts = [`Transcript: ${noteTitle}`, `Date: ${date}`];
   if (speakers.length > 0) parts.push(`Speakers: ${speakers.join(", ")}`);
@@ -191,10 +193,11 @@ export function emailContextHeader(
   subject: string,
   participants: string[],
   date: string,
+  tz = "UTC",
 ): string {
   const dateStr = new Date(date).toLocaleDateString("en-AU", {
     weekday: "short", day: "numeric", month: "short", year: "numeric",
-    timeZone: "Australia/Sydney",
+    timeZone: tz,
   });
   const parts = [`Email Thread: ${subject}`, `Date: ${dateStr}`];
   if (participants.length > 0) {

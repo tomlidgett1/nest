@@ -161,6 +161,8 @@ export default function Welcome() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const token = searchParams.get('token') ?? ''
+  const product = searchParams.get('product') ?? ''
+  if (product) sessionStorage.setItem('nest_product', product)
   const [autoLinking, setAutoLinking] = useState(false)
   const [mobileMessages, setMobileMessages] = useState<number[]>([])
   const [desktopMessages, setDesktopMessages] = useState<number[]>([])

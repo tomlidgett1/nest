@@ -118,8 +118,16 @@ export async function runExecutionAgent(
           const isGoogleAuth =
             msg.includes("GOOGLE_REAUTH_REQUIRED") ||
             msg.includes("invalid_grant") ||
+            msg.includes("insufficient_scope") ||
             msg.includes("Google token refresh failed");
-          result = isGoogleAuth
+          const isDriveScope = msg.includes("drive_scope_required");
+          result = isDriveScope
+            ? {
+                error: "drive_scope_required",
+                detail:
+                  "Google Drive permission is required. Please grant Drive access in Settings > Accounts.",
+              }
+            : isGoogleAuth
             ? {
                 error: "google_auth_reconnect_required",
                 detail:

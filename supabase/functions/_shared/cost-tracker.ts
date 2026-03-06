@@ -31,6 +31,7 @@ const EXACT_PRICING: Record<string, ModelPricing> = {
   "gpt-4o-2024-05-13":      { input: 5.00,  inputCached: 5.00,   output: 15.00  },
   "gpt-4o-mini":            { input: 0.15,  inputCached: 0.075,  output: 0.60   },
   // GPT-5 family
+  "gpt-5.4":                { input: 1.75,  inputCached: 0.175,  output: 14.00  },
   "gpt-5.2":                { input: 1.75,  inputCached: 0.175,  output: 14.00  },
   "gpt-5.2-chat-latest":    { input: 1.75,  inputCached: 0.175,  output: 14.00  },
   "gpt-5.2-codex":          { input: 1.75,  inputCached: 0.175,  output: 14.00  },
@@ -59,6 +60,7 @@ const EXACT_PRICING: Record<string, ModelPricing> = {
 
 // Prefix fallback — most-specific first, catches future model variants
 const PREFIX_PRICING: Array<[string, ModelPricing]> = [
+  ["gpt-5.4",       { input: 1.75,  inputCached: 0.175,  output: 14.00  }],
   ["gpt-5.3",       { input: 1.75,  inputCached: 0.175,  output: 14.00  }],
   ["gpt-5.2-pro",   { input: 21.00, inputCached: 21.00,  output: 168.00 }],
   ["gpt-5.2",       { input: 1.75,  inputCached: 0.175,  output: 14.00  }],

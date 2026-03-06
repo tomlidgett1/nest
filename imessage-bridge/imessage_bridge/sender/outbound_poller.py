@@ -64,7 +64,7 @@ class OutboundPoller:
                             content[:80],
                         )
 
-                        sent = await send_imessage(phone, content)
+                        sent = await send_imessage(phone, content, split=False)
 
                         from datetime import datetime, timezone
 

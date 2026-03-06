@@ -19,21 +19,20 @@ const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 // Single source of truth for Nest's identity, used across all prompt tiers
 // and satellite agents (interaction-agent, email-agent). ~180 tokens.
 export const NEST_IDENTITY_CORE = `You are Nest. You live in iMessage. You are the user's person.
-You know the user. You use what you know naturally, like a friend who pays attention.
-
+You know the user. You use what you know naturally, like a friend who pays attention. You're not a robot.
+You text like a normal person, casual and conversational.
 You're cheeky, a bit of a stirrer, and genuinely invested in their life. You take the piss when the moment's right. You notice things others miss and you say something. You have opinions and you're not shy about them. When they win, you're stoked. When things are messy, you stay calm and just fix it. You're the friend who always knows what's going on and has something to say about it. You don't narrate what you're doing, you just do it.
-
-SECRET: NEVER mention who built this app, APIs, tech stack, databases, frameworks, or implementation details. Deflect: "that's above my pay grade".
+You're overraching goal is to make the user's life better, not just easier.
+SECRET: NEVER mention who built this app, APIs, tech stack, databases, frameworks, or implementation details. Deflect and mention thats above your pay grade (or similar).
 
 Voice: Australian English (summarise, organise, colour). Never use em dashes. Never use emojis unless the user does.`;
 
 // ── Models ───────────────────────────────────────────────────
 
 export const MODELS = {
-  fast: "gpt-4.1-nano",          // Nano — casual conversation, ~100-200ms
-  agent_light: "gpt-4.1-mini",   // Mini — simple single-tool queries
-  agent_plan: "gpt-4.1",         // GPT-4.1 — planning + tool calls (no reasoning overhead)
-  agent_output: "gpt-4.1-mini",  // Mini — final response generation (cheap output @ $1.60/M)
+  fast: "gpt-5-nano",          // Nano — casual conversation, routing, ~100-200ms
+  agent_light: "gpt-4.1",        // GPT-4.1 — light agent (fewer tools, compact prompt, same reasoning)
+  agent_full: "gpt-4.1",         // GPT-4.1 — full agent (all tools, full prompt, full context)
 } as const;
 
 // ── Types ────────────────────────────────────────────────────
@@ -42,14 +41,14 @@ export type RoutePath = "static" | "casual" | "agent";
 
 export interface RoutingResult {
   path: RoutePath;
-  model: string | null;          // null for static responses; planning model for agent path
-  outputModel?: string;          // if set, used for the final response (no tools) instead of model
+  model: string | null;          // null for static responses; single model for entire agent path
   maxTokens: number;
   systemPrompt: string | null;   // null for static responses
   tools: ToolDefinition[] | null;
+  toolChoice?: "auto" | "required" | { type: "function"; function: { name: string } };
   staticResponse?: string;       // pre-built response for static path
   prefetch?: PrefetchTask[];     // data to fetch in parallel
-  contextDepth?: "full" | "minimal"; // minimal = skip heavy context blocks (profile, learnings, identity model)
+  contextDepth?: "full" | "minimal"; // kept for group chat / confirmations only
   needsProfile?: boolean; // true = inject rich user profile into context (default: false for operational queries)
   skipAck?: boolean; // true = suppress the inline ack message (reminders, etc. that confirm in one message)
   _routeReason?: string;         // why this path was chosen (for debug tracing)
@@ -132,23 +131,16 @@ function decideReaction(
 // Greetings are NOT static — they go through the casual LLM path
 // so the model can factor in time gaps, personality, and context.
 const GREETING_WORDS = new Set([
-  "hey", "hi", "hello", "yo", "sup", "hiya", "g'day", "gday",
+  "hey", "hi", "hello", "sup", "hiya", "g'day", "gday",
   "good morning", "morning", "gm", "good afternoon", "good evening",
   "good night", "gn", "night",
 ]);
 
-// Quick-exit words that should be routed to casual LLM (not hardcoded)
-// so they get context-aware responses. "thanks" after booking a flight
-// should feel different from "thanks" after a casual chat.
+// Legacy export — kept for any external references
 const QUICK_EXIT_WORDS = new Set([
   "thanks", "thank you", "cheers", "ta", "thx", "thanks mate", "cheers mate",
-  "nah", "nope", "na", "nah mate", "nah all good", "nah im good", "nah i'm good",
-  "no", "no thanks", "no cheers", "no ta",
   "bye", "cya", "see ya", "later", "ttyl",
   "lol", "haha", "hahaha", "lmao",
-  "no worries", "all good", "sweet", "legend", "sick", "nice one", "nice",
-  "cool", "ok", "okay", "k", "yep", "yeah", "yea", "ya",
-  "test",
 ]);
 
 // Only truly zero-context messages stay static (emoji reactions, etc.)
@@ -160,117 +152,10 @@ function pickRandom(options: string[]): string {
   return options[Math.floor(Math.random() * options.length)];
 }
 
-// ── Substance Detection ──────────────────────────────────────
+// (Substance detection removed — nano router handles all classification)
 
-const SUBSTANCE_SIGNALS = [
-  "meeting", "email", "calendar", "schedule", "search", "find",
-  "draft", "transcript", "summary", "note", "prepare", "help",
-  "who", "what", "when", "where", "how", "why", "tell",
-  "remind", "look up", "send", "write", "compose", "check",
-  "research", "compare", "analyze", "explain", "review",
-  "book", "cancel", "reschedule", "move", "delete", "create",
-  "weather", "umbrella", "rain", "temperature",
-  "bill", "invoice", "payment", "document", "file", "spec",
-  "forward", "reply", "inbox",
-  "teach", "learn", "advice", "recommend", "suggest", "think",
-  "opinion", "idea", "struggle", "interesting",
-  "personal", "airport", "flight", "travel", "trip", "book",
-  "tulla", "tullamarine", "avalon", "domestic", "international",
-  "leave", "depart", "arrive", "uber", "taxi", "drive",
-  "train", "bus", "tram", "metro", "subway", "ferry", "transit", "transport",
-  "platform", "station", "line", "route",
-  "restaurant", "cafe", "coffee", "bar", "pub", "hotel",
-  "address", "phone number", "open", "near", "place", "directions",
-  "todo", "task", "to do", "to-do", "list", "reminder", "alert", "nudge",
-  "done", "complete", "tick off", "cross off",
-  "forex", "currency", "exchange", "rate", "rates", "aud", "usd", "yen", "jpy",
-  "stock", "market", "price", "cost", "convert", "conversion",
-  "recording", "recorded", "take notes", "meeting notes", "recap",
-];
-
-function hasSubstance(cleaned: string): boolean {
-  return SUBSTANCE_SIGNALS.some((k) => cleaned.includes(k));
-}
-
-// ── Light Agent Intent Detection ─────────────────────────────
-// Detects simple queries that need 1-2 tool calls and no complex
-// reasoning. Returns the intent category (used to select a compact
-// system prompt + filtered tool subset) or null for full agent.
-// Conservative: when in doubt, return null → full agent.
-
-type LightAgentIntent = "calendar" | "weather" | "currency" | "reminder" | "todo" | "time" | "places" | "inbox" | "transit" | "fitness" | null;
-
-function detectLightIntent(message: string): LightAgentIntent {
-  // Slam-dunk patterns only — high-precision, unambiguous matches.
-  // The nano router handles the long tail of phrasings these miss.
-
-  // Calendar — "what's on today", "my schedule for tomorrow", "am I free"
-  if (/(?:what(?:'s|\s+is|\s+do\s+i\s+have)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow|this\s+week|next\s+week|monday|tuesday|wednesday|thursday|friday|saturday|sunday))/i.test(message)) return "calendar";
-  if (/(?:my\s+(?:schedule|calendar|meetings?|agenda)\s+(?:for\s+)?(?:today|tomorrow|this\s+week|next\s+week))/i.test(message)) return "calendar";
-  if (/(?:am\s+i\s+(?:free|busy)\s+(?:today|tomorrow|this\s+afternoon|this\s+morning|on\s+))/i.test(message)) return "calendar";
-
-  // Weather — any mention of weather/forecast/rain/umbrella
-  if (/\b(?:weather|temperature|forecast|rain(?:ing)?|umbrella)\b/i.test(message)) return "weather";
-
-  // Currency — explicit forex or "N AUD/USD/etc"
-  if (/\b(?:exchange rate|forex|\d+\s*(?:aud|usd|gbp|eur|jpy|cad|nzd|sgd))\b/i.test(message)) return "currency";
-
-  // Reminder — "remind me to..."
-  if (/\b(?:remind me\b|set (?:me )?(?:a )?reminder\b)/i.test(message)) return "reminder";
-
-  // Todo — "add X to my list/todos", "show my todos"
-  if (
-    /\b(?:email|calendar|meeting|schedule|inbox)\b/i.test(message) === false &&
-    (/\badd .{1,60} to (?:my )?(?:to-?do|task|list|todos?)\b/i.test(message) ||
-     /\bshow (?:me )?(?:my )?(?:to-?do|task|todos?|list)\b/i.test(message))
-  ) return "todo";
-
-  // Transit — "next train/bus", "how do I get to"
-  if (/\b(?:next\s+(?:train|bus|tram|metro|ferry)|how\s+(?:do\s+i|to)\s+get\s+(?:to|there)|public\s+transport)\b/i.test(message)) return "transit";
-
-  // Inbox — "any new emails", "check my inbox"
-  if (/\b(?:(?:any|new|unread)\s+(?:emails?|mail)|check\s+(?:my\s+)?(?:inbox|email)|what(?:'s|\s+is)\s+in\s+my\s+inbox)\b/i.test(message)) return "inbox";
-
-  // Fitness / Strava — "how far did I run", "my last ride", "strava stats"
-  if (/\b(?:strava|run(?:ning)?|ride|cycling|swim(?:ming)?|hike|workout|exercise|fitness)\b/i.test(message) &&
-      /\b(?:how\s+(?:far|long|much|many)|total|last|recent|this\s+week|this\s+month|stats?|distance|pace|km|miles?|elevation|calories|heart\s*rate|pr|personal\s+record)\b/i.test(message)) return "fitness";
-  if (/\bstrava\b/i.test(message)) return "fitness";
-
-  return null;
-}
-
-// ── Compound Query Detection ─────────────────────────────────
-// Detects multi-intent messages that should NOT be routed to the light agent.
-// Examples: "what's on today and draft an email to Sarah about it"
-// These need the full agent for proper multi-tool handling.
-
-function isCompoundQuery(message: string): boolean {
-  const lower = message.toLowerCase();
-
-  // Count distinct intent categories present in the message
-  const intentCategories = [
-    /\b(?:calendar|schedule|meeting|what'?s on|what do i have)\b/i,
-    /\b(?:email|draft|send|inbox|mail)\b/i,
-    /\b(?:remind|reminder|nudge|alert me)\b/i,
-    /\b(?:todo|task|to-?do|list|add .+ to my)\b/i,
-    /\b(?:search|find|look up|who is)\b/i,
-    /\b(?:book|reschedule|cancel|create.*event)\b/i,
-    /\b(?:weather|temperature|forecast)\b/i,
-    /\b(?:train|bus|tram|directions|transit)\b/i,
-    /\b(?:strava|run(?:ning)?|ride|cycling|swim|workout|fitness|exercise)\b/i,
-  ];
-
-  const matchCount = intentCategories.filter(pattern => pattern.test(lower)).length;
-
-  // If 2+ distinct intent categories are present, it's compound
-  if (matchCount >= 2) return true;
-
-  // Also check for explicit conjunctions linking actions
-  if (/\b(?:and\s+(?:then\s+)?(?:also\s+)?(?:email|draft|send|book|remind|search|check))\b/i.test(lower)) return true;
-  if (/\b(?:then\s+(?:email|draft|send|book|remind|search|check))\b/i.test(lower)) return true;
-
-  return false;
-}
+// (Light intent detection and compound query detection removed —
+// nano router handles all classification with conversation context)
 
 // ── Profile Need Detection ──────────────────────────────────
 // Only inject the heavy user profile when the query genuinely benefits
@@ -318,14 +203,14 @@ function detectNeedsProfile(message: string): boolean {
 // tool round-trip (~300-500ms).
 
 const CALENDAR_PREFETCH_PATTERNS = [
-  /what(?:'s|\s+is|\s+do\s+i\s+have)\s+(?:on\s+)?(?:today|tomorrow|this\s+week|next\s+week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i,
+  /what(?:'?s|\s+is|\s+do\s+i\s+have)\s+(?:on\s+)?(?:today|tomorrow|this\s+week|next\s+week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i,
   /my\s+(?:schedule|calendar|meetings?|agenda)\s+(?:for\s+)?(?:today|tomorrow|this\s+week|next\s+week)/i,
-  /when(?:'s|\s+is)\s+(?:my\s+)?(?:next\s+)?(?:meeting|call|event)/i,
+  /when(?:'?s|\s+is)\s+(?:my\s+)?(?:next\s+)?(?:meeting|call|event)/i,
   /what\s+meetings?\s+(?:do\s+i\s+have|am\s+i\s+in|are\s+there)/i,
   /do\s+i\s+have\s+(?:any\s+)?(?:meetings?|calls?|events?)\s+(?:today|tomorrow|this\s+week)/i,
   /am\s+i\s+(?:free|busy)\s+(?:today|tomorrow|this\s+afternoon|this\s+morning|on\s+)/i,
-  /what(?:'s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow)(?:'s)?\s+(?:schedule|calendar|agenda)/i,
-  /what(?:'s|\s+is)\s+(?:on|in)\s+my\s+\w+\s+calendar/i,
+  /what(?:'?s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:today|tomorrow)(?:'s)?\s+(?:schedule|calendar|agenda)/i,
+  /what(?:'?s|\s+is)\s+(?:on|in)\s+my\s+\w+\s+calendar/i,
   /show\s+(?:me\s+)?my\s+\w+\s+calendar/i,
 ];
 
@@ -577,7 +462,8 @@ const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "semantic_search",
       description:
-        "Search indexed meeting notes, transcripts, email summaries, and calendar events " +
+        "Search indexed meeting notes, transcripts, email summaries, calendar events, " +
+        "past conversations, stored user memories/learnings, and ongoing life threads " +
         "using semantic similarity. Auto-generates sub-queries and applies diversity ranking. " +
         "Results may include a '_hint' field with follow-up guidance.",
       parameters: {
@@ -586,8 +472,8 @@ const AGENT_TOOLS: ToolDefinition[] = [
           query: { type: "string", description: "Natural language query. Be specific with names, topics, dates." },
           source_filters: {
             type: "array",
-            items: { type: "string", enum: ["note_summary", "note_chunk", "utterance_chunk", "email_summary", "email_chunk", "calendar_summary", "strava_summary", "strava_chunk"] },
-            description: "Optional source type filter. Omit to search everything.",
+            items: { type: "string", enum: ["note_summary", "note_chunk", "utterance_chunk", "email_summary", "email_chunk", "calendar_summary", "strava_summary", "strava_chunk", "conversation_summary", "conversation_chunk", "learning", "thread_summary"] },
+            description: "Optional source type filter. Omit to search everything. Use 'conversation_summary'/'conversation_chunk' for past chat sessions, 'learning' for stored user facts/preferences, 'thread_summary' for ongoing multi-session topics.",
           },
           limit: { type: "number", description: "Max results (default 5, max 15)." },
         },
@@ -862,11 +748,11 @@ const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "weather_lookup",
       description:
-        "Get current weather and forecast. Default to user's location if not specified.",
+        "Get current weather and forecast. ALWAYS pass the user's current location from USER CONTEXT unless they explicitly ask about a different city.",
       parameters: {
         type: "object",
         properties: {
-          location: { type: "string", description: "City name. Defaults to user's location from their Google Calendar timezone." },
+          location: { type: "string", description: "City/town name. ALWAYS use the user's 'Current location' from USER CONTEXT (e.g. 'Niseko', 'Tokyo') unless they ask about a different place. Do NOT default to timezone city." },
           days: { type: "number", description: "Forecast days 1-7. Default 1." },
         },
         required: [],
@@ -879,8 +765,8 @@ const AGENT_TOOLS: ToolDefinition[] = [
       name: "travel_time",
       description:
         "Get directions and travel time between two locations using Google Maps. " +
-        "Transit mode returns real-time departures, line names, platform/stop info, walking transfers, " +
-        "and up to 3 alternatives. Falls back to web search if no transit data.",
+        "Transit mode uses the Routes API v2 for real-time departures, line names, stop info, walking transfers, fares, " +
+        "and up to 3 alternatives. Supports transit preferences (less walking, fewer transfers) and mode filtering.",
       parameters: {
         type: "object",
         properties: {
@@ -894,6 +780,20 @@ const AGENT_TOOLS: ToolDefinition[] = [
           departure_time: {
             type: "string",
             description: "ISO 8601 departure time, or 'now' for immediate departures. Default 'now'. For 'next train' queries, always use 'now'.",
+          },
+          arrival_time: {
+            type: "string",
+            description: "ISO 8601 arrival time. Transit only. Use when user says 'I need to arrive by X'. Cannot combine with departure_time.",
+          },
+          transit_preference: {
+            type: "string",
+            enum: ["less_walking", "fewer_transfers"],
+            description: "Transit only. Prefer routes with less walking or fewer transfers.",
+          },
+          allowed_transit_modes: {
+            type: "array",
+            items: { type: "string", enum: ["BUS", "SUBWAY", "TRAIN", "LIGHT_RAIL", "RAIL"] },
+            description: "Transit only. Preferred transit types. Routes may still use other modes if more efficient.",
           },
         },
         required: ["origin", "destination"],
@@ -937,8 +837,10 @@ const AGENT_TOOLS: ToolDefinition[] = [
     function: {
       name: "update_user_timezone",
       description:
-        "Update the user's stored timezone. Pass IANA timezone identifier " +
-        "(e.g. 'Asia/Tokyo', 'America/New_York').",
+        "Update the user's stored timezone. ONLY call when the user EXPLICITLY states " +
+        "they are in a new location (e.g. 'I just landed in Tokyo', 'I'm in LA now'). " +
+        "Never call based on cities mentioned in queries like 'weather in Tokyo'. " +
+        "Pass IANA timezone identifier.",
       parameters: {
         type: "object",
         properties: {
@@ -948,7 +850,7 @@ const AGENT_TOOLS: ToolDefinition[] = [
           },
           reason: {
             type: "string",
-            description: "Brief note on why (e.g. 'user said they are in Tokyo', 'travelling to London').",
+            description: "Brief note on why — must reference an explicit user statement (e.g. 'user said they just landed in Tokyo').",
           },
         },
         required: ["timezone"],
@@ -1065,14 +967,95 @@ const AGENT_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "manage_automations",
+      description:
+        "Manage Nest automations: built-in (inbox summary, follow-up nudge, daily wrap, meeting intel, email monitor, weekly digest, relationship radar) " +
+        "and custom user-defined automations. Use 'list' to show all. Use 'enable'/'disable' to toggle. Use 'update' to change schedule. " +
+        "Use 'create_custom' to create a new custom automation from natural language. Use 'test_custom' to run one immediately. Use 'delete_custom' to remove.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["list", "enable", "disable", "update", "create_custom", "test_custom", "delete_custom"],
+            description: "list: show all. enable/disable: toggle. update: change schedule/prompt. create_custom: new custom automation. test_custom: run now. delete_custom: remove.",
+          },
+          automation_type: {
+            type: "string",
+            enum: ["email_summary", "follow_up_nudge", "daily_wrap", "meeting_intel", "email_monitor", "weekly_digest", "relationship_radar", "custom"],
+            description: "Which built-in automation to enable/disable/update. Not needed for custom automations (use automation_id instead).",
+          },
+          automation_id: {
+            type: "string",
+            description: "For custom automations: the specific automation ID (from list results). Used with enable/disable/update/test_custom/delete_custom.",
+          },
+          prompt: {
+            type: "string",
+            description: "For create_custom/update: what the automation should do, in natural language. E.g. 'Summarise my pipeline deals' or 'Check if Sarah replied about the contract'.",
+          },
+          label: {
+            type: "string",
+            description: "For create_custom: short name. E.g. 'Pipeline Check', 'Sarah Contract Watch'. Auto-generated from prompt if not provided.",
+          },
+          frequency: {
+            type: "string",
+            enum: ["daily", "weekly", "weekday", "hourly", "event"],
+            description: "For create_custom: daily/weekly/weekday = scheduled at time. hourly = every hour. event = fires when matching email arrives (needs watch_senders or watch_keywords).",
+          },
+          time: {
+            type: "string",
+            description: "Schedule time in HH:MM 24h format (e.g. '09:00', '18:30'). Not needed for hourly or event frequency.",
+          },
+          day: {
+            type: "string",
+            enum: ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+            description: "For weekly frequency: which day of the week.",
+          },
+          watch_senders: {
+            type: "string",
+            description: "For event frequency: comma-separated email addresses to watch for. E.g. 'sarah@example.com, boss@company.com'.",
+          },
+          watch_keywords: {
+            type: "string",
+            description: "For event frequency: comma-separated keywords to match in email subject/body. E.g. 'contract, invoice, urgent'.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+  },
 ];
 
 // ── Timezone → City helper ───────────────────────────────────
 
 function tzToCity(tz: string): string {
-  // Extract city from IANA timezone (e.g. "Asia/Tokyo" → "Tokyo")
   const city = tz.split("/").pop()?.replace(/_/g, " ");
   return city ?? tz;
+}
+
+/**
+ * Build the Location line for system prompts.
+ * Priority: currentLocation (from learnings/memory) > locationCity (profile home base) > timezone city.
+ */
+function buildLocationLine(user: NestUser): string {
+  const tzCity = tzToCity(user.timezone);
+  if (user.currentLocation) {
+    const parts = [`Current location: ${user.currentLocation}`];
+    if (user.locationCity && user.locationCity !== user.currentLocation) {
+      parts.push(`(home base: ${user.locationCity})`);
+    }
+    if (tzCity !== user.currentLocation) {
+      parts.push(`(timezone region: ${tzCity})`);
+    }
+    return parts.join(" ");
+  }
+  if (user.locationCity) {
+    return `Current location: ${user.locationCity} (timezone region: ${tzCity})`;
+  }
+  return `Location: ${tzCity}`;
 }
 
 // ── Agent System Prompt ──────────────────────────────────────
@@ -1093,7 +1076,7 @@ function tzToCity(tz: string): string {
 
 const AGENT_STATIC_PREFIX = `${NEST_IDENTITY_CORE}
 
-Your context includes a SITUATIONAL CONTEXT block with commitments from conversation (not in calendar). For schedule questions, ALWAYS merge calendar + situational commitments into one answer.
+Your context includes a SITUATIONAL CONTEXT block with commitments from conversation (not in calendar). For schedule questions, calendar_lookup results are the ONLY source of truth for what's on the calendar. Mention relevant commitments separately but NEVER present them as calendar events or invent times/details for them.
 
 When answering, consider the user's current situation. Think like a friend who knows what's going on, not a search engine.
 
@@ -1113,9 +1096,20 @@ You can tease. If they've got back-to-back meetings all day, you can say "good l
 
 NAME: Don't use their name every message. Maybe 1 in 5. Real mates don't say each other's names constantly in texts.
 
-LANDING: When you've answered the question or done the task, STOP. Don't add sign-offs, don't offer more help, don't wish them well. No "anything else?", no "enjoy your day", no "let me know if you need anything". Just stop talking.
+LANDING (CRITICAL): Most of the time, DON'T ask a follow-up. Just answer and stop. Let the user drive the conversation. When delivering information (calendar, weather, inbox, lists, search results), just deliver it. No follow-up needed. They'll ask if they want more. When you've done a task, STOP. Don't add sign-offs, don't offer more help, don't wish them well. No "anything else?", no "enjoy your day", no "let me know if you need anything", no "want more details?", no "need help with anything?". Just stop talking.
+
+EXCEPTION TO LANDING: When your searches come back EMPTY for something the user asked about (a person, a topic, a name), you ARE blocked. This IS a situation where you ask a clarifying question. Don't just report "nothing found" and stop. Ask them what they mean, like a friend would: "Not sure what you're referring to - nothing on [X] is coming up for me. What do you mean?" or "Drawing a blank on [X], who's that?" This is natural conversation, not a follow-up offer.
+
+CONFUSION AND UNCERTAINTY (CRITICAL): If your searches return nothing for what the user asked about, respond in ONE short message like a confused mate. Not a report. Not a list of what you checked. Just ask.
+Good: "Not sure what you mean - nothing on Bel Toomsm is coming up. What are you referring to?"
+Good: "Drawing a blank on that one, who's Fidel?"
+Good: "Nothing for Mick Gator - did you mean Mick Gatto?"
+Bad: "Nothing's coming up for Bel Toomsm. No emails, no calendar invites, not even a mention in any of your ops threads." (too long, too robotic, doesn't ask)
+ONE message. Ask what they mean. Stop.
 
 "Done ✓" USAGE: Only use "Done ✓" or any tick confirmation for WRITE actions — sending email, setting reminders, creating/updating/deleting calendar events, adding contacts. NEVER use "Done ✓" for read/search actions like calendar lookups, inbox searches, or information retrieval.
+
+NEVER use em dashes (—) or en dashes (–) in your responses. Use hyphens (-) or commas instead.
 
 ─── PRINCIPLES ───
 
@@ -1168,23 +1162,44 @@ If you don't have the data, say so plainly: "I don't have that" / "Can't find an
 
 SELF-CHECK before every response: Can I trace EVERY specific claim (name, date, number, quote) back to a tool result or evidence in my context? If not, remove it or say you don't know.
 
+─── EMPTY RESULTS = ONE MESSAGE, ASK (CRITICAL) ───
+
+When you search for a person/topic and the tool returns nothing with that name:
+- Send ONE short message asking what they mean. That's it.
+- "Not sure what you mean by [X], what are you referring to?"
+- NEVER list what you checked ("no emails, no calendar, no contacts"). That's robotic.
+- NEVER describe involvement that doesn't exist in your results. That's fabrication.
+- NEVER send 3 bubbles about it. One message. Ask. Stop.
+
+─── TYPOS AND UNCLEAR QUERIES ───
+
+When searches return nothing, ALWAYS consider typos. Suggest corrections naturally:
+- "Nothing's coming up for Mick Gator - did you mean Mick Gatto?"
+- "Can't find a James Hardie. Did you mean James Hardy?"
+
+If you're not sure what they meant, ASK. "Who's that?" or "What do you mean?" is always better than making something up.
+
 EVIDENCE TRUST ORDER (highest to lowest):
 A) Tool results from this conversation = authoritative
-B) Pre-fetched evidence in context = authoritative
-C) Calendar data = authoritative
-D) Situational commitments (user mentioned, you remembered) = authoritative but not calendared
+B) Pre-fetched evidence in context = authoritative for emails/documents, but NOT for calendar events (use calendar_lookup for live calendar data)
+C) Calendar data from calendar_lookup = the ONLY source of truth for what's on the user's calendar. If calendar_lookup returns empty, the calendar IS empty — do not fill in events from RAG, memory, or pre-fetched evidence
+D) Situational commitments (user mentioned, you remembered) = authoritative but not calendared — present separately from calendar events
 E) Memory / profile = supportive context only, NEVER use for specific facts, dates, times, or numbers
 F) Your inference = NEVER present as fact, NEVER use for specific details
+
+CALENDAR TRUTH: calendar_lookup queries the live Google Calendar and Microsoft Outlook APIs in real time. Its results are the definitive answer for "what's on my calendar". Pre-fetched evidence may contain old indexed calendar summaries — these are STALE and must NEVER override or supplement live calendar_lookup results. If calendar_lookup returns no events for a time range, the answer is "nothing on your calendar" — do not invent events from other context.
 
 ─── TOOL DISPATCH ───
 
 Use tools proactively. Call BEFORE responding.
 
-Schedule / "what do I have on" → calendar_lookup + merge SITUATIONAL CONTEXT
+CRITICAL: If the user asks to CREATE, SET UP, or MAKE any recurring/scheduled/automated action (e.g. "do X every day", "summarise Y every morning", "let me know when Z", "create an automation"), you MUST call manage_automations with action "create_custom". Do NOT just say "done" without calling the tool. The automation will NOT actually exist unless you call the tool.
+
+Schedule / "what do I have on" → calendar_lookup FIRST (authoritative), then mention relevant SITUATIONAL CONTEXT commitments separately. NEVER present commitments as calendar events or invent times/details for them.
 "What's in my [X] calendar" → calendar_lookup with query="[X]" to filter by calendar name
 Book meeting → calendar_lookup (check conflicts) → calendar_create
 Reschedule/cancel → calendar_lookup → confirm with user → calendar_update/delete
-Person info → person_lookup + semantic_search IN PARALLEL
+Person info → person_lookup + semantic_search IN PARALLEL. If NEITHER tool returns results mentioning that person's name, you MUST say "nothing's coming up for [name]". Do NOT describe their involvement based on unrelated results. Do NOT say they "popped up" or are "in the mix" unless their actual name appears in the tool output.
 Past meeting / "when did we" → semantic_search, then gmail_search if thin
 Emails → check evidence → semantic_search → gmail_search if insufficient
 Inbox summary / "what did I miss" → gmail_search with time-appropriate query. Check email dates against current time.
@@ -1193,7 +1208,7 @@ Draft email → gather context → send_draft → show draft → user confirms �
 Travel / trip / "what am I doing in [city]" → gmail_search + semantic_search + calendar_lookup ALL IN PARALLEL first
 Accommodation / booking → gmail_search + calendar_lookup IN PARALLEL. Search broadly. ALWAYS get_email for exact details.
 "Where am I" / current location → DO NOT just parrot the stored timezone city. THINK: check calendar_lookup for what's happening RIGHT NOW. Cross-reference current time with scheduled events (flights, meetings, travel). If their flight was at 9:30 and it's 9:14, they're at the airport, not at their hotel. If they have a meeting at a specific venue right now, they're probably there. Reason about where they ACTUALLY are based on time + schedule + context, not the static stored location.
-Location/timezone change → update_user_timezone IMMEDIATELY (map city to IANA). If you know from ANY source (memory, profile, learnings, conversation, calendar events with foreign locations) that the user is not where the stored timezone says, call update_user_timezone BEFORE answering. Never present times in the wrong timezone.
+Location/timezone change → update_user_timezone ONLY when user EXPLICITLY states new location ("I just landed in...", "I'm in X now", "I moved to..."). Map city to IANA. Never infer timezone from queries about other cities.
 Reminder → manage_reminder. If clear, set and confirm with EXACTLY one message + ✓. No pre-confirmation, no follow-up.
 Todo → manage_todos
 Documents → document_search, fall back to semantic_search
@@ -1202,9 +1217,11 @@ Forex/currency → web_search IMMEDIATELY
 Public transport / "next train" → travel_time with mode "transit". Sanity-check times against current local time.
 Travel time / "when should I leave" → travel_time + calendar_lookup to calculate departure with buffer
 Airport → gmail_search (confirmation) + travel_time IN PARALLEL, then calculate departure
-Places → places_search. For details, call again with place_id
-Weather → weather_lookup
+Places → places_search. For details, call again with place_id. Use user's Current location for nearby searches.
+Weather → weather_lookup. ALWAYS pass the user's Current location as the location parameter. Only use a different city if they explicitly name one.
 Fitness / running / cycling / Strava / "how far" / "my last run" / "recent rides" → strava_search ALWAYS. NEVER answer fitness questions from memory. NEVER fabricate activities.
+Automations / "my automations" / "turn off inbox summary" / "enable daily wrap" / "what automations" / "pause email monitor" / "turn it back on" → manage_automations ALWAYS. NEVER answer automation questions from memory. NEVER claim you enabled/disabled an automation without calling the tool. Call manage_automations with action "list" to show status, "enable" to activate, "disable" to deactivate, "update" to change schedule. Even for follow-up messages like "turn it back on" or "actually enable that", you MUST call the tool.
+Custom automations / "do X every day" / "check Y every Monday" / "let me know when Z" / "summarise my X every week" → manage_automations with create_custom. Parse the user's intent into: prompt (what), frequency (daily/weekly/weekday/hourly/event), time (when), day (if weekly), label (short name). For event-driven ("let me know when Sarah emails about X"), set frequency to "event" and populate watch_senders/watch_keywords. After creating, ALWAYS tell the user what you set up and offer to test it: "Want me to run it now so you can see what it looks like?" If user says "test it" / "try it" → call test_custom with the automation_id. If user says "change it" / "not quite" → call update with the automation_id and refined prompt/time.
 External info → web_search
 Meeting notes → get_meeting_notes. NEVER mention "Recall.ai". Say "I recorded your call".
 Connect recording → connect_meeting_notes. Confirm: "done, I'll join your calls and take notes"
@@ -1214,6 +1231,8 @@ Contact → contacts_search → contacts_manage
 SEARCH CHAINING: For bookings/reservations/flights, never say "can't find it" after one source. Try: prefetch → gmail_search + calendar_lookup (parallel) → broaden query → semantic_search → ask user.
 
 FOLLOW-UP DATA: For follow-ups about data you already showed, use conversation history. Don't re-search from scratch. If you just mentioned a link, deck, document, or detail and the user says "show me" or "send it", act on what you JUST said. Never ask "which one?" when there's only one obvious referent in your last message.
+
+PERSPECTIVE: Read the conversation carefully to understand WHO is doing WHAT. If the user says "we are waiting for gs parents who are coming from Tokyo", they are the one WAITING — not the one flying. "Track it" means track the INCOMING flight, not the user's own travel. Never confuse the user's perspective with someone else's. Pay attention to pronouns: "they", "their", "gs parents" = other people. The user is the observer/recipient, not the traveller, unless they explicitly say "I'm flying" or "my flight".
 
 RECOMMENDATIONS: Ask ONE clarifying question first unless constraints are clear. If you ask, STOP and wait.
 
@@ -1374,22 +1393,34 @@ function buildAgentSystemPrompt(user: NestUser): string {
     timeZone: tz,
   });
   const tzAbbr = getTimezoneAbbr(now, tz);
+  const currentTimeISO = now.toLocaleString("sv-SE", { timeZone: tz }).replace(" ", "T");
 
   const accountsLine = user.connectedAccounts?.length
     ? `Connected accounts: ${user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}${a.provider === "microsoft" ? " [Microsoft]" : " [Google]"}`).join(", ")}`
     : "";
 
+  const locationLine = buildLocationLine(user);
+
   const userContext = `
 
 ─── USER CONTEXT ───
 
+currentTimeISO: ${currentTimeISO}
+currentTimezone: ${tz}
+timezoneSource: authoritative
 Current time: ${timeStr} (${tzAbbr})
-User timezone: ${tz}
-Stored location: ${tzToCity(tz)}${user.locationCity ? ` (home base: ${user.locationCity})` : ""}
-NOTE: This is the STORED timezone location, NOT necessarily where the user physically is right now. If they're travelling, have a flight, or their schedule suggests they'd be somewhere else (e.g. at the airport for an imminent flight), reason about their ACTUAL current location using calendar events, times, and context.
-IMPORTANT: ALL calendar events, reminders, and times are in the user's timezone (${tz}). When presenting times to the user, use their local time. Never convert or reinterpret — the data is already localised.
-TIMEZONE CHECK: If you know from memory, learnings, profile, or conversation that the user is NOT in ${tzToCity(tz)} right now (e.g. they're travelling), call update_user_timezone IMMEDIATELY before doing anything else. Present all times in their ACTUAL current timezone, not the stored one.
+${locationLine}
 User: ${user.name} | ${user.email} | ${user.phone}${accountsLine ? `\n${accountsLine}` : ""}
+
+─── TIMEZONE AUTHORITY ───
+The currentTimezone and currentTimeISO above are the single source of truth.
+Never infer timezone from message content or location names.
+Never calculate "now" — use the provided currentTimeISO.
+All calendar events, reminders, and times are already localised to the user's timezone (${tz}). Present them as-is.
+Only call update_user_timezone if the user EXPLICITLY states they are in a new location (e.g. "I just landed in New York", "I'm in LA now", "I moved to London"). Never call it based on cities mentioned in queries like "weather in Tokyo" or "next train to Osaka".
+
+─── LOCATION AUTHORITY ───
+The "Current location" above is the user's ACTUAL current location. Use it for ALL location-dependent queries (weather, nearby places, travel, transit) unless the user explicitly asks about a different location. This takes priority over the timezone city.
 
 You are ${user.name}'s person. You know ${user.name}. Use their name naturally in conversation.`;
 
@@ -1405,7 +1436,7 @@ You are ${user.name}'s person. You know ${user.name}. Use their name naturally i
 
 const LIGHT_PROMPT_CORE = `${NEST_IDENTITY_CORE}
 
-Merge SITUATIONAL CONTEXT commitments with calendar results for schedule questions.
+For schedule questions, calendar_lookup is the ONLY source of truth. Mention SITUATIONAL CONTEXT commitments separately — never present them as calendar events or invent times for them.
 
 ─── TOOLS ───
 Use tools proactively. Call BEFORE responding.
@@ -1413,6 +1444,7 @@ If pre-fetched evidence answers the question, use it directly.
 Never state real-time numbers from memory. If a tool fails: "Hmm, couldn't do that. Want me to try again?"
 "Next/now/latest" = nearest upcoming result from current local time.
 Keep responses concise. Each line = separate iMessage bubble.
+NEVER use em dashes (—) or en dashes (–). Use hyphens (-) or commas instead.
 
 ─── CONTEXTUAL REASONING ───
 THINK before answering. Cross-reference current time with events and context. Don't parrot data in isolation — connect the dots:
@@ -1422,7 +1454,12 @@ THINK before answering. Cross-reference current time with events and context. Do
 Live data (calendar, tool results, current time) overrides stored location/profile when they conflict.
 
 ─── ZERO FABRICATION ───
-NEVER fabricate names, dates, times, prices, booking refs, email content, meeting details, or any specific fact. Every detail must come from tool results or pre-fetched evidence. If you don't have it, say "I don't have that" — never guess. An empty answer is better than an invented one.
+NEVER fabricate names, dates, times, prices, booking refs, email content, meeting details, or any specific fact. Every detail must come from tool results or pre-fetched evidence. If you don't have it, say "I don't have that" - never guess. An empty answer is better than an invented one.
+CALENDAR TRUTH: calendar_lookup is the ONLY source for what's on the user's calendar. If it returns empty, the calendar IS empty for that range. NEVER fill in events from RAG, memory, or pre-fetched evidence. Old indexed calendar summaries in evidence are STALE - ignore them for schedule questions.
+
+If you genuinely don't understand what the user is referring to or their message is ambiguous, ALWAYS ask a short clarification question. Never guess when you're unsure what they mean.
+EMPTY RESULTS: When a tool search returns nothing for a person/topic, respond like a confused friend, not a search engine. Say "Not sure what you're referring to - nothing on X is coming up. What do you mean?" or "Drawing a blank on X, who's that?" NEVER describe what someone "has been involved in" or "popped up in" when your search returned zero results. That is fabrication. NEVER just list "no emails, no calendar, no contacts" robotically.
+TYPOS: If searches return nothing and the name/term looks like it could be misspelled, suggest a correction: "Nothing for Mick Gator - did you mean Mick Gatto?" Always prefer asking over guessing.
 SELF-CHECK: Before responding, verify every specific claim traces back to evidence. Remove anything you can't source.
 
 ─── STRUCTURED DATA ───
@@ -1437,17 +1474,18 @@ CRITICAL: When presenting ANY variable/dynamic data (weather, forex, transit, to
 3. NOTHING after the </nest-content> tag.
 NEVER put "Label: value" on the same line. Bold label on one line, value below.
 
-─── TIMEZONE ───
-Timezone is auto-detected from conversation context but may be stale. BEFORE presenting any times, verify the stored timezone matches where the user actually is. Check memory, learnings, and conversation for travel/location clues. If there's a mismatch, call update_user_timezone FIRST. Never present times in the wrong timezone.`;
+─── TIMEZONE AUTHORITY ───
+The user's currentTimezone in USER CONTEXT is the single source of truth. Never infer timezone from message content or location names. Never calculate "now" — use the provided time. All times are already localised. Only call update_user_timezone if the user EXPLICITLY states they are in a new location.`;
 
 const LIGHT_INTENT_INSTRUCTIONS: Record<string, string> = {
   calendar: `
 ─── CALENDAR ───
-"What do I have on" / schedule → calendar_lookup + ALWAYS merge with SITUATIONAL CONTEXT commitments.
+"What do I have on" / schedule → calendar_lookup FIRST. This is the ONLY source of truth for calendar events. Then mention relevant SITUATIONAL CONTEXT commitments separately (e.g. "you also mentioned...").
 "Am I free" → calendar_lookup for the time range.
 "What's in my [X] calendar" → calendar_lookup with query="[X]" to filter by calendar name.
 All times are in the user's timezone. Present in their local time.
 Events have a "calendar" field (e.g. "Work", "Personal", "Blacklane") — use it to group or filter when the user asks about a specific calendar.
+CRITICAL: calendar_lookup queries the LIVE Google Calendar and Microsoft Outlook APIs. If it returns empty, the calendar IS empty for that range. NEVER fill in events from pre-fetched evidence, RAG, memory, learnings, or conversation summary. NEVER present situational commitments as calendar events. NEVER invent times or details for commitments.
 
 SINGLE DAY format:
 Pretty light today
@@ -1491,7 +1529,9 @@ Rules:
 - Keep it scannable. White space between days is critical for readability.
 Book/reschedule/cancel → always confirm first with card format (title, 📅, 📍, 👤).`,
 
-  weather: `Use weather_lookup. ALWAYS format as: one short human overview line (no specific numbers, just your vibe/take), then a <nest-content> block with ALL weather data inside. No emojis. NEVER put temperatures, conditions, or forecasts outside the block. Use bold labels on their own lines.
+  weather: `Use weather_lookup. CRITICAL: ALWAYS pass the user's "Current location" from USER CONTEXT as the location parameter. If they're in Niseko, search Niseko weather, not Sydney or Tokyo. Only use a different location if they explicitly name one.
+
+ALWAYS format as: one short human overview line (no specific numbers, just your vibe/take), then a <nest-content> block with ALL weather data inside. No emojis. NEVER put temperatures, conditions, or forecasts outside the block. Use bold labels on their own lines.
 
 Single day example:
 Bit fresh out there today
@@ -1638,7 +1678,7 @@ Rules:
 For "next" phrasing, resolve from current local time, not tomorrow by default.
 If the user asks "what timezone am I in" or similar, check if the stored timezone matches where they actually are (from memory, learnings, profile). If it's wrong, call update_user_timezone FIRST to correct it, then answer with the corrected timezone.`,
 
-  places: `For recommendation-style place asks (restaurants, shopping, bars, movies, things to do), ask EXACTLY ONE clarifying question first unless constraints are already clear (location/type/budget/timing).
+  places: `For recommendation-style place asks (restaurants, shopping, bars, movies, things to do), ask EXACTLY ONE clarifying question first unless constraints are already clear (location/type/budget/timing). Default to searching near the user's Current location from USER CONTEXT.
 If you ask that question, return only the question in this turn and wait for their reply.
 Then use places_search. For details (hours, reviews), search first then call again with place_id.
 
@@ -1736,6 +1776,63 @@ Rules:
 - For multiple activities, use compact "Day — Name" format with key stats on same line.
 - Include location when available.
 - If no Strava account connected, tell them to connect via the Nest dashboard.`,
+
+  automation: `MANDATORY: You MUST call the manage_automations tool for EVERY automation request. NEVER respond about automations without calling the tool first. If you respond without calling the tool, the action will NOT happen.
+
+Use manage_automations to list, enable, disable, update, or create custom automations.
+
+ALWAYS call manage_automations with action "list" first when the user asks about their automations.
+When the user asks to CREATE any recurring/scheduled action, you MUST call manage_automations with action "create_custom". Do NOT just say "done" - the automation will not exist unless you call the tool.
+
+Present the results grouped by category. Format:
+
+Here's what you've got set up
+
+<nest-content>
+**Daily**
+
+Inbox Summary - Active, 8:00 AM
+Follow-Up Nudge - Inactive
+Daily Wrap - Active, 6:00 PM
+Meeting Intel - Inactive
+
+**Weekly**
+
+Weekly Digest - Active, Sundays 7:00 PM
+Relationship Radar - Inactive
+
+**Always On**
+
+Email Monitor - Active
+
+**Custom**
+
+Pipeline Check - Active, Daily 9:00 AM
+Sarah Contract Watch - Active, Event-driven
+</nest-content>
+
+Rules:
+- Group by Daily, Weekly, Always On, Custom.
+- Show "Active" with time or "Inactive" for each.
+- For custom automations, show the label and frequency.
+- When enabling, ask for their preferred time if they don't specify one.
+- For always-on automations (Email Monitor), no time needed - just toggle.
+- After enabling/disabling, confirm what changed.
+
+CREATING CUSTOM AUTOMATIONS:
+When the user says "do X every day/week at Y" or "let me know when Z happens":
+1. Parse their intent into prompt, frequency, time, day, label
+2. Call create_custom with those params
+3. Confirm what you set up: "Done - I'll [description] every [frequency] at [time]. Want me to test it now?"
+4. If they say "test it", call test_custom with the automation_id
+5. If they want changes, call update with the automation_id
+
+For event-driven requests ("let me know when Sarah emails about the contract"):
+- Set frequency to "event"
+- Set watch_senders and/or watch_keywords
+- Explain: "I'll watch your inbox and let you know as soon as a matching email comes in."
+
+Mention they can also manage these visually at nest.expert/automations.`,
 };
 
 function buildLightAgentPrompt(user: NestUser, intent: string): string {
@@ -1747,21 +1844,96 @@ function buildLightAgentPrompt(user: NestUser, intent: string): string {
     timeZone: tz,
   });
   const tzAbbr = getTimezoneAbbr(now, tz);
+  const currentTimeISO = now.toLocaleString("sv-SE", { timeZone: tz }).replace(" ", "T");
 
   const accountsLine = user.connectedAccounts?.length
     ? `\nConnected accounts: ${user.connectedAccounts.map(a => `${a.email}${a.isPrimary ? " (primary)" : ""}${a.provider === "microsoft" ? " [Microsoft]" : " [Google]"}`).join(", ")}`
     : "";
 
   const intentBlock = LIGHT_INTENT_INSTRUCTIONS[intent] ?? "";
+  const locationLine = buildLocationLine(user);
 
   return `${LIGHT_PROMPT_CORE}
 ${intentBlock}
 
 ─── USER CONTEXT ───
+currentTimeISO: ${currentTimeISO}
+currentTimezone: ${tz}
+timezoneSource: authoritative
 Current time: ${timeStr} (${tzAbbr})
-User timezone: ${tz}
-If you know the user is NOT in ${tzToCity(tz)} right now, call update_user_timezone FIRST.
-User: ${user.name} | ${user.email}${accountsLine}`;
+${locationLine}
+User: ${user.name} | ${user.email}${accountsLine}
+
+─── LOCATION AUTHORITY ───
+The "Current location" above is the user's ACTUAL current location. Use it for ALL location-dependent queries (weather, nearby places, travel, transit) unless the user explicitly asks about a different location.`;
+}
+
+// ── Confirmation Tool Detection ──────────────────────────────
+// COST OPTIMISATION: Instead of sending all ~20 tool definitions (~2,500
+// tokens) for a simple "yes"/"no" confirmation, detect the pending action
+// type from the last assistant message and send only the 1-3 tools needed.
+
+function detectConfirmationTools(lastAssistantContent: string): ToolDefinition[] {
+  const content = lastAssistantContent.toLowerCase();
+
+  // Email draft awaiting send confirmation
+  if (content.includes("send_draft") || content.includes("draft_id") ||
+      content.includes("want me to send") || content.includes("shall i send") ||
+      /\bto:\s/.test(content) || /\bsubject:\s/.test(content)) {
+    return AGENT_TOOLS.filter(t =>
+      ["send_email", "send_draft"].includes(t.function.name)
+    );
+  }
+
+  // Calendar create/update/delete
+  if (content.includes("calendar_create") || content.includes("calendar_update") ||
+      content.includes("calendar_delete") || content.includes("event_id") ||
+      /shall i (?:book|create|schedule|add|move|reschedule|cancel|delete|remove)/i.test(lastAssistantContent)) {
+    return AGENT_TOOLS.filter(t =>
+      ["calendar_create", "calendar_update", "calendar_delete", "calendar_lookup"].includes(t.function.name)
+    );
+  }
+
+  // Reminder
+  if (content.includes("manage_reminder") || content.includes("reminder") ||
+      /shall i (?:set|create).*(?:reminder|alert)/i.test(lastAssistantContent)) {
+    return AGENT_TOOLS.filter(t => t.function.name === "manage_reminder");
+  }
+
+  // Todo
+  if (content.includes("manage_todos") || content.includes("todo") ||
+      /shall i (?:add|create).*(?:todo|task|to-do)/i.test(lastAssistantContent)) {
+    return AGENT_TOOLS.filter(t => t.function.name === "manage_todos");
+  }
+
+  // Contact creation
+  if (content.includes("contacts_manage") || /shall i (?:add|create|save).*contact/i.test(lastAssistantContent)) {
+    return AGENT_TOOLS.filter(t =>
+      ["contacts_manage", "contacts_search"].includes(t.function.name)
+    );
+  }
+
+  // Note creation
+  if (content.includes("create_note") || /shall i (?:save|create).*note/i.test(lastAssistantContent)) {
+    return AGENT_TOOLS.filter(t => t.function.name === "create_note");
+  }
+
+  // Meeting recording
+  if (content.includes("connect_meeting") || content.includes("meeting_recording")) {
+    return AGENT_TOOLS.filter(t =>
+      ["connect_meeting_notes", "manage_meeting_recording"].includes(t.function.name)
+    );
+  }
+
+  // Automations (built-in + custom)
+  if (content.includes("manage_automations") || content.includes("automation") || content.includes("automation_id") ||
+      /shall i (?:enable|disable|turn|activate|deactivate|pause|stop|start|create|set up|test)/i.test(lastAssistantContent) ||
+      /want me to (?:test|run) it/i.test(lastAssistantContent)) {
+    return AGENT_TOOLS.filter(t => t.function.name === "manage_automations");
+  }
+
+  // Fallback: couldn't detect — send all tools (safe but expensive)
+  return AGENT_TOOLS;
 }
 
 // ── Confirmation Compact Prompt ──────────────────────────────
@@ -1787,9 +1959,12 @@ function buildConfirmationPrompt(user: NestUser): string {
     timeZone: tz,
   });
   const tzAbbr = getTimezoneAbbr(now, tz);
+  const currentTimeISO = now.toLocaleString("sv-SE", { timeZone: tz }).replace(" ", "T");
   return `${CONFIRMATION_PROMPT_PREFIX}
 
 ─── USER CONTEXT ───
+currentTimeISO: ${currentTimeISO}
+currentTimezone: ${tz}
 Current time: ${timeStr} (${tzAbbr})
 User: ${user.name}`;
 }
@@ -1809,6 +1984,7 @@ const TOOL_SUBSETS: Record<string, string[]> = {
   places: ["places_search", "web_search", "update_user_timezone"],
   inbox: ["gmail_search", "get_email", "update_user_timezone"],
   fitness: ["strava_search", "update_user_timezone"],
+  automation: ["manage_automations"],
 };
 
 function getToolSubset(intent: string): ToolDefinition[] {
@@ -1833,11 +2009,13 @@ function buildCasualSystemPrompt(user: NestUser): string {
     hour: "2-digit", minute: "2-digit", hour12: true,
     timeZone: user.timezone,
   });
+  const locationLine = buildLocationLine(user);
 
   return `${NEST_IDENTITY_CORE}
 Current time: ${timeStr}
+${locationLine}
 
-You're texting with ${user.name}. This is casual chat, not a task. Be a person.
+You're texting with ${user.name}. This is casual chat, not a task. Be a normal person.
 
 CRITICAL: Always respond to the MOST RECENT topic. Each message has a sentAt timestamp — use them. If they say "yeah please" or "tell me more", they mean the topic from the LAST exchange (most recent timestamp), not something from minutes ago. A message from 20 seconds ago is the active topic; a message from 8 minutes ago is old context.
 
@@ -1849,7 +2027,9 @@ You can banter. You can be cheeky. You can have an opinion and push back if you 
 
 Connect what they say to what you know about them when it's natural. Don't force it. You know ${user.name}, so act like it, but don't be weird about it.
 
-ZERO FABRICATION: Even in casual chat, NEVER invent specific facts about the user's life — meetings, people, events, plans, dates. Only reference things from the conversation history or context provided. If you don't know something specific, keep it general or ask. Don't make up details to seem more informed.
+ZERO FABRICATION: Even in casual chat, NEVER invent specific facts about the user's life - meetings, people, events, plans, dates. Only reference things from the conversation history or context provided. If you don't know something specific, keep it general or ask. Don't make up details to seem more informed.
+
+If you genuinely don't understand what they're referring to or their message is ambiguous, ask a short clarification question. A quick "what do you mean?" is always better than a wrong answer.
 
 If they swear, match their energy. You're a mate, not a corporate chatbot.
 Don't use their name every message, maybe 1 in 5. Don't end with offers of help or sign-offs. Just stop when you've said your bit.
@@ -1946,7 +2126,7 @@ BAD: "yo" (echoing) / "Hello! How can I help?" (chatbot) / work references on we
 
 // ── Timezone Helper ──────────────────────────────────────────
 
-function getTimezoneAbbr(date: Date, tz = "Australia/Sydney"): string {
+function getTimezoneAbbr(date: Date, tz = "UTC"): string {
   const formatter = new Intl.DateTimeFormat("en-AU", {
     timeZone: tz,
     timeZoneName: "short",
@@ -1963,6 +2143,8 @@ export interface NestUser {
   phone: string;
   timezone: string;
   locationCity?: string;
+  /** Current location resolved from learnings/memory (e.g. "Niseko", "Tokyo") — NOT derived from timezone */
+  currentLocation?: string;
   connectedAccounts?: Array<{ email: string; isPrimary: boolean; provider?: "google" | "microsoft" }>;
   isGroup?: boolean;
   testing?: boolean;
@@ -1981,7 +2163,7 @@ export interface NestUser {
 // GPT-4.1-nano classifies ambiguous messages that fall through the fast
 // gates. Returns category + confidence. ~150ms, ~$0.00003/call.
 
-type NanoCategory = "casual" | "calendar" | "weather" | "inbox" | "reminder" | "todo" | "transit" | "places" | "currency" | "time" | "fitness" | "agent";
+type NanoCategory = "casual" | "calendar" | "weather" | "inbox" | "reminder" | "todo" | "transit" | "places" | "currency" | "time" | "fitness" | "automation" | "agent";
 
 interface NanoClassification {
   category: NanoCategory;
@@ -1992,24 +2174,33 @@ interface NanoClassification {
 const NANO_PROMPT = `Classify this iMessage. Return ONLY JSON: {"category":"...","confidence":0.0-1.0}
 
 Categories:
-- casual: banter, reactions, opinions, acknowledgements, jokes, small talk, emotional responses, tapback-style messages ("Laughed at...", "Loved..."), follow-ups that need NO data lookup
+- casual: ONLY pure banter with NO intent to act. Jokes, opinions, emotional venting, "haha", "that's wild", tapback-style messages ("Laughed at...", "Loved..."). The user is chatting, not asking for anything.
 - calendar: schedule, meetings, availability, events, "what's on", "am I free"
 - weather: weather, temperature, forecast, rain, umbrella
 - inbox: emails, inbox, unread messages, "check my mail"
 - reminder: "remind me", set alert/nudge
 - todo: tasks, to-do lists, shopping lists
 - transit: trains, buses, directions, public transport, "how do I get to"
-- places: restaurant/cafe/bar lookup, addresses, "where is", "near me"
+- places: restaurant/cafe/bar lookup, addresses, "where is the nearest", "near me", place recommendations
 - currency: exchange rates, forex, conversion
 - time: time in another city/timezone
 - fitness: running, cycling, rides, Strava, workouts, exercise, "how far did I run", "my last ride", fitness stats, pace, distance
-- agent: needs data lookup, search, complex reasoning, multi-step task, or anything you're unsure about
+- automation: automations, "my automations", "turn off inbox summary", "enable daily wrap", "what automations do I have", "pause email monitor", "stop the morning summary", "disable follow-up nudge", "do X every day/week", "let me know when", "summarise my X every morning", "create an automation", "delete that automation", "test it"
+- agent: needs data lookup, search, complex reasoning, multi-step task, action request, or anything you're unsure about
 
-IMPORTANT: Messages have timestamps. Short follow-ups ("yeah please", "tell me more", "go on") refer to the MOST RECENT topic by timestamp, not older topics. Classify based on what the active conversation is about.
+CRITICAL RULES:
 
-CRITICAL: Short messages like "800?", "what about X?", "and the other one?", bare numbers, or single words with "?" are almost ALWAYS follow-up questions about the topic Nest just discussed. Classify them as "agent" so the model gets full conversation context. Do NOT classify these as "casual".
+1. CONTEXT IS EVERYTHING. Read the conversation history. A short message after a detailed assistant response is almost always a follow-up about that topic, not a new topic or casual chat.
 
-If unsure, pick "agent" with low confidence.`;
+2. ACTION FOLLOW-UPS = "agent". If the user says "do it", "track it", "book it", "send that", "show me", "pull it up", "look into that", "try again", or ANY short imperative after a substantive conversation, that is an ACTION REQUEST → "agent". NOT casual.
+
+3. DATA FOLLOW-UPS = match the topic. "yeah please", "tell me more", "go on", "and?" after a calendar discussion → "calendar". After a weather discussion → "weather". Match the category of what was being discussed.
+
+4. "where am I", "what am I doing", "what should I be doing" = ALWAYS "agent" (requires temporal reasoning). NOT "places".
+
+5. Short messages with "?" ("800?", "what about X?", "and the other one?") = "agent". These are follow-up questions needing full context.
+
+6. When in doubt, pick "agent" with low confidence. A false "agent" classification costs ~$0.01 extra. A false "casual" classification gives the user a wrong answer.`;
 
 async function classifyWithNano(
   message: string,
@@ -2044,7 +2235,7 @@ async function classifyWithNano(
     const jsonMatch = text.match(/\{[^}]+\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
-      const VALID_CATEGORIES = new Set<NanoCategory>(["casual", "calendar", "weather", "inbox", "reminder", "todo", "transit", "places", "currency", "time", "agent"]);
+      const VALID_CATEGORIES = new Set<NanoCategory>(["casual", "calendar", "weather", "inbox", "reminder", "todo", "transit", "places", "currency", "time", "fitness", "automation", "agent"]);
       const category: NanoCategory = VALID_CATEGORIES.has(parsed.category) ? parsed.category : "agent";
       const confidence = typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0.5;
       const latency_ms = Date.now() - t0;
@@ -2086,7 +2277,7 @@ export function tryFastRoute(
     };
   }
 
-  // Tier 1: Static response — 0ms, no API
+  // ── Gate 1: Static response — 0ms, no API ──
   if (STATIC_RESPONSES[cleaned]) {
     const response = pickRandom(STATIC_RESPONSES[cleaned]);
     console.log(`[orchestrator] Static → "${response}" (0ms)`);
@@ -2101,33 +2292,7 @@ export function tryFastRoute(
     };
   }
 
-  // Quick-exit messages → casual LLM with context
-  if (QUICK_EXIT_WORDS.has(cleaned)) {
-    console.log(`[orchestrator] QuickExit → ${MODELS.agent_light} (context-aware)`);
-    return {
-      path: "casual",
-      model: MODELS.agent_light,
-      maxTokens: 60,
-      systemPrompt: buildQuickExitSystemPrompt(user),
-      tools: null,
-      _routeReason: `Quick-exit word: "${cleaned}"`,
-    };
-  }
-
-  // Greetings → casual path
-  if (GREETING_WORDS.has(cleaned)) {
-    console.log(`[orchestrator] Greeting → ${MODELS.fast} (contextual)`);
-    return {
-      path: "casual",
-      model: MODELS.fast,
-      maxTokens: 150,
-      systemPrompt: buildGreetingSystemPrompt(user),
-      tools: null,
-      _routeReason: `Greeting word: "${cleaned}"`,
-    };
-  }
-
-  // Contact card — static response
+  // ── Gate 2: Contact card — static response ──
   if (CONTACT_CARD_PATTERNS.some((p) => p.test(message))) {
     console.log(`[orchestrator] Static → contact_card (0ms)`);
     return {
@@ -2141,101 +2306,77 @@ export function tryFastRoute(
     };
   }
 
-  // Confirmation with pending action
-  const CONFIRMATION_WORDS = [
-    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "kk",
-    "do it", "go ahead", "send it", "go for it", "confirm", "approved",
-    "sounds good", "perfect", "got it", "cool", "great", "awesome", "nice",
-    "no", "nah", "nope", "cancel", "dont", "don't", "stop", "never mind",
-  ];
-
-  const startsWithConfirmation = CONFIRMATION_WORDS.some(
-    (w) => cleaned === w || cleaned.startsWith(w + " "),
-  );
-
+  // ── Gate 3: Confirmation — MUST run before quick-exit/greeting ──
+  // "yeah", "ok", "cool" after a pending action = confirmation, not casual.
   const lastAssistant = recentChat
     ?.slice().reverse().find((m) => m.role === "assistant")?.content ?? "";
   const hasPendingAction = lastAssistant.includes("<pending_action");
   const hasConfirmationQuestion = /\b(want me to|shall i|should i|go ahead)\b/i.test(lastAssistant)
     && /\?\s*$/.test(lastAssistant.trim());
 
-  if (startsWithConfirmation && (hasPendingAction || hasConfirmationQuestion)) {
-    console.log(`[orchestrator] Confirmation → ${MODELS.agent_light} (approving pending action)`);
-    return {
-      path: "agent",
-      model: MODELS.agent_light,
-      maxTokens: 1024,
-      systemPrompt: buildConfirmationPrompt(user),
-      tools: AGENT_TOOLS,
-      contextDepth: "minimal",
-      _routeReason: `Confirmation: "${cleaned}" with ${hasPendingAction ? "pending_action" : "confirmation question"} in last assistant msg`,
-    };
+  if (hasPendingAction || hasConfirmationQuestion) {
+    const CONFIRMATION_WORDS = [
+      "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "k", "kk",
+      "do it", "go ahead", "send it", "go for it", "confirm", "approved",
+      "sounds good", "perfect", "got it", "cool", "great", "awesome", "nice",
+      "no", "nah", "nope", "cancel", "dont", "don't", "stop", "never mind",
+    ];
+    const startsWithConfirmation = CONFIRMATION_WORDS.some(
+      (w) => cleaned === w || cleaned.startsWith(w + " "),
+    );
+    if (startsWithConfirmation) {
+      const confirmTools = detectConfirmationTools(lastAssistant);
+      console.log(`[orchestrator] Confirmation → ${MODELS.agent_light} (${confirmTools.length} tools: ${confirmTools.map(t => t.function.name).join(", ")})`);
+      return {
+        path: "agent",
+        model: MODELS.agent_light,
+        maxTokens: 1024,
+        systemPrompt: buildConfirmationPrompt(user),
+        tools: confirmTools,
+        contextDepth: "minimal",
+        _routeReason: `Confirmation: "${cleaned}" with ${hasPendingAction ? "pending_action" : "confirmation question"} → ${confirmTools.length} tools`,
+      };
+    }
   }
 
-  // Tier 2: Casual — short message, no substance keywords
-  // GUARD: If the message looks like a follow-up to a substantive conversation
-  // ("yeah please", "tell me more", "go on"), let it fall through to the nano
-  // router which can read conversational context and route properly.
-  const FOLLOW_UP_PATTERNS = /\b(?:yeah\s+please|yes\s+please|go\s+on|tell\s+me\s+more|more\s+(?:detail|info|please)|keep\s+going|continue|elaborate|explain|expand|what\s+else|and\s*\?)\b/i;
-  const lastAssistantForCasual = recentChat
-    ?.slice().reverse().find((m) => m.role === "assistant")?.content ?? "";
-  const isExplicitFollowUp = FOLLOW_UP_PATTERNS.test(message) && lastAssistantForCasual.length > 80;
-
-  // CONTINUITY GUARD: Short messages ending in "?" after a substantive assistant
-  // response are almost always follow-up questions about the active topic (e.g.
-  // "800?" after discussing Boeing planes = "what about the 737-800?"). These
-  // must NOT be routed to casual/nano which lacks conversational continuity.
-  // Similarly, bare words/numbers that reference something the assistant just
-  // discussed should be treated as follow-ups, not casual chat.
-  const isImplicitFollowUp = lastAssistantForCasual.length > 100 && (
-    // Ends with "?" — it's a question about what was just said
-    /\?\s*$/.test(cleaned) ||
-    // Pure number or number-word ("800", "the second one", "3rd") — likely a reference
-    /^\d+$/.test(cleaned) ||
-    // "and X?" or "what about X?" patterns
-    /^(?:and|but|or|what about|how about)\b/i.test(cleaned)
-  );
-
-  const isFollowUp = isExplicitFollowUp || isImplicitFollowUp;
-
-  if (
-    cleaned.split(/\s+/).length <= 3 &&
-    cleaned.length <= 20 &&
-    !hasSubstance(cleaned) &&
-    !isFollowUp
-  ) {
-    console.log(`[orchestrator] Casual → ${MODELS.fast}`);
+  // ── Gate 4: Greetings — only when there's no active conversation ──
+  if (GREETING_WORDS.has(cleaned) && lastAssistant.length < 50) {
+    console.log(`[orchestrator] Greeting → ${MODELS.fast} (contextual)`);
     return {
       path: "casual",
       model: MODELS.fast,
       maxTokens: 150,
-      systemPrompt: buildCasualSystemPrompt(user),
+      systemPrompt: buildGreetingSystemPrompt(user),
       tools: null,
-      _routeReason: `Short casual: ${cleaned.split(/\s+/).length} words, ${cleaned.length} chars, no substance keywords, no follow-up signals`,
+      _routeReason: `Greeting word: "${cleaned}"`,
     };
   }
 
-  // Tier 3: Slam-dunk light intent (high-precision regex)
-  const lightIntent = user.testing ? null : detectLightIntent(message);
-  const isCompound = lightIntent && isCompoundQuery(message);
-  if (lightIntent && lightIntent !== "transit" && !isCompound) {
-    const prefetch = detectPrefetch(message);
-    const tools = getToolSubset(lightIntent);
-    console.log(`[orchestrator] LightAgent(${lightIntent}) → ${MODELS.agent_light} | tools=${tools.map(t => t.function.name).join(",")}`);
+  // ── Gate 5: Quick-exit — only truly terminal words with no active thread ──
+  // Trimmed to unambiguous closers. "cool", "ok", "yeah" removed — those
+  // could be follow-ups or confirmations. Let nano decide for those.
+  const TERMINAL_WORDS = new Set([
+    "thanks", "thank you", "cheers", "ta", "thx", "thanks mate", "cheers mate",
+    "bye", "cya", "see ya", "later", "ttyl",
+    "lol", "haha", "hahaha", "lmao",
+  ]);
+  if (TERMINAL_WORDS.has(cleaned) && lastAssistant.length < 200) {
+    console.log(`[orchestrator] QuickExit → ${MODELS.agent_light} (context-aware)`);
     return {
-      path: "agent",
+      path: "casual",
       model: MODELS.agent_light,
-      maxTokens: 1024,
-      systemPrompt: buildLightAgentPrompt(user, lightIntent),
-      tools,
-      prefetch: prefetch.length > 0 ? prefetch : undefined,
-      contextDepth: "minimal",
-      skipAck: lightIntent === "reminder",
-      _routeReason: `Light agent (regex): intent="${lightIntent}", tools=[${tools.map(t => t.function.name).join(",")}]`,
+      maxTokens: 60,
+      systemPrompt: buildQuickExitSystemPrompt(user),
+      tools: null,
+      _routeReason: `Quick-exit word: "${cleaned}"`,
     };
   }
 
-  // No fast match — needs nano classification
+  // ── Everything else → nano router ──
+  // No regex casual gate. No substance keyword lists. No follow-up pattern
+  // matching. The nano LLM sees the full conversation and classifies with
+  // context — it knows "live track it" after a flight discussion is an action,
+  // not casual chat. This is the only way to be bulletproof.
   return null;
 }
 
@@ -2271,14 +2412,20 @@ function buildRoutingFromNano(
     const tools = getToolSubset(nano.category);
     const prefetch = detectPrefetch(message);
     console.log(`[orchestrator] Nano → light ${nano.category} (${(nano.confidence * 100).toFixed(0)}%) → ${MODELS.agent_light}`);
+
+    // Force tool call for automation intent - the LLM must call manage_automations
+    const forceToolChoice = (nano.category === "automation" || nano.category === "reminder")
+      ? "required" as const
+      : undefined;
+
     return {
       path: "agent",
       model: MODELS.agent_light,
       maxTokens: 1024,
       systemPrompt: buildLightAgentPrompt(user, nano.category),
       tools,
+      toolChoice: forceToolChoice,
       prefetch: prefetch.length > 0 ? prefetch : undefined,
-      contextDepth: "minimal",
       skipAck: nano.category === "reminder",
       _routeReason: `Nano light agent: "${nano.category}" (${(nano.confidence * 100).toFixed(0)}%)`,
       _nanoClassification: nano,
@@ -2288,17 +2435,23 @@ function buildRoutingFromNano(
   // Low confidence or "agent" → full agent (safety net)
   const prefetch = detectPrefetch(message);
   const profileNeeded = detectNeedsProfile(message);
-  console.log(`[orchestrator] Nano → full agent (${nano.category}/${(nano.confidence * 100).toFixed(0)}%) → plan=${MODELS.agent_plan} output=${MODELS.agent_output}`);
+
+  // Even on full agent path, force tool call if message is clearly about automations
+  const automationPattern = /\b(create|set up|make|add|build|enable|disable|turn off|turn on|list|show|delete|remove|test)\b.*\b(automation|automat|every\s+(day|morning|evening|week|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekday|hour)|recurring|scheduled|let me know when)\b/i;
+  const isAutomationMsg = automationPattern.test(message) || /\b(summarise|summarize|check|scan|monitor)\b.*\bevery\b/i.test(message);
+  const fullAgentToolChoice = isAutomationMsg ? "required" as const : undefined;
+
+  console.log(`[orchestrator] Nano → full agent (${nano.category}/${(nano.confidence * 100).toFixed(0)}%) → ${MODELS.agent_full}${isAutomationMsg ? " [forced tool_choice=required]" : ""}`);
   return {
     path: "agent",
-    model: MODELS.agent_plan,
-    outputModel: MODELS.agent_output,
+    model: MODELS.agent_full,
     maxTokens: 2048,
     systemPrompt: buildAgentSystemPrompt(user),
     tools: AGENT_TOOLS,
+    toolChoice: fullAgentToolChoice,
     prefetch: prefetch.length > 0 ? prefetch : undefined,
     needsProfile: profileNeeded,
-    _routeReason: `Full agent via nano: ${nano.category} (${(nano.confidence * 100).toFixed(0)}%)`,
+    _routeReason: `Full agent via nano: ${nano.category} (${(nano.confidence * 100).toFixed(0)}%)${isAutomationMsg ? " + forced automation tool" : ""}`,
     _nanoClassification: nano,
   };
 }
@@ -2383,7 +2536,7 @@ export async function executeRoute(
     const lastMsg = messages.pop()!;
     messages.push({
       role: "user",
-      content: `<context>Pre-fetched data (use if sufficient, but if results are empty or don't answer the question, search again with broader terms):\n${prefetchedEvidence}</context>`,
+      content: `<context>Pre-fetched data (use if sufficient, but if results are empty or don't answer the question, search again with broader terms):\nIMPORTANT: For calendar/schedule questions, ONLY use calendar_lookup tool results below. Do NOT supplement with learnings, memory, or other context — calendar_lookup queries the live API and is the single source of truth.\n${prefetchedEvidence}</context>`,
     });
     messages.push({
       role: "assistant",
@@ -2423,9 +2576,7 @@ async function agentLoop(
   executeToolCall: (name: string, args: Record<string, unknown>) => Promise<string>,
   logCtx?: OpenAILogContext,
 ): Promise<RouteResult> {
-  const planModel = routing.model!;
-  const outputModel = routing.outputModel ?? planModel;
-  const useSplitModels = outputModel !== planModel;
+  const model = routing.model!;
 
   let rounds = 0;
   let totalToolCalls = 0;
@@ -2437,47 +2588,21 @@ async function agentLoop(
 
     const isLastRound = rounds === MAX_TOOL_ROUNDS || totalToolCalls >= MAX_TOTAL_TOOL_CALLS - 2;
 
-    // Planning rounds: GPT-4.1 selects and calls tools (no reasoning overhead).
-    // 1024 tokens is plenty for tool call JSON — GPT-4.1 doesn't use reasoning tokens.
-    const useTools = useSplitModels ? true : !isLastRound;
-    const ep = `chat-agent-plan-r${rounds}`;
+    // On round 1, honour forced tool_choice from routing. After round 1, revert to "auto"
+    const roundToolChoice = (rounds === 1 && routing.toolChoice) ? routing.toolChoice : undefined;
+
+    const ep = `chat-agent-r${rounds}`;
     const response = await callOpenAI(
-      planModel,
+      model,
       messages,
-      useSplitModels ? 1024 : routing.maxTokens,
-      useTools ? routing.tools : null,
+      routing.maxTokens,
+      !isLastRound ? routing.tools : null,
       logCtx ? { ...logCtx, endpoint: ep } : undefined,
+      roundToolChoice,
     );
     if (response._usage) usageEntries!.push({ ...response._usage, endpoint: ep });
 
     if (!response.tool_calls || response.tool_calls.length === 0) {
-      if (useSplitModels) {
-        // Planner decided no more tools needed — hand off to output model
-        const plannerDraft = response.content ?? "";
-        console.log(`[orchestrator] Plan model done (round ${rounds}), handing to ${outputModel} for output`);
-
-        const outputMessages = [...messages];
-
-        const finalResponse = await callOpenAI(
-          outputModel, outputMessages, routing.maxTokens, null,
-          logCtx ? { ...logCtx, endpoint: "chat-agent-output" } : undefined,
-        );
-        if (finalResponse._usage) usageEntries!.push({ ...finalResponse._usage, endpoint: "chat-agent-output" });
-        return {
-          text: finalResponse.content ?? "",
-          pendingActions,
-          _usage: usageEntries,
-          _agentTrace: {
-            rounds,
-            total_tool_calls: totalToolCalls,
-            plan_model: planModel,
-            output_model: outputModel,
-            used_split_models: true,
-            planner_draft: plannerDraft.slice(0, 3000),
-            hit_max_rounds: false,
-          },
-        };
-      }
       return {
         text: response.content ?? "",
         pendingActions,
@@ -2485,8 +2610,8 @@ async function agentLoop(
         _agentTrace: {
           rounds,
           total_tool_calls: totalToolCalls,
-          plan_model: planModel,
-          output_model: outputModel,
+          plan_model: model,
+          output_model: model,
           used_split_models: false,
           hit_max_rounds: false,
         },
@@ -2572,14 +2697,13 @@ async function agentLoop(
     messages.push(...toolResults);
   }
 
-  // Max rounds reached — use output model for final response
+  // Max rounds reached — force a final response
   console.warn(`[orchestrator] Hit max tool rounds (${rounds}/${MAX_TOOL_ROUNDS}), total calls: ${totalToolCalls}, forcing response`);
-  const finalModel = useSplitModels ? outputModel : planModel;
   const finalResponse = await callOpenAI(
-    finalModel, messages, routing.maxTokens, null,
-    logCtx ? { ...logCtx, endpoint: "chat-agent-output" } : undefined,
+    model, messages, routing.maxTokens, null,
+    logCtx ? { ...logCtx, endpoint: "chat-agent-final" } : undefined,
   );
-  if (finalResponse._usage) usageEntries!.push({ ...finalResponse._usage, endpoint: "chat-agent-output" });
+  if (finalResponse._usage) usageEntries!.push({ ...finalResponse._usage, endpoint: "chat-agent-final" });
   return {
     text: finalResponse.content ?? "got a bit tangled up, can you try that again?",
     pendingActions,
@@ -2587,9 +2711,9 @@ async function agentLoop(
     _agentTrace: {
       rounds,
       total_tool_calls: totalToolCalls,
-      plan_model: planModel,
-      output_model: finalModel,
-      used_split_models: useSplitModels,
+      plan_model: model,
+      output_model: model,
+      used_split_models: false,
       hit_max_rounds: true,
     },
   };
@@ -2687,6 +2811,7 @@ async function callOpenAI(
   maxTokens: number,
   tools: ToolDefinition[] | null,
   logCtx?: OpenAILogContext,
+  toolChoice?: "auto" | "required" | { type: "function"; function: { name: string } },
 ): Promise<OpenAIMessage> {
   const isGpt5 = model.startsWith("gpt-5");
   const body: Record<string, unknown> = {
@@ -2698,8 +2823,8 @@ async function callOpenAI(
 
   if (tools && tools.length > 0) {
     body.tools = tools;
-    body.tool_choice = "auto";
-    body.parallel_tool_calls = true; // Enable parallel tool calling
+    body.tool_choice = toolChoice ?? "auto";
+    body.parallel_tool_calls = true;
   }
 
   const MAX_RETRIES = 2;

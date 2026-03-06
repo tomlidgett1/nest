@@ -148,18 +148,19 @@ def _escape_applescript(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-async def send_imessage(phone: str, text: str, *, chat_guid: str | None = None) -> bool:
+async def send_imessage(phone: str, text: str, *, chat_guid: str | None = None, split: bool = True) -> bool:
     """Send *text* as one or more iMessages.
 
     If *chat_guid* is provided (e.g. for group chats), sends to that chat
     directly via ``chat id``. Otherwise sends to *phone* as a buddy (1:1 DM).
+    If *split* is False, send the entire text as a single bubble (no splitting).
     """
     clean = strip_markdown(text)
     if not clean:
         logger.warning("Empty message after markdown stripping, skipping")
         return False
 
-    chunks = _split_conversational(clean)
+    chunks = [clean] if not split else _split_conversational(clean)
     target_label = f"chat {chat_guid}" if chat_guid else phone
     logger.info(
         "Sending %d message(s) to %s (total %d chars)",

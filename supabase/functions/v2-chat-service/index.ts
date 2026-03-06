@@ -21,7 +21,7 @@ import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 import { appendToConversation } from "../_shared/conversation-store.ts";
 import { serverSideRAG } from "../_shared/server-rag.ts";
 import { getGoogleAccessToken, fetchCalendarTimezone } from "../_shared/gmail-helpers.ts";
-import { resolveTimezone, TimezoneHolder } from "../_shared/timezone-resolver.ts";
+import { resolveTimezone, TimezoneHolder, DEFAULT_TZ } from "../_shared/timezone-resolver.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
@@ -118,8 +118,9 @@ Deno.serve(async (req: Request) => {
     let userLearnings: any[] = [];
     let pdlWelcomeContext: string | undefined;
     let connectedAccounts: Array<{ email: string; isPrimary: boolean; provider: "google" | "microsoft" }> = [];
-    let userTimezone = "Australia/Sydney";
+    let userTimezone = DEFAULT_TZ;
     let locationCity: string | undefined;
+    let currentLocation: string | undefined;
     let totalMessageCountResult: any = { count: 0 };
     let userProfile: { name: string | null; email: string | null; phone: string | null } = { name: null, email: null, phone: null };
     let dailyBriefingData: any = null;
@@ -389,6 +390,17 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      // Resolve group owner's timezone from DB (not hardcoded)
+      try {
+        const { data: _groupTzRow } = await supabaseAdmin
+          .from("user_google_accounts")
+          .select("timezone")
+          .eq("user_id", userId)
+          .eq("is_primary", true)
+          .maybeSingle();
+        if (_groupTzRow?.timezone) userTimezone = _groupTzRow.timezone as string;
+      } catch { /* non-blocking */ }
+
       console.log(
         `[chat] Group mode: ${recentChat.length} msgs, ` +
         `${groupParticipantProfiles ? groupParticipantProfiles.split("\n").length : 0} profiles, ` +
@@ -403,18 +415,18 @@ Deno.serve(async (req: Request) => {
         .eq("user_id", userId)
         .eq("is_primary", true)
         .maybeSingle();
-      const _prefetchTz = (_tzRow?.timezone as string) || "Australia/Sydney";
+      const _prefetchTz = (_tzRow?.timezone as string) || DEFAULT_TZ;
       const today = new Date().toLocaleDateString("en-CA", { timeZone: _prefetchTz });
       const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString("en-CA", { timeZone: _prefetchTz });
 
-      const [recentChatResult, _userMemory, _userProfile, _richProfile, imsgUserRow, linkedAccountsResult, linkedMicrosoftAccountsResult, userLearningsResult, _totalMessageCountResult, _briefingResult, _commitmentsResult] = await Promise.all([
+      const [recentChatResult, _userMemory, _userProfile, _richProfile, imsgUserRow, linkedAccountsResult, linkedMicrosoftAccountsResult, userLearningsResult, _totalMessageCountResult, _briefingResult, _commitmentsResult, _locationLearningsResult] = await Promise.all([
         supabaseAdmin
           .from("v2_chat_messages")
           .select("role, content, created_at")
           .eq("user_id", userId)
           .in("role", ["user", "assistant"])
           .order("created_at", { ascending: false })
-          .limit(isAppPath ? 50 : 20),
+          .limit(isAppPath ? 70 : 70),
         getUserMemory(userId, supabaseAdmin),
         loadUserProfile(userId),
         loadRichProfile(userId),
@@ -459,6 +471,16 @@ Deno.serve(async (req: Request) => {
           .or(`and(target_date.gte.${today},target_date.lte.${nextWeek}),target_date.is.null`)
           .order("target_date", { ascending: true, nullsFirst: false })
           .limit(15),
+        // Separate query for location learnings — the main learnings query (limit 50) may not include them
+        supabaseAdmin
+          .from("v2_user_learnings")
+          .select("content, confidence")
+          .eq("user_id", userId)
+          .eq("category", "location")
+          .eq("active", true)
+          .gte("confidence", 0.5)
+          .order("last_observed_at", { ascending: false })
+          .limit(5),
       ]);
 
       recentChat = (recentChatResult.data ?? [])
@@ -516,7 +538,7 @@ Deno.serve(async (req: Request) => {
       const accounts = googleAccounts;
 
       const primaryAccount = accounts.find((a: any) => a.is_primary) ?? accounts[0];
-      let dbTimezone = (primaryAccount?.timezone as string) ?? "Australia/Sydney";
+      let dbTimezone = (primaryAccount?.timezone as string) ?? DEFAULT_TZ;
 
       // Backfill from Google Calendar if missing in DB
       if (!primaryAccount?.timezone && primaryAccount) {
@@ -549,19 +571,53 @@ Deno.serve(async (req: Request) => {
         emotionalWeight: (l.emotional_weight as string) ?? "medium",
       }));
 
-      // ── Three-layer timezone resolution ──
-      // Priority: 1) client payload  2) context inference  3) database
+      // Resolve current location from dedicated location learnings query
+      const locationLearnings = (_locationLearningsResult.data ?? []) as Array<{ content: string; confidence: number }>;
+      console.log(`[chat] Location learnings: ${locationLearnings.length} — ${locationLearnings.map(l => `"${l.content}"`).join(", ")}`);
+
+      for (const ll of locationLearnings) {
+        const locMatch = ll.content.match(
+          /(?:currently\s+in|visiting|staying\s+in|travelling\s+(?:to|in)|(?:^|\s)in|at)\s+([A-Z][A-Za-z\s\-']+)/i,
+        );
+        if (locMatch) {
+          const candidate = locMatch[1].trim();
+          if (candidate.length > 1 && !/^their\b/i.test(candidate)) {
+            currentLocation = candidate;
+            console.log(`[chat] Current location resolved: "${currentLocation}" (from: "${ll.content}")`);
+            break;
+          }
+        }
+      }
+
+      // ── Authoritative timezone resolution ──
+      // Priority: 1) client device timezone  2) database  3) location-based correction
       const tzResult = await resolveTimezone({
         dbTimezone,
         clientTimezone: payload.timezone,
-        recentMessages: [...recentChat, { role: "user", content: message }],
-        learnings: userLearnings,
         userId,
         supabase: supabaseAdmin,
       });
       userTimezone = tzResult.timezone;
       if (tzResult.changed) {
         console.log(`[chat] Timezone resolved: ${tzResult.timezone} (source: ${tzResult.source}, was: ${dbTimezone})`);
+      }
+
+      // Auto-correct timezone when learnings say the user is in a different region
+      // than their stored timezone. E.g. learnings say "Niseko" but tz is Asia/Tokyo not Australia/Sydney.
+      console.log(`[chat] Timezone auto-correct check: currentLocation="${currentLocation}", userTimezone="${userTimezone}", clientTz="${payload.timezone ?? "none"}"`);
+      if (currentLocation && !payload.timezone) {
+        const correctedTz = inferTimezoneFromLocation(currentLocation, userTimezone);
+        console.log(`[chat] inferTimezoneFromLocation("${currentLocation}", "${userTimezone}") → ${correctedTz ?? "null (no change needed)"}`);
+        if (correctedTz && correctedTz !== userTimezone) {
+          console.log(`[chat] Timezone auto-corrected: ${userTimezone} → ${correctedTz} (user is in ${currentLocation})`);
+          userTimezone = correctedTz;
+          supabaseAdmin
+            .from("user_google_accounts")
+            .update({ timezone: correctedTz, updated_at: new Date().toISOString() })
+            .eq("user_id", userId)
+            .then(() => console.log(`[chat] Timezone persisted: ${correctedTz}`))
+            .catch((e: unknown) => console.error(`[chat] Timezone persist failed:`, e));
+        }
       }
 
       console.log(`[chat] Rich profile loaded: ${richProfile ? `v${(richProfile as any).version ?? 1}, ${((richProfile as any).summary ?? "").length}c summary` : "NONE"}`);
@@ -591,6 +647,9 @@ Deno.serve(async (req: Request) => {
         content: message,
       });
 
+      // Engagement tracker: detect if user is replying to an automation message
+      trackAutomationEngagement(userId, message, supabaseAdmin).catch(() => {});
+
       // Universal learning extraction: extract facts, plans, preferences, people, etc. (fire-and-forget)
       extractLearnings(message, userId, supabaseAdmin).catch((e: unknown) =>
         console.error("[chat] Learning extraction failed (non-blocking):", e),
@@ -605,6 +664,7 @@ Deno.serve(async (req: Request) => {
       phone: isGroup ? "" : (userProfile.phone ?? ""),
       timezone: userTimezone,
       locationCity: isGroup ? undefined : locationCity,
+      currentLocation: isGroup ? undefined : (currentLocation ?? locationCity),
       connectedAccounts: isGroup ? undefined : (connectedAccounts.length > 0 ? connectedAccounts : undefined),
       isGroup,
       testing: isGroup ? false : testingPromptEnabled,
@@ -697,7 +757,7 @@ Deno.serve(async (req: Request) => {
       const stream = new ReadableStream({
         async start(controller) {
           try {
-            const ragPromise = serverSideRAG(message, recentChat, userId, supabaseAdmin)
+            const ragPromise = serverSideRAG(message, recentChat, userId, supabaseAdmin, userTimezone)
               .catch((e: unknown) => {
                 console.warn("[chat] Proactive RAG failed (non-blocking):", e);
                 return "";
@@ -842,7 +902,7 @@ Deno.serve(async (req: Request) => {
     // RAG runs in parallel with prefetch inside handleMessage
     const ragPromise =
       !isGroup && (!quickRoute || quickRoute.path === "agent")
-        ? serverSideRAG(message, recentChat, userId, supabaseAdmin).catch((e: unknown) => {
+        ? serverSideRAG(message, recentChat, userId, supabaseAdmin, userTimezone).catch((e: unknown) => {
             console.warn("[chat] Proactive RAG failed (non-blocking):", e);
             return "";
           })
@@ -989,6 +1049,16 @@ Deno.serve(async (req: Request) => {
   } catch (error) {
     const msg = error instanceof Error ? error.message : "unknown";
     console.error("[chat] Error:", msg);
+
+    // Drive scope errors → user-friendly message
+    if (msg.includes("drive_scope_required") || msg.includes("insufficient_scope")) {
+      return jsonResponse({
+        response:
+          "Google Drive permission is required to search your documents. " +
+          "Go to Settings > Accounts and grant Drive access for the relevant account.",
+        response_id: null,
+      }, 200);
+    }
 
     // Google auth errors → user-friendly message
     if (
@@ -1206,6 +1276,164 @@ function detectGroupVibe(
 
   if (scores[0].count < 2) return null;
   return scores[0].vibe;
+}
+
+/**
+ * Infer IANA timezone from a location name when it clearly conflicts with the stored timezone.
+ * Returns null if the location doesn't map to a known timezone or already matches.
+ */
+function inferTimezoneFromLocation(location: string, currentTz: string): string | null {
+  const loc = location.toLowerCase().trim();
+  const currentRegion = currentTz.split("/")[0];
+
+  const LOCATION_TZ_MAP: Array<{ pattern: RegExp; tz: string; region: string }> = [
+    // Japan
+    { pattern: /\b(tokyo|osaka|kyoto|niseko|sapporo|hokkaido|nagoya|fukuoka|hiroshima|okinawa|nara|kobe|yokohama|japan)\b/, tz: "Asia/Tokyo", region: "Asia" },
+    // Korea
+    { pattern: /\b(seoul|busan|korea|jeju)\b/, tz: "Asia/Seoul", region: "Asia" },
+    // China / HK / Taiwan
+    { pattern: /\b(shanghai|beijing|shenzhen|guangzhou|china|hong kong|hongkong)\b/, tz: "Asia/Shanghai", region: "Asia" },
+    { pattern: /\b(taipei|taiwan)\b/, tz: "Asia/Taipei", region: "Asia" },
+    // SE Asia
+    { pattern: /\b(singapore)\b/, tz: "Asia/Singapore", region: "Asia" },
+    { pattern: /\b(bangkok|phuket|chiang mai|thailand)\b/, tz: "Asia/Bangkok", region: "Asia" },
+    { pattern: /\b(bali|jakarta|indonesia)\b/, tz: "Asia/Jakarta", region: "Asia" },
+    { pattern: /\b(kuala lumpur|malaysia|kl)\b/, tz: "Asia/Kuala_Lumpur", region: "Asia" },
+    { pattern: /\b(hanoi|ho chi minh|saigon|vietnam)\b/, tz: "Asia/Ho_Chi_Minh", region: "Asia" },
+    // India
+    { pattern: /\b(mumbai|delhi|bangalore|india|goa|chennai|kolkata|hyderabad)\b/, tz: "Asia/Kolkata", region: "Asia" },
+    // Middle East
+    { pattern: /\b(dubai|abu dhabi|uae)\b/, tz: "Asia/Dubai", region: "Asia" },
+    // Australia
+    { pattern: /\b(sydney|melbourne|canberra)\b/, tz: "Australia/Sydney", region: "Australia" },
+    { pattern: /\b(brisbane|gold coast|queensland)\b/, tz: "Australia/Brisbane", region: "Australia" },
+    { pattern: /\b(perth|western australia)\b/, tz: "Australia/Perth", region: "Australia" },
+    { pattern: /\b(adelaide)\b/, tz: "Australia/Adelaide", region: "Australia" },
+    { pattern: /\b(hobart|tasmania)\b/, tz: "Australia/Hobart", region: "Australia" },
+    { pattern: /\b(darwin)\b/, tz: "Australia/Darwin", region: "Australia" },
+    // New Zealand
+    { pattern: /\b(auckland|wellington|christchurch|queenstown|new zealand|nz)\b/, tz: "Pacific/Auckland", region: "Pacific" },
+    // Europe
+    { pattern: /\b(london|manchester|birmingham|edinburgh|uk|england|scotland|wales)\b/, tz: "Europe/London", region: "Europe" },
+    { pattern: /\b(paris|france|lyon|marseille|nice)\b/, tz: "Europe/Paris", region: "Europe" },
+    { pattern: /\b(berlin|munich|frankfurt|germany|hamburg)\b/, tz: "Europe/Berlin", region: "Europe" },
+    { pattern: /\b(amsterdam|netherlands|rotterdam)\b/, tz: "Europe/Amsterdam", region: "Europe" },
+    { pattern: /\b(rome|milan|italy|florence|venice)\b/, tz: "Europe/Rome", region: "Europe" },
+    { pattern: /\b(madrid|barcelona|spain)\b/, tz: "Europe/Madrid", region: "Europe" },
+    { pattern: /\b(lisbon|portugal|porto)\b/, tz: "Europe/Lisbon", region: "Europe" },
+    { pattern: /\b(zurich|geneva|switzerland|bern)\b/, tz: "Europe/Zurich", region: "Europe" },
+    { pattern: /\b(vienna|austria)\b/, tz: "Europe/Vienna", region: "Europe" },
+    { pattern: /\b(stockholm|sweden)\b/, tz: "Europe/Stockholm", region: "Europe" },
+    { pattern: /\b(copenhagen|denmark)\b/, tz: "Europe/Copenhagen", region: "Europe" },
+    { pattern: /\b(oslo|norway)\b/, tz: "Europe/Oslo", region: "Europe" },
+    { pattern: /\b(helsinki|finland)\b/, tz: "Europe/Helsinki", region: "Europe" },
+    { pattern: /\b(dublin|ireland)\b/, tz: "Europe/Dublin", region: "Europe" },
+    { pattern: /\b(athens|greece|santorini|mykonos)\b/, tz: "Europe/Athens", region: "Europe" },
+    { pattern: /\b(istanbul|turkey)\b/, tz: "Europe/Istanbul", region: "Europe" },
+    // US
+    { pattern: /\b(new york|nyc|manhattan|brooklyn|boston|philadelphia|washington dc|miami|atlanta|charlotte)\b/, tz: "America/New_York", region: "America" },
+    { pattern: /\b(chicago|houston|dallas|austin|nashville|minneapolis|milwaukee|detroit)\b/, tz: "America/Chicago", region: "America" },
+    { pattern: /\b(denver|phoenix|salt lake|albuquerque)\b/, tz: "America/Denver", region: "America" },
+    { pattern: /\b(los angeles|la|san francisco|sf|seattle|portland|las vegas|san diego|vancouver)\b/, tz: "America/Los_Angeles", region: "America" },
+    { pattern: /\b(honolulu|hawaii)\b/, tz: "Pacific/Honolulu", region: "Pacific" },
+    // Canada
+    { pattern: /\b(toronto|montreal|ottawa)\b/, tz: "America/Toronto", region: "America" },
+    { pattern: /\b(calgary|edmonton)\b/, tz: "America/Edmonton", region: "America" },
+  ];
+
+  for (const entry of LOCATION_TZ_MAP) {
+    if (entry.pattern.test(loc)) {
+      if (entry.tz === currentTz) return null;
+      if (entry.region === currentRegion && entry.tz === currentTz) return null;
+      return entry.tz;
+    }
+  }
+
+  return null;
+}
+
+async function trackAutomationEngagement(
+  userId: string,
+  userMessage: string,
+  supabase: any,
+): Promise<void> {
+  // Find the most recent automation message (within 2 hours)
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const { data: recentAutoMsg } = await supabase
+    .from("v2_chat_messages")
+    .select("id, metadata, created_at")
+    .eq("user_id", userId)
+    .eq("role", "assistant")
+    .gte("created_at", twoHoursAgo)
+    .not("metadata", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!recentAutoMsg?.metadata?.automation_id) return;
+
+  const autoId = recentAutoMsg.metadata.automation_id;
+
+  // Check if there are any user messages between the automation message and now
+  const { count: msgsBetween } = await supabase
+    .from("v2_chat_messages")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("role", "user")
+    .gt("created_at", recentAutoMsg.created_at)
+    .lt("created_at", new Date().toISOString());
+
+  // Only count as engagement if this is the first reply after the automation message
+  if ((msgsBetween ?? 0) > 1) return;
+
+  // Simple sentiment: positive, negative, or neutral
+  const lower = userMessage.toLowerCase().trim();
+  const negative = /\b(stop|disable|turn off|don't|annoying|useless|spam|too much|not helpful|shut up|quiet|mute)\b/i.test(lower);
+  const positive = /\b(thanks|great|helpful|perfect|nice|love|good|useful|awesome|cheers|ta)\b/i.test(lower);
+  const sentiment = negative ? "negative" : positive ? "positive" : "neutral";
+
+  // Update the automation's run_history with engagement data
+  const { data: automation } = await supabase
+    .from("user_automations")
+    .select("id, config")
+    .eq("id", autoId)
+    .maybeSingle();
+
+  if (!automation) return;
+
+  const config = automation.config as Record<string, unknown>;
+  const runHistory = ((config.run_history as any[]) ?? []);
+
+  // Find the most recent delivered run and mark it
+  for (let i = runHistory.length - 1; i >= 0; i--) {
+    if (runHistory[i].delivered && runHistory[i].user_engaged === null) {
+      runHistory[i].user_engaged = true;
+      runHistory[i].user_feedback = sentiment;
+      break;
+    }
+  }
+
+  // Compute engagement rate
+  const deliveredRuns = runHistory.filter((r: any) => r.delivered);
+  const engagedRuns = deliveredRuns.filter((r: any) => r.user_engaged === true);
+  const engagementRate = deliveredRuns.length > 0 ? Math.round((engagedRuns.length / deliveredRuns.length) * 100) : null;
+
+  await supabase.from("user_automations").update({
+    config: { ...config, run_history: runHistory, engagement_rate: engagementRate },
+  }).eq("id", autoId);
+
+  console.log(`[chat] Automation engagement tracked: ${autoId} | sentiment: ${sentiment} | rate: ${engagementRate}%`);
+
+  // Auto-disable on repeated negative feedback (3+ consecutive negative)
+  if (negative) {
+    const recentNegative = runHistory.slice(-3).filter((r: any) => r.user_feedback === "negative").length;
+    if (recentNegative >= 3) {
+      await supabase.from("user_automations").update({
+        active: false, next_run_at: null, updated_at: new Date().toISOString(),
+      }).eq("id", autoId);
+      console.log(`[chat] Auto-disabled automation ${autoId} after 3 consecutive negative feedback`);
+    }
+  }
 }
 
 function jsonResponse(body: Record<string, unknown>, status: number): Response {

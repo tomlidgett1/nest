@@ -20,7 +20,6 @@ import { enrichByIdentity, profileToContext } from "../_shared/pdl-enrichment.ts
 import type { PDLProfile } from "../_shared/pdl-enrichment.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
-const tavilyApiKey = Deno.env.get("TAVILY_API_KEY") ?? "";
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
@@ -698,19 +697,29 @@ async function deepScanOutlookCalendar(
   }
 }
 
-// ── Web Search ──────────────────────────────────────────────
+// ── Web Search (OpenAI Responses API) ───────────────────────
 
 async function searchWeb(query: string): Promise<string | null> {
-  if (!tavilyApiKey) return null;
+  if (!openaiApiKey) return null;
   try {
-    const resp = await fetch("https://api.tavily.com/search", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ api_key: tavilyApiKey, query, max_results: 3, search_depth: "basic" }),
+      headers: { Authorization: `Bearer ${openaiApiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        tools: [{ type: "web_search_preview" }],
+        input: query,
+      }),
     });
     if (resp.ok) {
       const data = await resp.json();
-      return data.answer ?? data.results?.map((r: any) => r.content).join("\n").slice(0, 1000) ?? null;
+      const text = data.output
+        ?.filter((item: any) => item.type === "message")
+        ?.flatMap((item: any) => item.content)
+        ?.filter((c: any) => c.type === "output_text")
+        ?.map((c: any) => c.text)
+        ?.join("\n") ?? null;
+      return text?.slice(0, 1000) ?? null;
     }
   } catch { /* fall through */ }
   return null;

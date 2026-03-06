@@ -1,25 +1,25 @@
 // Memory service — rolling conversation summary + self-learning layers.
 //
-// Strategy: 20 raw messages for immediate context + a rolling summary
+// Strategy: 70 raw messages for immediate context + a rolling summary
 // that captures everything before that. The summary is updated every
-// 20 new messages using a cheap GPT-4.1-mini call (~$0.0006 each).
+// 4 new messages using a cheap GPT-4.1-mini call (~$0.0006 each).
+// This aggressive cadence ensures nothing falls through the gap between
+// raw history scrolling off and the summary capturing it.
 //
 // Self-learning layers:
 //   Layer 1: Learned facts — extracted during summarisation, persisted to v2_user_learnings
 //   Layer 2: Relationship memory — relationship_notes + key_moments on v2_user_memory
 //   Layer 3: Identity model — deep psychological profile, updated every ~100 messages
-//
-// This gives Nest near-perfect memory at ~2000 tokens per request
-// instead of ~15,000 for raw history.
 
 import { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import type { IdentityModel } from "./personality-agent.ts";
 import { logApiUsage } from "./cost-tracker.ts";
+import { embedLearning, embedNarrativeThreads } from "./conversation-embedder.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
-const SUMMARY_INTERVAL = 20;
-const IDENTITY_UPDATE_INTERVAL = 100; // every 5th summary cycle
+const SUMMARY_INTERVAL = 4;
+const IDENTITY_UPDATE_INTERVAL = 100;
 
 export interface OpenLoop {
   topic: string;
@@ -91,7 +91,7 @@ export async function updateMemory(
   // Fetch the messages that haven't been summarised yet (between
   // last summary and now), plus a small overlap for continuity.
   const unsummarisedCount = totalMessageCount - lastSummarisedAt;
-  const fetchCount = Math.min(unsummarisedCount + 4, 60);
+  const fetchCount = Math.min(unsummarisedCount + 6, 30);
 
   const { data: rawMessages } = await supabase
     .from("v2_chat_messages")
@@ -149,6 +149,13 @@ export async function updateMemory(
     await saveExtractedLearnings(userId, newSummary.learnedFacts, supabase);
   }
 
+  // Embed narrative threads from open_loops (Layer 3 of memory search)
+  if (newSummary.openLoops && newSummary.openLoops.length > 0) {
+    embedNarrativeThreads(supabase, userId, newSummary.openLoops, existing?.openLoops ?? null).catch(e =>
+      console.error("[memory-service] Narrative thread embedding failed:", (e as Error).message),
+    );
+  }
+
   // Identity model update (Layer 3) — every ~100 messages
   if (totalMessageCount % IDENTITY_UPDATE_INTERVAL < SUMMARY_INTERVAL) {
     console.log(`[memory-service] Triggering identity model update at message ${totalMessageCount}`);
@@ -191,7 +198,7 @@ async function summariseConversation(
   supabase?: SupabaseClient,
 ): Promise<SummaryResult | null> {
   const conversationText = messages
-    .map((m) => `${m.role}: ${m.content.slice(0, 300)}`)
+    .map((m) => `${m.role}: ${m.content.slice(0, 600)}`)
     .join("\n");
 
   const openLoopsContext = existingOpenLoops && existingOpenLoops.length > 0
@@ -233,7 +240,7 @@ Produce a JSON object with exactly these fields:
       "firstMentioned": "ISO date when first mentioned (carry forward from existing)",
       "lastMentioned": "ISO date of most recent mention",
       "status": "open | resolved | stale",
-      "context": "1-2 sentences: when/why this came up and how the user felt about it"
+      "context": "3-5 sentences telling the full story across sessions: when/why this first came up, how it has evolved, key decisions or changes, and how the user feels about it now. This narrative should connect the dots across multiple conversations so someone reading it later can understand the full arc."
     }
   ],
   "emotional_arc": "1-2 sentences describing how the user's overall mood and energy has shifted across recent conversations.",
@@ -417,9 +424,12 @@ async function saveExtractedLearnings(
           })
           .eq("id", existing.id);
         if (updateErr) console.error(`[memory-service] Learning reinforce failed:`, updateErr.message);
-        else console.log(`[memory-service] Reinforced learning: ${l.category} — "${l.content.slice(0, 60)}"`);
+        else {
+          console.log(`[memory-service] Reinforced learning: ${l.category} — "${l.content.slice(0, 60)}"`);
+          embedLearning(supabase, userId, existing.id, l.category, l.content, l.context || null).catch(() => {});
+        }
       } else {
-        const { error: insertErr } = await supabase.from("v2_user_learnings").insert({
+        const { data: inserted, error: insertErr } = await supabase.from("v2_user_learnings").insert({
           user_id: userId,
           category: l.category,
           content: l.content,
@@ -427,9 +437,14 @@ async function saveExtractedLearnings(
           emotional_weight: l.emotional_weight,
           confidence: l.confidence,
           source: "inferred",
-        });
+        }).select("id").single();
         if (insertErr) console.error(`[memory-service] Learning insert failed:`, insertErr.message, insertErr.details);
-        else console.log(`[memory-service] New learning: ${l.category} — "${l.content.slice(0, 60)}"`);
+        else {
+          console.log(`[memory-service] New learning: ${l.category} — "${l.content.slice(0, 60)}"`);
+          if (inserted?.id) {
+            embedLearning(supabase, userId, inserted.id, l.category, l.content, l.context || null).catch(() => {});
+          }
+        }
       }
     } catch (e) {
       console.error(`[memory-service] Learning save exception:`, (e as Error).message);
@@ -578,8 +593,9 @@ export async function extractLearnings(
           })
           .eq("id", existing.id);
         console.log(`[memory-service] Reinforced ${category}: "${content.slice(0, 60)}"`);
+        embedLearning(supabase, userId, existing.id, category, content, `Mentioned on ${today}`).catch(() => {});
       } else {
-        await supabase.from("v2_user_learnings").insert({
+        const { data: inserted } = await supabase.from("v2_user_learnings").insert({
           user_id: userId,
           category,
           content,
@@ -589,8 +605,11 @@ export async function extractLearnings(
           source: "inferred",
           target_date: l.target_date ?? null,
           expires_after: l.expires_after ?? null,
-        });
+        }).select("id").single();
         console.log(`[memory-service] New ${category}: "${content.slice(0, 60)}"${l.target_date ? ` → ${l.target_date}` : ""}`);
+        if (inserted?.id) {
+          embedLearning(supabase, userId, inserted.id, category, content, `Mentioned on ${today}`).catch(() => {});
+        }
       }
     }
   } catch (e) {

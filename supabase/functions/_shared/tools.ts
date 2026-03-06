@@ -10,7 +10,7 @@
 //   - Unified: compose_draft + reply_with_draft → send_draft (with reply_all)
 //   - Added: send_email, get_email, document_search, create_note,
 //            weather_lookup, get_meeting_detail
-//   - web_search: Tavily direct (fallback to OpenAI Responses API)
+//   - web_search: OpenAI Responses API with web_search_preview
 //   - 10s timeout on every external fetch (fetchWithTimeout)
 //   - 1-retry with backoff on external APIs (retryFetch)
 //   - Contacts warmup: fire-and-forget, non-blocking, per-session
@@ -34,12 +34,12 @@ import {
   detectAccountProvider,
   type AccountToken,
 } from "./gmail-helpers.ts";
+import { GOOGLE_SCOPES, hasScope } from "./google-scopes.ts";
 
 // ── Config ───────────────────────────────────────────────────
 
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY") ?? "";
 const PDL_API_KEY = Deno.env.get("PDL_API_KEY") ?? "";
-const TAVILY_API_KEY = Deno.env.get("TAVILY_API_KEY") ?? "";
 const WEATHER_API_KEY = Deno.env.get("WEATHER_API_KEY") ?? "";
 const GOOGLE_MAPS_API_KEY = Deno.env.get("GOOGLE_MAPS_API_KEY") ?? "";
 
@@ -50,7 +50,7 @@ const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 const GRAPH_API = "https://graph.microsoft.com/v1.0/me";
 
 const FETCH_TIMEOUT_MS = 10_000;
-const DEFAULT_TZ = "Australia/Sydney";
+const DEFAULT_TZ = "UTC";
 
 // ── Contacts warmup cache ────────────────────────────────────
 // Google People API requires a warmup call before search works.
@@ -206,6 +206,7 @@ function isGoogleAuthError(msg: string): boolean {
   return (
     msg.includes("GOOGLE_REAUTH_REQUIRED") ||
     msg.includes("invalid_grant") ||
+    msg.includes("insufficient_scope") ||
     msg.includes("Google token refresh failed") ||
     msg.includes("Token has been expired or revoked")
   );
@@ -255,6 +256,7 @@ async function dispatch(
     case "get_meeting_notes":     return getMeetingNotes(userId, supabase, args);
     case "manage_meeting_recording": return manageMeetingRecording(userId, supabase, args);
     case "strava_search":           return stravaSearch(userId, supabase, args);
+    case "manage_automations":      return manageAutomations(userId, supabase, args);
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -430,7 +432,8 @@ async function calendarLookup(
                   return [];
                 }
                 const data = await resp.json();
-                return (data.value ?? []).map((e: any) => ({
+                const events = data.value ?? [];
+                return events.map((e: any) => ({
                   ...formatMicrosoftCalendarEvent(e, tz),
                   account: acct.email,
                   calendar: cal.name,
@@ -581,12 +584,13 @@ function formatMicrosoftCalendarEvent(e: any, tz?: string): Record<string, unkno
 function resolveTimeRange(range: string, tz: string): { timeMin: string; timeMax: string } {
   const now = new Date();
   const todayLocal = getLocalDateParts(now, tz);
+  const utcOffsetMs = getUtcOffsetMs(now, tz);
 
   const lower = (range ?? "today").toLowerCase().trim();
 
   const makeDay = (year: number, month: number, day: number) => ({
-    timeMin: new Date(`${year}-${pad(month)}-${pad(day)}T00:00:00`).toISOString(),
-    timeMax: new Date(`${year}-${pad(month)}-${pad(day)}T23:59:59`).toISOString(),
+    timeMin: new Date(Date.UTC(year, month - 1, day, 0, 0, 0) - utcOffsetMs).toISOString(),
+    timeMax: new Date(Date.UTC(year, month - 1, day, 23, 59, 59) - utcOffsetMs).toISOString(),
   });
 
   switch (lower) {
@@ -752,6 +756,16 @@ function getLocalDateParts(date: Date, tz: string): { year: number; month: numbe
   const str = fmt.format(date); // "YYYY-MM-DD"
   const [y, m, d] = str.split("-").map(Number);
   return { year: y, month: m, day: d };
+}
+
+/**
+ * Get the UTC offset in milliseconds for a timezone at a given instant.
+ * Positive means ahead of UTC (e.g. +9h for Asia/Tokyo = +32400000).
+ */
+function getUtcOffsetMs(date: Date, tz: string): number {
+  const utcStr = date.toLocaleString("sv-SE", { timeZone: "UTC" });
+  const localStr = date.toLocaleString("sv-SE", { timeZone: tz });
+  return new Date(localStr + "Z").getTime() - new Date(utcStr + "Z").getTime();
 }
 
 function pad(n: number): string {
@@ -1188,14 +1202,16 @@ async function hybridSearchWithFallback(
 }
 
 async function temporalCalendarSearchFromQuery(
-  query: string,
-  supabase: SupabaseClient,
-  userId: string,
-  userTz = DEFAULT_TZ,
+  _query: string,
+  _supabase: SupabaseClient,
+  _userId: string,
+  _userTz = DEFAULT_TZ,
 ): Promise<any[]> {
-  const lower = query.toLowerCase();
+  // Disabled: indexed calendar_summary entries are stale. Live calendar_lookup
+  // is the authoritative source for schedule data.
+  return [];
 
-  // Detect temporal intent — explicit date words or implicit date-seeking patterns
+  const lower = _query.toLowerCase();
   const hasTemporalKeyword = /\b(today|tomorrow|yesterday|this week|last week|next week|this month|last month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(lower);
   const hasDateSeekingIntent = /\b(date|when|first|last|earliest|latest|most recent)\b/i.test(lower);
 
@@ -2041,9 +2057,10 @@ async function createOutlookDraft(
   const toList = Array.isArray(args.to) ? args.to : [args.to as string];
   const ccList = args.cc ? (Array.isArray(args.cc) ? args.cc : [args.cc as string]) : [];
 
-  const htmlBody = (args.body as string ?? "").includes("<br") || (args.body as string ?? "").includes("<p")
-    ? (args.body as string)
-    : (args.body as string ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>\n");
+  const bodyStr = (args.body as string) ?? "";
+  const htmlBody = bodyStr.includes("<br") || bodyStr.includes("<p")
+    ? bodyStr
+    : bodyStr.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>\n");
 
   const message: Record<string, unknown> = {
     subject: args.subject,
@@ -2165,35 +2182,11 @@ async function sendEmail(
 }
 
 // ══════════════════════════════════════════════════════════════
-// WEB SEARCH (direct — no LLM intermediary)
+// WEB SEARCH (OpenAI Responses API with web_search_preview)
 // ══════════════════════════════════════════════════════════════
 
 async function webSearch(args: Record<string, unknown>): Promise<unknown> {
-  if (!TAVILY_API_KEY) return webSearchViaOpenAI(args.query as string);
-
-  const resp = await retryFetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      api_key: TAVILY_API_KEY,
-      query: args.query,
-      max_results: 5,
-      include_answer: true,
-      include_raw_content: false,
-    }),
-  });
-  if (!resp.ok) throw new Error(`Web search failed (${resp.status})`);
-
-  const data = await resp.json();
-  return {
-    answer: data.answer ?? null,
-    results: (data.results ?? []).map((r: any) => ({
-      title: r.title, url: r.url, snippet: r.content?.slice(0, 300), score: r.score,
-    })),
-  };
-}
-
-async function webSearchViaOpenAI(query: string): Promise<unknown> {
+  const query = args.query as string;
   const resp = await retryFetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -2203,7 +2196,7 @@ async function webSearchViaOpenAI(query: string): Promise<unknown> {
       input: query,
     }),
   });
-  if (!resp.ok) throw new Error(`Web search (OpenAI) failed (${resp.status})`);
+  if (!resp.ok) throw new Error(`Web search failed (${resp.status})`);
 
   const data = await resp.json();
   const text = data.output
@@ -2465,7 +2458,7 @@ async function manageReminder(
  * Get the current wall-clock time in a given IANA timezone.
  * Returns a Date object whose UTC value corresponds to "now" in that timezone.
  */
-function nowInTimezone(tz: string): { localHour: number; localMinute: number; localDate: number; localMonth: number; localDow: number; utcNow: Date } {
+export function nowInTimezone(tz: string): { localHour: number; localMinute: number; localDate: number; localMonth: number; localDow: number; utcNow: Date } {
   const utcNow = new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
@@ -2487,7 +2480,7 @@ function nowInTimezone(tz: string): { localHour: number; localMinute: number; lo
 /**
  * Convert a local hour:minute in a timezone to a UTC Date for today (or tomorrow if past).
  */
-function localTimeToUtc(hour: number, minute: number, tz: string, dateOverride?: { date: number; month: number }): Date {
+export function localTimeToUtc(hour: number, minute: number, tz: string, dateOverride?: { date: number; month: number }): Date {
   const { localHour, localMinute, localDate, localMonth, utcNow } = nowInTimezone(tz);
 
   const offsetMs = (() => {
@@ -2646,6 +2639,31 @@ async function documentSearch(
     getAllMicrosoftAccountTokens(supabase, userId).catch(() => [] as AccountToken[]),
   ]);
 
+  const driveAccounts = googleAccounts.filter(
+    (acct) => hasScope(acct.scopes, GOOGLE_SCOPES.DRIVE_READONLY),
+  );
+  const accountsMissingDrive = googleAccounts.filter(
+    (acct) => !hasScope(acct.scopes, GOOGLE_SCOPES.DRIVE_READONLY),
+  );
+
+  if (driveAccounts.length === 0 && msAccounts.length === 0) {
+    return {
+      error: "drive_scope_required",
+      error_type: "insufficient_scope",
+      accounts_missing_scope: accountsMissingDrive.map((a) => ({
+        account_id: a.accountId,
+        email: a.email,
+      })),
+      hint: "Google Drive permission required. Please grant access in Settings > Accounts.",
+    };
+  }
+
+  if (accountsMissingDrive.length > 0) {
+    console.warn(
+      `[tools] document_search: ${accountsMissingDrive.length} Google account(s) missing drive.readonly scope — skipping Drive for those`,
+    );
+  }
+
   const mimeTypes: Record<string, string> = {
     document: "application/vnd.google-apps.document",
     spreadsheet: "application/vnd.google-apps.spreadsheet",
@@ -2658,7 +2676,7 @@ async function documentSearch(
   const fields = "files(id,name,mimeType,modifiedTime,owners,sharingUser,webViewLink,size)";
 
   const googleResults = Promise.all(
-    googleAccounts.map(async (acct) => {
+    driveAccounts.map(async (acct) => {
       try {
         const [fullTextResp, nameResp] = await Promise.all([
           retryFetch(
@@ -2678,6 +2696,14 @@ async function documentSearch(
             { headers: { Authorization: `Bearer ${acct.accessToken}` } },
           ),
         ]);
+
+        if (!fullTextResp.ok && (fullTextResp.status === 403 || fullTextResp.status === 401)) {
+          const errBody = await fullTextResp.text().catch(() => "");
+          if (/insufficient/i.test(errBody) || /accessNotConfigured/i.test(errBody) || /PERMISSION_DENIED/i.test(errBody)) {
+            console.warn(`[tools] document_search: Drive API rejected for ${acct.email} (${fullTextResp.status}) — token lacks drive.readonly`);
+            return { _driveAuthNeeded: true, email: acct.email, accountId: acct.accountId };
+          }
+        }
 
         const fullTextData = fullTextResp.ok ? await fullTextResp.json() : { files: [] };
         const nameData = nameResp.ok ? await nameResp.json() : { files: [] };
@@ -2737,8 +2763,20 @@ async function documentSearch(
 
   const [gResults, mResults] = await Promise.all([googleResults, msResults]);
 
+  const driveAuthNeeded = gResults.flat().filter((r: any) => r?._driveAuthNeeded);
+  const validGResults = gResults.flat().filter((r: any) => !r?._driveAuthNeeded);
+
+  if (driveAuthNeeded.length > 0 && validGResults.length === 0 && mResults.flat().length === 0) {
+    return {
+      error: "drive_reconnect_required",
+      error_type: "insufficient_scope",
+      accounts: driveAuthNeeded.map((a: any) => ({ email: a.email, account_id: a.accountId })),
+      hint: "Google Drive access needs to be refreshed. Please reconnect your Google account in Settings > Accounts to grant Drive permission.",
+    };
+  }
+
   const seen = new Set<string>();
-  let results = [...gResults.flat(), ...mResults.flat()].filter((f: any) => {
+  let results = [...validGResults, ...mResults.flat()].filter((f: any) => {
     if (seen.has(f.file_id)) return false;
     seen.add(f.file_id);
     return true;
@@ -2751,7 +2789,14 @@ async function documentSearch(
     );
   }
 
-  return { results, count: results.length };
+  const response: Record<string, unknown> = { results, count: results.length };
+
+  if (accountsMissingDrive.length > 0) {
+    response.google_drive_unavailable = true;
+    response.google_drive_note = `Google Drive is not accessible for ${accountsMissingDrive.map(a => a.email).join(", ")}. These accounts need to be reconnected in Settings > Accounts to grant Drive permission.`;
+  }
+
+  return response;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2826,10 +2871,90 @@ function timezoneToCityName(tz: string): string {
 }
 
 // ══════════════════════════════════════════════════════════════
-// TRAVEL TIME (Google Maps Directions API)
+// TRAVEL TIME (Google Maps Directions API + Routes API v2 for transit)
 // ══════════════════════════════════════════════════════════════
 
 const DIRECTIONS_API = "https://maps.googleapis.com/maps/api/directions/json";
+const ROUTES_API = "https://routes.googleapis.com/directions/v2:computeRoutes";
+
+const TRANSIT_FIELD_MASK = [
+  "routes.legs.duration",
+  "routes.legs.steps.transitDetails",
+  "routes.legs.steps.startLocation",
+  "routes.legs.steps.endLocation",
+  "routes.legs.steps.polyline",
+  "routes.legs.steps.travelMode",
+  "routes.legs.steps.localizedValues",
+  "routes.legs.steps.navigationInstruction",
+  "routes.legs.stepsOverview",
+  "routes.localizedValues",
+  "routes.travelAdvisory",
+  "routes.legs.localizedValues",
+].join(",");
+
+async function transitViaRoutesAPI(
+  origin: string,
+  destination: string,
+  departureTime: string | undefined,
+  arrivalTime: string | undefined,
+  transitPreference: string | undefined,
+  allowedModes: string[] | undefined,
+): Promise<unknown> {
+  const body: Record<string, unknown> = {
+    origin: { address: origin },
+    destination: { address: destination },
+    travelMode: "TRANSIT",
+    computeAlternativeRoutes: true,
+  };
+
+  if (arrivalTime && arrivalTime !== "now") {
+    body.arrivalTime = new Date(arrivalTime).toISOString();
+  } else if (departureTime && departureTime !== "now") {
+    const depDate = new Date(departureTime);
+    if (!isNaN(depDate.getTime()) && depDate.getTime() > Date.now()) {
+      body.departureTime = depDate.toISOString();
+    }
+  }
+
+  const transitPreferences: Record<string, unknown> = {};
+  if (transitPreference === "less_walking" || transitPreference === "LESS_WALKING") {
+    transitPreferences.routingPreference = "LESS_WALKING";
+  } else if (transitPreference === "fewer_transfers" || transitPreference === "FEWER_TRANSFERS") {
+    transitPreferences.routingPreference = "FEWER_TRANSFERS";
+  }
+  if (allowedModes?.length) {
+    transitPreferences.allowedTravelModes = allowedModes.map((m: string) => m.toUpperCase());
+  }
+  if (Object.keys(transitPreferences).length) {
+    body.transitPreferences = transitPreferences;
+  }
+
+  console.log(`[tools] Routes API transit request: ${origin} → ${destination}`);
+
+  const resp = await fetchWithTimeout(ROUTES_API, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+      "X-Goog-FieldMask": TRANSIT_FIELD_MASK,
+    },
+    body: JSON.stringify(body),
+  }, FETCH_TIMEOUT_MS);
+
+  const data = await resp.json();
+
+  if (data.error) {
+    console.log(`[tools] Routes API error: ${data.error.message} (${data.error.status})`);
+    return null;
+  }
+
+  if (!data.routes?.length) {
+    console.log("[tools] Routes API returned 0 routes");
+    return null;
+  }
+
+  return parseTransitRoutesV2(data.routes, origin, destination);
+}
 
 async function travelTime(args: Record<string, unknown>): Promise<unknown> {
   const origin = args.origin as string | undefined;
@@ -2846,17 +2971,49 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
 
   const mode = (args.mode as string) ?? "driving";
   const departureTime = args.departure_time as string | undefined;
+  const arrivalTime = args.arrival_time as string | undefined;
 
+  // Transit uses the new Routes API v2 for better results
+  if (mode === "transit") {
+    try {
+      const transitPreference = args.transit_preference as string | undefined;
+      const allowedModes = args.allowed_transit_modes as string[] | undefined;
+      const result = await transitViaRoutesAPI(origin, destination, departureTime, arrivalTime, transitPreference, allowedModes);
+      if (result) return result;
+
+      console.log("[tools] Routes API returned no results, falling back to web_search");
+      const transitQuery = `${origin} to ${destination} train schedule departure time today`;
+      const fallback = await webSearch({ query: transitQuery });
+      if (typeof fallback === "object" && fallback !== null) {
+        (fallback as Record<string, unknown>)._transit_fallback = true;
+        (fallback as Record<string, unknown>).origin = origin;
+        (fallback as Record<string, unknown>).destination = destination;
+        (fallback as Record<string, unknown>).mode = "transit";
+        (fallback as Record<string, unknown>)._hint = "Build a MAGIC TRANSIT CARD from this timetable data. Include: service name, typical duration, frequency, fare, and a practical tip. Times are in LOCAL TIME at the destination. These are RECURRING DAILY schedules, not past events. Use <nest-content> card format. No emojis. Do NOT say 'couldn't confirm'. The user needs this info NOW.";
+      }
+      return fallback;
+    } catch (e) {
+      console.error("[tools] transit Routes API error:", (e as Error).message);
+      const transitQuery = `${origin} to ${destination} train schedule departure time today`;
+      const fallback = await webSearch({ query: transitQuery });
+      if (typeof fallback === "object" && fallback !== null) {
+        (fallback as Record<string, unknown>)._transit_fallback = true;
+        (fallback as Record<string, unknown>).origin = origin;
+        (fallback as Record<string, unknown>).destination = destination;
+        (fallback as Record<string, unknown>).mode = "transit";
+        (fallback as Record<string, unknown>)._hint = "Build a MAGIC TRANSIT CARD from this data. Include: service name, duration, frequency, fare, and a practical tip. Use <nest-content> card format. No emojis.";
+      }
+      return fallback;
+    }
+  }
+
+  // Non-transit modes use the legacy Directions API
   const params = new URLSearchParams({
     origin,
     destination,
     mode,
     key: GOOGLE_MAPS_API_KEY,
   });
-
-  if (mode === "transit") {
-    params.set("alternatives", "true");
-  }
 
   if (departureTime) {
     if (departureTime === "now") {
@@ -2865,7 +3022,7 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
       const epochSec = Math.floor(new Date(departureTime).getTime() / 1000);
       if (!isNaN(epochSec) && epochSec > Math.floor(Date.now() / 1000)) {
         params.set("departure_time", String(epochSec));
-        if (mode !== "transit") params.set("traffic_model", "best_guess");
+        params.set("traffic_model", "best_guess");
       } else {
         params.set("departure_time", "now");
       }
@@ -2878,30 +3035,11 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
     const resp = await fetchWithTimeout(`${DIRECTIONS_API}?${params}`, {}, FETCH_TIMEOUT_MS);
     const data = await resp.json();
 
-    if (data.status === "ZERO_RESULTS" || (data.status !== "OK" && mode === "transit")) {
-      console.log(`[tools] transit directions returned ${data.status} (error: ${data.error_message ?? "none"}), falling back to web_search`);
-      const transitQuery = `${origin} to ${destination} train schedule departure time today`;
-      const fallback = await webSearch({ query: transitQuery });
-      if (typeof fallback === "object" && fallback !== null) {
-        (fallback as Record<string, unknown>)._transit_fallback = true;
-        (fallback as Record<string, unknown>)._google_status = data.status;
-        (fallback as Record<string, unknown>).origin = origin;
-        (fallback as Record<string, unknown>).destination = destination;
-        (fallback as Record<string, unknown>).mode = "transit";
-        (fallback as Record<string, unknown>)._hint = "Build a MAGIC TRANSIT CARD from this timetable data. Include: service name, typical duration, frequency, fare, and a practical tip. Times are in LOCAL TIME at the destination. These are RECURRING DAILY schedules, not past events. Use <nest-content> card format. No emojis. Do NOT say 'couldn't confirm'. The user needs this info NOW.";
-      }
-      return fallback;
-    }
-
     if (data.status !== "OK" || !data.routes?.length) {
       return {
         error: `Google Maps returned: ${data.status}`,
         hint: data.error_message ?? "Check origin/destination spelling.",
       };
-    }
-
-    if (mode === "transit") {
-      return parseTransitRoutes(data.routes, origin, destination);
     }
 
     const route = data.routes[0];
@@ -2941,96 +3079,114 @@ async function travelTime(args: Record<string, unknown>): Promise<unknown> {
     return result;
   } catch (e) {
     console.error("[tools] travel_time error:", (e as Error).message);
-    const query = mode === "transit"
-      ? `${origin} to ${destination} train schedule departure time today`
-      : `travel time from ${origin} to ${destination} by ${mode}`;
+    const query = `travel time from ${origin} to ${destination} by ${mode}`;
     const fallback = await webSearch({ query });
-    if (mode === "transit" && typeof fallback === "object" && fallback !== null) {
-      (fallback as Record<string, unknown>)._transit_fallback = true;
-      (fallback as Record<string, unknown>).origin = origin;
-      (fallback as Record<string, unknown>).destination = destination;
-      (fallback as Record<string, unknown>).mode = "transit";
-      (fallback as Record<string, unknown>)._hint = "Build a MAGIC TRANSIT CARD from this data. Include: service name, duration, frequency, fare, and a practical tip. Use <nest-content> card format. No emojis.";
-    }
     return fallback;
   }
 }
 
-function parseTransitRoutes(routes: any[], origin: string, destination: string): unknown {
+function parseTransitRoutesV2(routes: any[], origin: string, destination: string): unknown {
   const options = routes.slice(0, 3).map((route: any, idx: number) => {
-    const leg = route.legs[0];
+    const leg = route.legs?.[0];
+    if (!leg) return null;
+
     const option: Record<string, unknown> = {
       option: idx + 1,
-      origin: leg.start_address,
-      destination: leg.end_address,
-      duration: leg.duration?.text,
-      duration_seconds: leg.duration?.value,
-      depart_at: leg.departure_time?.text,
-      arrive_at: leg.arrival_time?.text,
+      duration: route.localizedValues?.duration?.text ?? leg.localizedValues?.duration?.text,
+      duration_seconds: leg.duration ? parseInt(leg.duration.replace("s", ""), 10) : undefined,
     };
 
-    // Extract fare if available
-    if (route.fare) {
-      option.fare = route.fare.text;
-      option.fare_currency = route.fare.currency;
+    // Transit fare from travel advisory
+    if (route.travelAdvisory?.transitFare) {
+      const fare = route.travelAdvisory.transitFare;
+      option.fare = `${fare.currencyCode} ${(parseInt(fare.units ?? "0", 10) + (fare.nanos ?? 0) / 1e9).toFixed(2)}`;
+      option.fare_currency = fare.currencyCode;
+    }
+    if (route.localizedValues?.transitFare?.text) {
+      option.fare = route.localizedValues.transitFare.text;
     }
 
     const transitSteps = (leg.steps ?? [])
-      .filter((s: any) => s.travel_mode === "TRANSIT" || s.travel_mode === "WALKING")
+      .filter((s: any) => s.travelMode === "TRANSIT" || s.travelMode === "WALK")
       .slice(0, 10)
       .map((s: any) => {
         const step: Record<string, unknown> = {
-          mode: s.travel_mode?.toLowerCase(),
-          instruction: s.html_instructions?.replace(/<[^>]*>/g, ""),
-          distance: s.distance?.text,
-          duration: s.duration?.text,
+          mode: s.travelMode === "WALK" ? "walking" : "transit",
         };
-        if (s.travel_mode === "WALKING") {
-          step.start_location = s.start_location;
-          step.end_location = s.end_location;
-          // Include sub-steps for walking directions (landmarks, turns)
-          const walkDetails = (s.steps ?? []).slice(0, 4).map((ws: any) =>
-            ws.html_instructions?.replace(/<[^>]*>/g, "")
-          ).filter(Boolean);
-          if (walkDetails.length) step.walking_directions = walkDetails;
+
+        if (s.localizedValues) {
+          step.distance = s.localizedValues.distance?.text;
+          step.duration = s.localizedValues.staticDuration?.text;
         }
-        if (s.transit_details) {
-          const td = s.transit_details;
-          step.line_name = td.line?.short_name || td.line?.name;
-          step.line_full_name = td.line?.name;
-          step.vehicle_type = td.line?.vehicle?.type?.toLowerCase();
-          step.vehicle_name = td.line?.vehicle?.name;
-          step.num_stops = td.num_stops;
-          step.departure_stop = td.departure_stop?.name;
-          step.arrival_stop = td.arrival_stop?.name;
-          if (td.departure_time?.text) step.departs_at = td.departure_time.text;
-          if (td.arrival_time?.text) step.arrives_at = td.arrival_time.text;
+
+        if (s.navigationInstruction?.instructions) {
+          step.instruction = s.navigationInstruction.instructions;
+        }
+
+        if (s.travelMode === "WALK") {
+          if (s.startLocation?.latLng) step.start_location = s.startLocation.latLng;
+          if (s.endLocation?.latLng) step.end_location = s.endLocation.latLng;
+        }
+
+        if (s.transitDetails) {
+          const td = s.transitDetails;
+          const line = td.transitLine;
+          if (line) {
+            step.line_name = line.nameShort || line.name;
+            step.line_full_name = line.name;
+            step.line_color = line.color;
+            if (line.vehicle) {
+              step.vehicle_type = line.vehicle.type?.toLowerCase();
+              step.vehicle_name = line.vehicle.name?.text;
+            }
+            if (line.agencies?.length) {
+              step.agency = line.agencies[0].name;
+            }
+          }
+          step.num_stops = td.stopCount;
+          if (td.stopDetails) {
+            step.departure_stop = td.stopDetails.departureStop?.name;
+            step.arrival_stop = td.stopDetails.arrivalStop?.name;
+            if (td.stopDetails.departureTime) step.departs_at = td.localizedValues?.departureTime?.time?.text ?? td.stopDetails.departureTime;
+            if (td.stopDetails.arrivalTime) step.arrives_at = td.localizedValues?.arrivalTime?.time?.text ?? td.stopDetails.arrivalTime;
+            if (td.stopDetails.departureStop?.location?.latLng) step.departure_location = td.stopDetails.departureStop.location.latLng;
+          }
           if (td.headsign) step.direction = td.headsign;
-          // Platform info (where available — common in Japan, Europe)
-          if (td.departure_stop?.location) step.departure_location = td.departure_stop.location;
-          if (td.trip_short_name) step.trip_id = td.trip_short_name;
         }
         return step;
       });
     if (transitSteps.length) option.legs = transitSteps;
 
-    // Extract first walking leg separately for "Getting There" section
+    // Extract departure/arrival from first and last transit steps
+    const firstTransit = transitSteps.find((s: any) => s.mode === "transit");
+    const lastTransit = [...transitSteps].reverse().find((s: any) => s.mode === "transit");
+    if (firstTransit?.departs_at) option.depart_at = firstTransit.departs_at;
+    if (lastTransit?.arrives_at) option.arrive_at = lastTransit.arrives_at;
+
     const firstWalk = transitSteps.find((s: any) => s.mode === "walking");
     if (firstWalk) {
       option.walk_to_station = {
         duration: firstWalk.duration,
         distance: firstWalk.distance,
-        directions: firstWalk.walking_directions,
       };
     }
 
+    // Steps overview (summary of modes used)
+    if (leg.stepsOverview?.multiModalSegments) {
+      option.segments_overview = leg.stepsOverview.multiModalSegments.map((seg: any) => ({
+        mode: seg.travelMode?.toLowerCase(),
+        navigation: seg.navigationInstruction?.instructions,
+        steps: seg.stepStartIndex !== undefined ? `steps ${seg.stepStartIndex}-${seg.stepEndIndex}` : undefined,
+      }));
+    }
+
     return option;
-  });
+  }).filter(Boolean);
 
   return {
     mode: "transit",
-    origin: options[0]?.origin ?? origin,
-    destination: options[0]?.destination ?? destination,
+    origin,
+    destination,
     options,
     _hint: "Build a MAGIC TRANSIT CARD. Include: Getting There (walk from origin to station with landmarks), Train/Bus name, Platform if known, Departure time, Arrival time, Duration, Fare, 1-2 alternatives as one-liners, and a practical Tip. Use <nest-content> card format. No emojis.",
   };
@@ -3798,4 +3954,306 @@ function formatStravaActivity(a: any): Record<string, unknown> {
   }
 
   return result;
+}
+
+// ── Manage Automations ──────────────────────────────────────
+
+const AUTOMATION_CATALOG: Record<string, { title: string; description: string; category: string; configurable: string }> = {
+  email_summary: { title: "Inbox Summary", description: "Morning email digest with prioritised actions, FYI, and promos", category: "daily", configurable: "time" },
+  follow_up_nudge: { title: "Follow-Up Nudge", description: "Flags unanswered email threads that need a reply", category: "daily", configurable: "time" },
+  daily_wrap: { title: "Daily Wrap", description: "End-of-day debrief with today's highlights and tomorrow's preview", category: "daily", configurable: "time" },
+  meeting_intel: { title: "Meeting Intel", description: "Evening-before strategic brief for tomorrow's meetings", category: "daily", configurable: "time" },
+  email_monitor: { title: "Email Monitor", description: "Hourly scan for urgent emails (bills, deadlines, key people)", category: "always_on", configurable: "none" },
+  weekly_digest: { title: "Weekly Digest", description: "Comprehensive weekly review with trends and strategic advice", category: "weekly", configurable: "day+time" },
+  relationship_radar: { title: "Relationship Radar", description: "Weekly check on relationships that need attention", category: "weekly", configurable: "day+time" },
+};
+
+async function manageAutomations(
+  userId: string,
+  supabase: SupabaseClient,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  const action = args.action as string;
+
+  switch (action) {
+    case "list": {
+      const { data, error } = await supabase
+        .from("user_automations")
+        .select("id, automation_type, active, config, label, last_run_at, next_run_at")
+        .eq("user_id", userId)
+        .order("automation_type");
+      if (error) throw new Error(`List automations failed: ${error.message}`);
+
+      // Built-in automations
+      const builtIns = Object.entries(AUTOMATION_CATALOG).map(([type, info]) => {
+        const existing = (data ?? []).find((a: any) => a.automation_type === type);
+        const item: Record<string, unknown> = {
+          type, title: info.title, description: info.description, category: info.category,
+          active: existing?.active ?? false,
+        };
+        if (existing?.config?.time) item.scheduled_time = existing.config.time;
+        if (existing?.config?.day) item.scheduled_day = existing.config.day;
+        if (existing?.config?.timezone) item.timezone = existing.config.timezone;
+        if (existing?.last_run_at) item.last_run = existing.last_run_at;
+        if (existing?.next_run_at && existing?.active) item.next_run = existing.next_run_at;
+        return item;
+      });
+
+      // Custom automations
+      const customs = (data ?? [])
+        .filter((a: any) => a.automation_type === "custom")
+        .map((a: any) => {
+          const c = a.config ?? {};
+          const item: Record<string, unknown> = {
+            type: "custom", automation_id: a.id,
+            title: a.label || c.prompt?.slice(0, 40) || "Custom",
+            description: c.prompt || "",
+            category: "custom",
+            frequency: c.frequency || "daily",
+            active: a.active,
+          };
+          if (c.time) item.scheduled_time = c.time;
+          if (c.day) item.scheduled_day = c.day;
+          if (c.timezone) item.timezone = c.timezone;
+          if (c.watch_filters) item.watch_filters = c.watch_filters;
+          if (a.last_run_at) item.last_run = a.last_run_at;
+          if (a.next_run_at && a.active) item.next_run = a.next_run_at;
+          if (c.total_runs) item.total_runs = c.total_runs;
+          if (c.engagement_rate != null) item.engagement_rate = c.engagement_rate;
+          return item;
+        });
+
+      const all = [...builtIns, ...customs];
+      const activeCount = all.filter((a: any) => a.active).length;
+      return { automations: all, active_count: activeCount, total_available: all.length, custom_count: customs.length };
+    }
+
+    case "enable": {
+      // Support enabling by automation_id (for custom) or automation_type (for built-in)
+      const autoId = args.automation_id as string;
+      if (autoId) {
+        const { data, error } = await supabase
+          .from("user_automations")
+          .select("id, config, label, automation_type")
+          .eq("id", autoId)
+          .eq("user_id", userId)
+          .maybeSingle();
+        if (error || !data) return { error: "Automation not found." };
+
+        const c = data.config as Record<string, unknown>;
+        const freq = (c.frequency as string) || "daily";
+        const tz = (args.time_zone as string) || (c.timezone as string) || "UTC";
+        if (args.time) c.time = args.time;
+        if (args.day) c.day = args.day;
+        c.timezone = tz;
+
+        let nextRun: string;
+        if (freq === "event") {
+          nextRun = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+        } else if (freq === "hourly") {
+          nextRun = new Date(Date.now() + 60 * 1000).toISOString();
+        } else {
+          nextRun = c.time ? computeNextRunFromTime(c.time as string, tz, c.day as string | undefined) : new Date(Date.now() + 60 * 1000).toISOString();
+        }
+
+        await supabase.from("user_automations").update({ active: true, config: c, next_run_at: nextRun, updated_at: new Date().toISOString() }).eq("id", autoId);
+        return { status: "enabled", automation_id: autoId, title: data.label || (c.prompt as string)?.slice(0, 40) || "Custom", next_run: nextRun };
+      }
+
+      const type = args.automation_type as string;
+      if (!type || !AUTOMATION_CATALOG[type]) {
+        return { error: `Unknown automation type. Available: ${Object.keys(AUTOMATION_CATALOG).join(", ")}` };
+      }
+
+      const tz = (args.time_zone as string) || "UTC";
+      const config: Record<string, unknown> = { timezone: tz };
+      if (args.time) config.time = args.time;
+      if (args.day) config.day = args.day;
+
+      const isAlwaysOn = AUTOMATION_CATALOG[type].category === "always_on";
+      const nextRun = isAlwaysOn
+        ? new Date(Date.now() + 60 * 1000).toISOString()
+        : (args.time ? computeNextRunFromTime(args.time as string, tz, args.day as string | undefined) : new Date(Date.now() + 60 * 1000).toISOString());
+
+      const { data: existing } = await supabase.from("user_automations").select("id").eq("user_id", userId).eq("automation_type", type).maybeSingle();
+      if (existing) {
+        const { error } = await supabase.from("user_automations").update({ active: true, config, next_run_at: nextRun, updated_at: new Date().toISOString() }).eq("id", existing.id);
+        if (error) throw new Error(`Enable automation failed: ${error.message}`);
+      } else {
+        const { error } = await supabase.from("user_automations").insert({ user_id: userId, automation_type: type, active: true, config, next_run_at: nextRun });
+        if (error) throw new Error(`Enable automation failed: ${error.message}`);
+      }
+      return { status: "enabled", automation_type: type, title: AUTOMATION_CATALOG[type].title, next_run: nextRun, config };
+    }
+
+    case "disable": {
+      const autoId = args.automation_id as string;
+      if (autoId) {
+        const { data, error } = await supabase.from("user_automations").update({ active: false, next_run_at: null, updated_at: new Date().toISOString() }).eq("id", autoId).eq("user_id", userId).select("id, label, config").maybeSingle();
+        if (error || !data) return { error: "Automation not found." };
+        return { status: "disabled", automation_id: autoId, title: data.label || (data.config as any)?.prompt?.slice(0, 40) || "Custom" };
+      }
+
+      const type = args.automation_type as string;
+      if (!type) return { error: "automation_type or automation_id is required to disable." };
+      const { data, error } = await supabase.from("user_automations").update({ active: false, next_run_at: null, updated_at: new Date().toISOString() }).eq("user_id", userId).eq("automation_type", type).select("id, automation_type").maybeSingle();
+      if (error) throw new Error(`Disable automation failed: ${error.message}`);
+      if (!data) return { error: `No automation of type '${type}' found.` };
+      return { status: "disabled", automation_type: type, title: AUTOMATION_CATALOG[type]?.title ?? type };
+    }
+
+    case "update": {
+      const autoId = args.automation_id as string;
+      const type = args.automation_type as string;
+      if (!autoId && !type) return { error: "automation_type or automation_id is required to update." };
+
+      let query = supabase.from("user_automations").select("id, config, active, label").eq("user_id", userId);
+      if (autoId) query = query.eq("id", autoId);
+      else query = query.eq("automation_type", type);
+      const { data: existing } = await query.maybeSingle();
+      if (!existing) return { error: "Automation not found. Enable it first." };
+
+      const newConfig = { ...(existing.config as Record<string, unknown>) };
+      const tz = (args.time_zone as string) || undefined;
+      if (args.time) newConfig.time = args.time;
+      if (args.day) newConfig.day = args.day;
+      if (tz) newConfig.timezone = tz;
+      if (args.prompt) { newConfig.prompt = args.prompt; newConfig.tools_hint = undefined; }
+
+      const updates: Record<string, unknown> = { config: newConfig, updated_at: new Date().toISOString() };
+      if (args.label) updates.label = args.label;
+
+      if ((args.time || args.day) && existing.active) {
+        const runTz = (newConfig.timezone as string) || "UTC";
+        updates.next_run_at = computeNextRunFromTime((newConfig.time as string) || "08:00", runTz, newConfig.day as string | undefined);
+      }
+
+      const { error } = await supabase.from("user_automations").update(updates).eq("id", existing.id);
+      if (error) throw new Error(`Update automation failed: ${error.message}`);
+      return { status: "updated", automation_id: existing.id, title: (args.label as string) || existing.label || (AUTOMATION_CATALOG[type]?.title ?? "Custom"), config: newConfig };
+    }
+
+    case "create_custom": {
+      const prompt = args.prompt as string;
+      if (!prompt) return { error: "prompt is required for create_custom." };
+
+      // Cap at 10 custom automations per user
+      const { count } = await supabase.from("user_automations").select("id", { count: "exact", head: true }).eq("user_id", userId).eq("automation_type", "custom").eq("active", true);
+      if ((count ?? 0) >= 10) return { error: "You've reached the maximum of 10 custom automations. Disable or delete one first." };
+
+      const tz = (args.time_zone as string) || "UTC";
+      const freq = (args.frequency as string) || "daily";
+      const label = (args.label as string) || prompt.slice(0, 50);
+
+      const config: Record<string, unknown> = { prompt, frequency: freq, timezone: tz, total_runs: 0, run_history: [] };
+      if (args.time) config.time = args.time;
+      if (args.day) config.day = args.day;
+
+      // Event-driven: build watch_filters
+      if (freq === "event") {
+        const filters: Record<string, unknown> = {};
+        if (args.watch_senders) filters.senders = (args.watch_senders as string).split(",").map(s => s.trim());
+        if (args.watch_keywords) filters.keywords = (args.watch_keywords as string).split(",").map(k => k.trim());
+        config.watch_filters = filters;
+      }
+
+      // Compute next_run_at
+      let nextRun: string;
+      if (freq === "event") {
+        nextRun = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+      } else if (freq === "hourly") {
+        nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      } else if (args.time) {
+        nextRun = computeNextRunFromTime(args.time as string, tz, args.day as string | undefined);
+      } else {
+        nextRun = new Date(Date.now() + 60 * 1000).toISOString();
+      }
+
+      const { data, error } = await supabase.from("user_automations").insert({
+        user_id: userId, automation_type: "custom", active: true, label, config, next_run_at: nextRun,
+      }).select("id").single();
+      if (error) throw new Error(`Create custom automation failed: ${error.message}`);
+
+      return {
+        status: "created", automation_id: data.id, label, prompt, frequency: freq,
+        time: args.time || null, day: args.day || null, next_run: nextRun,
+        watch_filters: config.watch_filters || null,
+        hint: "Offer to test it now with test_custom.",
+      };
+    }
+
+    case "test_custom": {
+      const autoId = args.automation_id as string;
+      if (!autoId) return { error: "automation_id is required for test_custom." };
+
+      const { data } = await supabase.from("user_automations").select("id, config, label").eq("id", autoId).eq("user_id", userId).maybeSingle();
+      if (!data) return { error: "Automation not found." };
+
+      // Fire the automation via v2-trigger
+      const triggerUrl = (Deno as any).env?.get?.("SUPABASE_URL") ?? "https://ynoidbjupfcaaymzbtic.supabase.co";
+      const serviceKey = (Deno as any).env?.get?.("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+      try {
+        fetch(`${triggerUrl}/functions/v1/v2-trigger`, {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${serviceKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "test_custom_automation", automation_id: autoId, user_id: userId }),
+        }).catch(() => {});
+      } catch {}
+
+      return {
+        status: "test_running", automation_id: autoId, label: data.label,
+        message: "Running it now. You'll get the result as a message in a moment.",
+      };
+    }
+
+    case "delete_custom": {
+      const autoId = args.automation_id as string;
+      if (!autoId) return { error: "automation_id is required for delete_custom." };
+
+      const { data, error } = await supabase.from("user_automations").update({ active: false, updated_at: new Date().toISOString() }).eq("id", autoId).eq("user_id", userId).eq("automation_type", "custom").select("id, label").maybeSingle();
+      if (error || !data) return { error: "Custom automation not found." };
+      return { status: "deleted", automation_id: autoId, title: data.label || "Custom" };
+    }
+
+    default:
+      return { error: `Unknown action '${action}'. Use: list, enable, disable, update, create_custom, test_custom, delete_custom.` };
+  }
+}
+
+function computeNextRunFromTime(time: string, tz: string, day?: string): string {
+  const [hourStr, minuteStr] = time.split(":");
+  const hour = parseInt(hourStr, 10);
+  const minute = parseInt(minuteStr || "0", 10);
+
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+  const p = formatter.formatToParts(now);
+  const get = (t: string) => parseInt(p.find(x => x.type === t)?.value ?? "0", 10);
+  const tzYear = get("year"), tzMonth = get("month"), tzDay = get("day");
+  const tzHour = get("hour"), tzMin = get("minute"), tzSec = get("second");
+  const tzNowAsUtc = Date.UTC(tzYear, tzMonth - 1, tzDay, tzHour, tzMin, tzSec);
+  const offsetMs = tzNowAsUtc - now.getTime();
+  const targetAsUtc = Date.UTC(tzYear, tzMonth - 1, tzDay, hour, minute, 0);
+  let nextRunUtc = new Date(targetAsUtc - offsetMs);
+  if (nextRunUtc.getTime() <= now.getTime()) {
+    nextRunUtc = new Date(nextRunUtc.getTime() + 86400000);
+  }
+
+  if (day) {
+    const dayMap: Record<string, number> = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+    const targetDow = dayMap[day.toLowerCase()] ?? -1;
+    if (targetDow >= 0) {
+      const currentDow = nextRunUtc.getUTCDay();
+      if (currentDow !== targetDow) {
+        let daysAhead = targetDow - currentDow;
+        if (daysAhead <= 0) daysAhead += 7;
+        nextRunUtc = new Date(nextRunUtc.getTime() + daysAhead * 86400000);
+      }
+    }
+  }
+
+  return nextRunUtc.toISOString();
 }

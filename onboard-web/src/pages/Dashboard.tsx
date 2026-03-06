@@ -1,8 +1,9 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { ChevronDown, LogOut, ShieldAlert, FileText, HelpCircle, Plus, Download, MessageCircle, Check, User, Link2, Zap } from 'lucide-react'
+import { ChevronDown, ChevronRight, LogOut, ShieldAlert, FileText, HelpCircle, Plus, Download, MessageCircle, Check, User, Link2, Zap, HardDrive, Sparkles, X } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
+import Automations from './Automations'
 
 const cn = (...classes: (string | false | undefined)[]) => classes.filter(Boolean).join(' ')
 
@@ -30,6 +31,7 @@ interface GoogleAccount {
   google_name: string | null
   google_avatar_url: string | null
   is_primary: boolean
+  scopes?: string[]
 }
 
 interface MicrosoftAccount {
@@ -70,6 +72,14 @@ export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<Tab>('accounts')
   const [stravaAccount, setStravaAccount] = useState<StravaAccount | null>(null)
   const [stravaLoading, setStravaLoading] = useState(false)
+  const [driveGranting, setDriveGranting] = useState<string | null>(null)
+  const [drivePickerOpen, setDrivePickerOpen] = useState(false)
+  const [drivePickerMounted, setDrivePickerMounted] = useState(false)
+  const [drivePickerVisible, setDrivePickerVisible] = useState(false)
+  const [autoSheetOpen, setAutoSheetOpen] = useState(false)
+  const [autoSheetMounted, setAutoSheetMounted] = useState(false)
+  const [autoSheetVisible, setAutoSheetVisible] = useState(false)
+
   const dropdownRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -106,10 +116,18 @@ export default function Dashboard() {
           .maybeSingle()
         if (strava) setStravaAccount(strava)
 
-        // Handle ?strava=connected redirect
+        // Handle redirect query params
         const params = new URLSearchParams(window.location.search)
         if (params.get('strava') === 'connected') {
           setActiveTab('connections')
+          window.history.replaceState({}, '', '/dashboard')
+        }
+        if (params.get('drive_auth') === 'success') {
+          setActiveTab('connections')
+          window.history.replaceState({}, '', '/dashboard')
+        }
+        if (params.get('automations') === 'open') {
+          setAutoSheetOpen(true)
           window.history.replaceState({}, '', '/dashboard')
         }
       } catch (err) {
@@ -149,6 +167,44 @@ export default function Dashboard() {
       setAddSheetMounted(false)
     }
   }, [addMenuOpen])
+
+  useEffect(() => {
+    if (drivePickerOpen) {
+      setDrivePickerMounted(true)
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setDrivePickerVisible(true)
+        })
+      })
+    } else {
+      setDrivePickerVisible(false)
+    }
+  }, [drivePickerOpen])
+
+  const handleDrivePickerTransitionEnd = useCallback(() => {
+    if (!drivePickerOpen) {
+      setDrivePickerMounted(false)
+    }
+  }, [drivePickerOpen])
+
+  useEffect(() => {
+    if (autoSheetOpen) {
+      setAutoSheetMounted(true)
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setAutoSheetVisible(true)
+        })
+      })
+    } else {
+      setAutoSheetVisible(false)
+    }
+  }, [autoSheetOpen])
+
+  const handleAutoSheetTransitionEnd = useCallback(() => {
+    if (!autoSheetOpen) {
+      setAutoSheetMounted(false)
+    }
+  }, [autoSheetOpen])
 
   async function fetchAccounts(token?: string): Promise<{ accounts: GoogleAccount[]; microsoft_accounts: MicrosoftAccount[] } | null> {
     const accessToken = token ?? (await supabase.auth.getSession()).data.session?.access_token
@@ -274,10 +330,59 @@ export default function Dashboard() {
     }
   }
 
+  function handleConnectDrive() {
+    const accountsWithoutDrive = accounts.filter(
+      (a) => !(a.scopes ?? []).includes('https://www.googleapis.com/auth/drive.readonly')
+    )
+    if (accountsWithoutDrive.length === 0) return
+    if (accountsWithoutDrive.length === 1) {
+      void handleGrantDriveAccess(accountsWithoutDrive[0].id)
+    } else {
+      setDrivePickerOpen(true)
+    }
+  }
+
+  async function handleGrantDriveAccess(accountId: string) {
+    const { data: { session } } = await supabase.auth.getSession()
+    if (!session) return
+    setDriveGranting(accountId)
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/google-drive-auth`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${session.access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          account_id: accountId,
+          redirect_uri: `${window.location.origin}/dashboard?drive_auth=success`,
+        }),
+      })
+      const data = await res.json()
+      if (data.already_granted) {
+        setDriveGranting(null)
+        return
+      }
+      if (data.auth_url) {
+        window.location.href = data.auth_url
+        return
+      }
+      setDriveGranting(null)
+    } catch {
+      setDriveGranting(null)
+    }
+  }
+
   const firstName = displayName.split(' ')[0] || 'there'
   const primaryAccount = accounts.find((a) => a.is_primary)
   const primaryMsAccount = microsoftAccounts.find((a) => a.is_primary)
   const primaryAvatar = primaryAccount?.google_avatar_url ?? primaryMsAccount?.microsoft_avatar_url ?? avatarUrl
+
+  const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly'
+  const driveConnectedAccounts = accounts.filter((a) => (a.scopes ?? []).includes(DRIVE_SCOPE))
+  const driveAvailable = accounts.length > 0
+  const driveConnected = driveConnectedAccounts.length > 0
 
   if (loading) {
     return (
@@ -585,6 +690,34 @@ export default function Dashboard() {
                   )}
                 </div>
 
+                {/* Google Drive */}
+                <div className="flex items-center gap-3 px-4 py-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
+                    <HardDrive className="h-4 w-4 text-gray-600" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13px] font-medium text-gray-900">Google Drive</p>
+                    <p className="text-[11px] text-gray-400">
+                      {driveConnected
+                        ? driveConnectedAccounts.map((a) => a.google_email).join(', ')
+                        : 'Search documents & files'}
+                    </p>
+                  </div>
+                  {driveConnected ? (
+                    <span className="text-[11px] text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-md font-medium">Connected</span>
+                  ) : driveAvailable ? (
+                    <button
+                      onClick={handleConnectDrive}
+                      disabled={!!driveGranting}
+                      className="shrink-0 text-[11px] font-medium text-white bg-gray-900 px-3 py-1 rounded-md active:scale-[0.96] transition-all"
+                    >
+                      {driveGranting ? '...' : 'Connect'}
+                    </button>
+                  ) : (
+                    <span className="shrink-0 text-[11px] text-gray-400 bg-gray-100 px-2 py-0.5 rounded-md">Add Google account first</span>
+                  )}
+                </div>
+
                 {/* Slack — coming soon */}
                 <div className="flex items-center gap-3 px-4 py-3">
                   <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gray-50 border border-gray-100">
@@ -616,6 +749,23 @@ export default function Dashboard() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* ── Automations link ── */}
+        <motion.div
+          className="shrink-0 mt-4"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, delay: 0.08, ease: [0.25, 0.1, 0.25, 1] }}
+        >
+          <button
+            onClick={() => setAutoSheetOpen(true)}
+            className="flex items-center gap-3 w-full rounded-2xl bg-white border border-gray-200/60 shadow-sm px-4 py-3 text-left active:scale-[0.98] transition-all"
+          >
+            <Sparkles className="h-[18px] w-[18px] text-gray-400 shrink-0" />
+            <span className="flex-1 text-[15px] font-normal text-gray-900">Automations</span>
+            <ChevronRight className="h-4 w-4 text-gray-300 shrink-0" />
+          </button>
+        </motion.div>
 
         <div className="flex-1" />
 
@@ -695,6 +845,123 @@ export default function Dashboard() {
           </div>
         </>
       )}
+
+      {/* ── Drive account picker bottom sheet ── */}
+      {drivePickerMounted && (
+        <>
+          <div
+            className="fixed inset-0 z-[60]"
+            style={{
+              backgroundColor: 'rgba(0,0,0,0.3)',
+              opacity: drivePickerVisible ? 1 : 0,
+              transition: 'opacity 0.3s ease-out',
+              willChange: 'opacity',
+            }}
+            onClick={() => setDrivePickerOpen(false)}
+          />
+          <div
+            className="fixed bottom-0 left-0 right-0 z-[70] bg-white rounded-t-[28px] pb-[max(env(safe-area-inset-bottom,0px),16px)] px-6 pt-3"
+            style={{
+              transform: drivePickerVisible ? 'translateY(0)' : 'translateY(100%)',
+              transition: 'transform 0.4s cubic-bezier(0.32, 0.72, 0, 1)',
+              willChange: 'transform',
+            }}
+            onTransitionEnd={handleDrivePickerTransitionEnd}
+          >
+            <div className="flex justify-center mb-5">
+              <div className="w-9 h-[5px] rounded-full bg-gray-300" />
+            </div>
+
+            <h2 className="text-[22px] font-bold tracking-tight text-gray-900 text-center mb-1">
+              Connect Google Drive
+            </h2>
+            <p className="text-[14px] text-gray-400 text-center mb-6">
+              Choose which account to grant Drive access
+            </p>
+
+            <div className="flex flex-col gap-3">
+              {accounts
+                .filter((a) => !(a.scopes ?? []).includes(DRIVE_SCOPE))
+                .map((account) => (
+                  <button
+                    key={account.id}
+                    onClick={() => { setDrivePickerOpen(false); void handleGrantDriveAccess(account.id) }}
+                    disabled={driveGranting === account.id}
+                    className="flex items-center gap-3 w-full bg-white text-gray-900 border border-gray-200 rounded-2xl py-3.5 px-4 text-left shadow-sm active:scale-[0.98] transition-all"
+                  >
+                    {account.google_avatar_url ? (
+                      <img src={account.google_avatar_url} alt="" className="h-8 w-8 rounded-full shrink-0" referrerPolicy="no-referrer" />
+                    ) : (
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gray-100 text-xs font-semibold text-gray-600">
+                        {(account.google_name || account.google_email).charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[14px] font-semibold truncate">{account.google_name || account.google_email}</p>
+                      <p className="text-[12px] text-gray-400 truncate">{account.google_email}</p>
+                    </div>
+                    {driveGranting === account.id && (
+                      <span className="text-[11px] text-gray-400">...</span>
+                    )}
+                  </button>
+                ))}
+            </div>
+
+            <button
+              onClick={() => setDrivePickerOpen(false)}
+              className="w-full mt-4 mb-2 text-[14px] text-gray-400 hover:text-gray-600 transition-colors py-2"
+            >
+              Cancel
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* ── Automations popup sheet ── */}
+      {autoSheetMounted && (
+        <>
+          <div
+            className="fixed inset-0 z-[80]"
+            style={{
+              backgroundColor: 'rgba(0,0,0,0.35)',
+              opacity: autoSheetVisible ? 1 : 0,
+              transition: 'opacity 0.2s ease-out',
+              willChange: 'opacity',
+            }}
+            onClick={() => setAutoSheetOpen(false)}
+          />
+          <div
+            className="fixed inset-x-0 bottom-0 z-[90] bg-[#FAFAFA] rounded-t-[20px] flex flex-col"
+            style={{
+              maxHeight: '92dvh',
+              transform: autoSheetVisible ? 'translateY(0)' : 'translateY(100%)',
+              transition: 'transform 0.4s cubic-bezier(0.32, 0.72, 0, 1)',
+              willChange: 'transform',
+            }}
+            onTransitionEnd={handleAutoSheetTransitionEnd}
+          >
+            <div className="shrink-0 px-5 pt-3 pb-0">
+              <div className="flex justify-center mb-3">
+                <div className="w-9 h-[5px] rounded-full bg-gray-300" />
+              </div>
+              <div className="relative flex items-center justify-center pb-3 border-b border-gray-200/40">
+                <img src="/nest-logo.png" alt="Nest" className="absolute left-0 h-6 w-6 rounded-[6px] shadow-sm" />
+                <h2 className="text-[17px] font-semibold tracking-tight text-gray-900">Automations</h2>
+                <button
+                  onClick={() => setAutoSheetOpen(false)}
+                  className="absolute right-0 flex h-7 w-7 items-center justify-center rounded-full bg-gray-100 active:bg-gray-200 transition-colors"
+                >
+                  <X className="h-3.5 w-3.5 text-gray-500" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain pb-[max(env(safe-area-inset-bottom,0px),16px)]">
+              <Automations onClose={() => setAutoSheetOpen(false)} />
+            </div>
+          </div>
+        </>
+      )}
+
     </motion.div>
   )
 }

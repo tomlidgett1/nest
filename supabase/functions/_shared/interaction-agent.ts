@@ -173,7 +173,8 @@ export async function runInteractionAgent(
   model?: string,
   maxTokens?: number,
   lightweightPrompt = false,
-  userName?: string
+  userName?: string,
+  timezone = "UTC",
 ): Promise<InteractionResult> {
   const now = new Date();
   const dateStr = now.toLocaleDateString("en-AU", {
@@ -181,15 +182,17 @@ export async function runInteractionAgent(
     day: "numeric",
     month: "long",
     year: "numeric",
-    timeZone: "Australia/Sydney",
+    timeZone: timezone,
   });
   const timeStr = now.toLocaleTimeString("en-AU", {
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
-    timeZone: "Australia/Sydney",
+    timeZone: timezone,
   });
-  const currentDatetime = `${dateStr} at ${timeStr} (AEDT)`;
+  const tzAbbr = new Intl.DateTimeFormat("en-AU", { timeZone: timezone, timeZoneName: "short" })
+    .formatToParts(now).find(p => p.type === "timeZoneName")?.value ?? timezone.split("/").pop() ?? "UTC";
+  const currentDatetime = `${dateStr} at ${timeStr} (${tzAbbr})`;
 
   let systemPrompt: string;
 

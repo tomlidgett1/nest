@@ -7,6 +7,7 @@ import { supabase } from '../lib/supabase'
 const ONBOARD_URL = import.meta.env.VITE_ONBOARD_FUNCTION_URL
 const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY as string
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL as string
+const HIRAFU_ONBOARD_URL = `${SUPABASE_URL}/functions/v1/hirafu-onboard`
 
 type Status = 'loading' | 'success' | 'error' | 'email_conflict'
 
@@ -197,8 +198,10 @@ export default function Callback() {
           }
         }
 
-        console.log('[nest-debug] Calling imessage-onboard POST...')
-        const res = await fetch(ONBOARD_URL, {
+        const storedProduct = sessionStorage.getItem('nest_product') ?? ''
+        const onboardEndpoint = storedProduct === 'hirafu' ? HIRAFU_ONBOARD_URL : ONBOARD_URL
+        console.log('[nest-debug] Calling onboard POST...', storedProduct ? `(product: ${storedProduct})` : '')
+        const res = await fetch(onboardEndpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -211,6 +214,7 @@ export default function Callback() {
             provider_token: finalProviderToken,
             provider_refresh_token: finalProviderRefreshToken,
             provider: authProvider,
+            user_id: session.user?.id,
           }),
         })
 
@@ -240,6 +244,7 @@ export default function Callback() {
         if (data.success) {
           console.log('[nest-debug] SUCCESS — redirecting to dashboard')
           sessionStorage.removeItem('nest_imessage_token')
+          sessionStorage.removeItem('nest_product')
           setStatus('success')
           setTimeout(() => {
             if (!cancelled) navigate('/dashboard', { replace: true })
