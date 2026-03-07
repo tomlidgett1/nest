@@ -1,5 +1,16 @@
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
@@ -60,7 +71,10 @@ Deno.serve(async (req: Request) => {
 
     messages.push({ role: "user", content: question });
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const systemMsg = messages.find((m: any) => m.role === "system");
+    const inputMsgs = messages.filter((m: any) => m.role !== "system");
+
+    const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -68,8 +82,9 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         model: "gpt-5.2",
-        messages,
-        max_completion_tokens: 2048,
+        instructions: systemMsg?.content ?? undefined,
+        input: inputMsgs,
+        max_output_tokens: 2048,
       }),
     });
 
@@ -83,7 +98,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const data = await response.json();
-    const answer = data.choices?.[0]?.message?.content ?? "No response";
+    const answer = extractResponseText(data) || "No response";
 
     return new Response(JSON.stringify({ answer }), {
       headers: { ...corsHeaders, "Content-Type": "application/json" },

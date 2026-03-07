@@ -15,6 +15,17 @@ const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 const admin = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
@@ -346,7 +357,10 @@ Deno.serve(async (req: Request) => {
     // Higher creativity during rapport building, more predictable for logistics
     const temperature = messageCount <= 4 ? 0.9 : 0.7;
 
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const systemMsg = messages.find((m: any) => m.role === "system");
+    const inputMsgs = messages.filter((m: any) => m.role !== "system");
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${openaiApiKey}`,
@@ -354,10 +368,10 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         model,
-        max_completion_tokens: maxTokens,
+        max_output_tokens: maxTokens,
         temperature,
-        presence_penalty: 0.6,
-        messages,
+        instructions: systemMsg?.content ?? "",
+        input: inputMsgs,
       }),
       signal: controller.signal,
     });
@@ -372,7 +386,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const data = await resp.json();
-    const responseText = data.choices?.[0]?.message?.content?.trim() ?? "";
+    const responseText = extractResponseText(data).trim();
 
     if (!responseText) {
       return json({ error: "empty_response" }, 502);

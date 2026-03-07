@@ -32,6 +32,17 @@ const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 // ══════════════════════════════════════════════════════════════
 // ENTRY POINT
 // ══════════════════════════════════════════════════════════════
@@ -528,7 +539,7 @@ async function generateMeetingSummary(
     .join(", ");
 
   try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -536,10 +547,7 @@ async function generateMeetingSummary(
       },
       body: JSON.stringify({
         model: "gpt-4.1-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are summarising a meeting transcript for someone's personal assistant.
+        instructions: `You are summarising a meeting transcript for someone's personal assistant.
 Extract and format:
 1. **Key decisions** — what was agreed
 2. **Action items** — who committed to what (name + task)
@@ -551,13 +559,8 @@ Attendees: ${attendeeNames || "unknown"}
 
 Keep it under 400 words. Be specific — use names and concrete details.
 Write in a direct, conversational tone. No fluff.`,
-          },
-          {
-            role: "user",
-            content: transcript.slice(0, 60_000), // ~15k tokens
-          },
-        ],
-        max_tokens: 1000,
+        input: transcript.slice(0, 60_000), // ~15k tokens
+        max_output_tokens: 1000,
         temperature: 0.2,
       }),
     });
@@ -568,7 +571,7 @@ Write in a direct, conversational tone. No fluff.`,
     }
 
     const result = await resp.json();
-    return result.choices?.[0]?.message?.content ?? "Summary unavailable.";
+    return extractResponseText(result) || "Summary unavailable.";
   } catch (e) {
     console.error("[recall-webhook] Summary generation error:", (e as Error).message);
     return "Summary generation failed — full transcript is available.";
@@ -738,7 +741,7 @@ async function extractMeetingLearnings(
   attendees: Array<Record<string, unknown>>,
 ): Promise<void> {
   try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -746,10 +749,7 @@ async function extractMeetingLearnings(
       },
       body: JSON.stringify({
         model: "gpt-4.1-nano",
-        messages: [
-          {
-            role: "system",
-            content: `Extract learnings from this meeting summary. Return a JSON array of objects, each with:
+        instructions: `Extract learnings from this meeting summary. Return a JSON array of objects, each with:
 - "category": one of "commitment", "fact", "relationship", "preference"
 - "content": the specific learning (1 sentence)
 - "emotional_weight": "high", "medium", or "low"
@@ -760,13 +760,8 @@ Focus on:
 - People and their roles/relevance (category: relationship)
 
 Return ONLY the JSON array. Max 8 items. Skip obvious/generic items.`,
-          },
-          {
-            role: "user",
-            content: `Meeting: ${title}\nSummary:\n${summary}`,
-          },
-        ],
-        max_tokens: 500,
+        input: `Meeting: ${title}\nSummary:\n${summary}`,
+        max_output_tokens: 500,
         temperature: 0,
       }),
     });
@@ -774,7 +769,7 @@ Return ONLY the JSON array. Max 8 items. Skip obvious/generic items.`,
     if (!resp.ok) return;
 
     const result = await resp.json();
-    const text = result.choices?.[0]?.message?.content ?? "[]";
+    const text = extractResponseText(result) || "[]";
 
     // Parse JSON from response (handle markdown code blocks)
     const cleaned = text.replace(/```json?\n?/g, "").replace(/```/g, "").trim();

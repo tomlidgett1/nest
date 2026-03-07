@@ -16,6 +16,17 @@ import type { OpenLoop } from "./memory-service.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 // ══════════════════════════════════════════════════════════════
 // LAYER 1: Episodic Memory — Session-Level Fact Extraction
 // ══════════════════════════════════════════════════════════════
@@ -147,7 +158,7 @@ async function extractSessionFacts(
   try {
     const truncated = conversationText.slice(0, 6000);
     const _t0 = Date.now();
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -155,11 +166,9 @@ async function extractSessionFacts(
       },
       body: JSON.stringify({
         model: "gpt-4.1-nano",
-        messages: [
-          { role: "system", content: SESSION_EXTRACTION_PROMPT },
-          { role: "user", content: truncated },
-        ],
-        max_tokens: 800,
+        instructions: SESSION_EXTRACTION_PROMPT,
+        input: truncated,
+        max_output_tokens: 800,
         temperature: 0,
       }),
     });
@@ -182,7 +191,7 @@ async function extractSessionFacts(
       });
     }
 
-    return (data.choices?.[0]?.message?.content ?? "").trim();
+    return extractResponseText(data).trim();
   } catch (e) {
     console.error("[conversation-embedder] Fact extraction failed:", (e as Error).message);
     return null;

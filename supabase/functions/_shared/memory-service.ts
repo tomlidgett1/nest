@@ -2,7 +2,7 @@
 //
 // Strategy: 70 raw messages for immediate context + a rolling summary
 // that captures everything before that. The summary is updated every
-// 4 new messages using a cheap GPT-4.1-mini call (~$0.0006 each).
+// 8 new messages using a compact GPT-4.1-mini call.
 // This aggressive cadence ensures nothing falls through the gap between
 // raw history scrolling off and the summary capturing it.
 //
@@ -18,8 +18,28 @@ import { embedLearning, embedNarrativeThreads } from "./conversation-embedder.ts
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
-const SUMMARY_INTERVAL = 4;
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
+const SUMMARY_INTERVAL = 8;
 const IDENTITY_UPDATE_INTERVAL = 100;
+const SUMMARY_OVERLAP_MESSAGES = 4;
+const MAX_SUMMARISE_MESSAGES = 16;
+const MAX_MESSAGE_CHARS_FOR_SUMMARY = 300;
+const MAX_EXISTING_SUMMARY_CHARS = 2200;
+const MAX_RELATIONSHIP_NOTES_CHARS = 700;
+const MAX_EMOTIONAL_ARC_CHARS = 250;
+const MAX_WRITING_STYLE_CHARS = 350;
+const MAX_OPEN_LOOPS = 8;
+const MAX_KEY_MOMENTS = 6;
 
 export interface OpenLoop {
   topic: string;
@@ -88,22 +108,28 @@ export async function updateMemory(
     return;
   }
 
-  // Fetch the messages that haven't been summarised yet (between
-  // last summary and now), plus a small overlap for continuity.
+  // Prefer the already-loaded recent messages from the request path.
+  // Fall back to DB fetch only if the in-memory slice is missing or too small.
   const unsummarisedCount = totalMessageCount - lastSummarisedAt;
-  const fetchCount = Math.min(unsummarisedCount + 6, 30);
+  const fetchCount = Math.min(unsummarisedCount + SUMMARY_OVERLAP_MESSAGES, MAX_SUMMARISE_MESSAGES);
 
-  const { data: rawMessages } = await supabase
-    .from("v2_chat_messages")
-    .select("role, content, created_at")
-    .eq("user_id", userId)
-    .in("role", ["user", "assistant"])
-    .order("created_at", { ascending: false })
-    .limit(fetchCount);
+  let messages = (recentMessages ?? [])
+    .filter((m) => m.content && m.content.trim().length > 0)
+    .slice(-fetchCount);
 
-  const messages = (rawMessages ?? [])
-    .filter((m: any) => m.content && m.content.trim().length > 0)
-    .reverse();
+  if (messages.length < Math.min(fetchCount, 6)) {
+    const { data: rawMessages } = await supabase
+      .from("v2_chat_messages")
+      .select("role, content, created_at")
+      .eq("user_id", userId)
+      .in("role", ["user", "assistant"])
+      .order("created_at", { ascending: false })
+      .limit(fetchCount);
+
+    messages = (rawMessages ?? [])
+      .filter((m: any) => m.content && m.content.trim().length > 0)
+      .reverse();
+  }
 
   if (messages.length === 0) return;
 
@@ -198,35 +224,42 @@ async function summariseConversation(
   supabase?: SupabaseClient,
 ): Promise<SummaryResult | null> {
   const conversationText = messages
-    .map((m) => `${m.role}: ${m.content.slice(0, 600)}`)
+    .map((m) => `${m.role}: ${m.content.slice(0, MAX_MESSAGE_CHARS_FOR_SUMMARY)}`)
     .join("\n");
 
-  const openLoopsContext = existingOpenLoops && existingOpenLoops.length > 0
-    ? `\nEXISTING OPEN LOOPS (carry forward, update status as needed):\n${JSON.stringify(existingOpenLoops)}\n`
+  const trimmedOpenLoops = (existingOpenLoops ?? []).slice(0, MAX_OPEN_LOOPS);
+  const trimmedKeyMoments = (existingKeyMoments ?? []).slice(0, MAX_KEY_MOMENTS);
+  const trimmedExistingSummary = existingSummary?.slice(0, MAX_EXISTING_SUMMARY_CHARS) ?? null;
+  const trimmedWritingStyle = existingWritingStyle?.slice(0, MAX_WRITING_STYLE_CHARS) ?? null;
+  const trimmedEmotionalArc = existingEmotionalArc?.slice(0, MAX_EMOTIONAL_ARC_CHARS) ?? null;
+  const trimmedRelationshipNotes = existingRelationshipNotes?.slice(0, MAX_RELATIONSHIP_NOTES_CHARS) ?? null;
+
+  const openLoopsContext = trimmedOpenLoops.length > 0
+    ? `\nEXISTING OPEN LOOPS (carry forward, update status as needed):\n${JSON.stringify(trimmedOpenLoops)}\n`
     : "";
 
-  const emotionalArcContext = existingEmotionalArc
-    ? `\nEXISTING EMOTIONAL ARC:\n${existingEmotionalArc}\n`
+  const emotionalArcContext = trimmedEmotionalArc
+    ? `\nEXISTING EMOTIONAL ARC:\n${trimmedEmotionalArc}\n`
     : "";
 
-  const relationshipContext = existingRelationshipNotes
-    ? `\nEXISTING RELATIONSHIP NOTES (evolve these, don't restart):\n${existingRelationshipNotes}\n`
+  const relationshipContext = trimmedRelationshipNotes
+    ? `\nEXISTING RELATIONSHIP NOTES (evolve these, don't restart):\n${trimmedRelationshipNotes}\n`
     : "";
 
-  const keyMomentsContext = existingKeyMoments && existingKeyMoments.length > 0
-    ? `\nEXISTING KEY MOMENTS (carry forward, add new standout moments):\n${JSON.stringify(existingKeyMoments)}\n`
+  const keyMomentsContext = trimmedKeyMoments.length > 0
+    ? `\nEXISTING KEY MOMENTS (carry forward, add new standout moments):\n${JSON.stringify(trimmedKeyMoments)}\n`
     : "";
 
   const systemPrompt = `You are a memory system for an AI assistant called Nest. Your job is to maintain a rolling summary AND extract relationship intelligence from the conversation.
 
-${existingSummary ? `EXISTING SUMMARY (update and extend this, never discard information unless it's clearly outdated):\n${existingSummary}\n` : "No existing summary yet. Create one from scratch."}
-${existingWritingStyle ? `EXISTING WRITING STYLE NOTES:\n${existingWritingStyle}\n` : ""}${openLoopsContext}${emotionalArcContext}${relationshipContext}${keyMomentsContext}
+${trimmedExistingSummary ? `EXISTING SUMMARY (update and extend this, never discard information unless it's clearly outdated):\n${trimmedExistingSummary}\n` : "No existing summary yet. Create one from scratch."}
+${trimmedWritingStyle ? `EXISTING WRITING STYLE NOTES:\n${trimmedWritingStyle}\n` : ""}${openLoopsContext}${emotionalArcContext}${relationshipContext}${keyMomentsContext}
 
 You will receive the latest batch of messages. Merge them into the existing summary AND extract learnings.
 
 Produce a JSON object with exactly these fields:
 {
-  "summary": "A rolling summary covering the ENTIRE conversation history. Include: key facts about the user (name, job, company, interests), important decisions, tasks completed, tasks pending, ongoing threads, personal details shared, and anything Nest should remember. Keep under 600 words. Be specific with names, dates, and details. Never lose information from the existing summary unless it's been superseded.",
+  "summary": "A rolling summary covering the ENTIRE conversation history. Include: key facts about the user, important decisions, unresolved threads, personal details shared, and anything Nest should remember. Keep under 300 words. Be specific. Never lose important information from the existing summary unless it's been superseded.",
   "writing_style": "A CONCRETE, SPECIFIC description of the user's iMessage texting style. Include ALL of these dimensions: (1) average message length in words, (2) capitalisation (all lowercase / sentence case / mixed), (3) punctuation habits (periods? commas? question marks? none?), (4) emoji usage (never / rare / frequent), (5) abbreviations or slang they use (list specific ones), (6) greeting patterns (hey / hi / nothing / yo), (7) sign-off patterns, (8) formality level (1-5 scale, 1=very casual, 5=formal), (9) typical response they seem to prefer from Nest (short punchy vs detailed). Example: 'avg 8 words, all lowercase, no periods, no emoji, uses abbreviations (u, ur, tbh), greets with hey or nothing, formality 2/5, prefers short punchy responses'",
   "preferences": {
     "communication_style": "how they prefer info delivered",
@@ -244,7 +277,7 @@ Produce a JSON object with exactly these fields:
     }
   ],
   "emotional_arc": "1-2 sentences describing how the user's overall mood and energy has shifted across recent conversations.",
-  "relationship_notes": "2-4 sentences about the current state of the Nest-user relationship. How comfortable are they with Nest? What's the vibe? Are they opening up more? Do they trust Nest? Any recurring dynamics (e.g. they test Nest, they joke with Nest, they're all business)? How has the relationship evolved?",
+  "relationship_notes": "1-3 sentences about the current state of the Nest-user relationship.",
   "key_moments": [
     {
       "moment": "Brief description of a memorable interaction",
@@ -269,7 +302,7 @@ OPEN LOOPS RULES:
 - Carry forward ALL existing open_loops, updating their status and lastMentioned date as needed
 - When a loop is clearly resolved (user says they did it, or outcome is known), set status to "resolved"
 - When a loop hasn't been mentioned in the last 14 days of conversation, set status to "stale"
-- Keep max 10 open loops. Drop resolved/stale ones first if you need space
+- Keep max 8 open loops. Drop resolved/stale ones first if you need space
 - Don't create loops for routine tasks (checking email, looking at calendar) — only meaningful ongoing threads
 
 EMOTIONAL ARC RULES:
@@ -289,7 +322,7 @@ KEY MOMENTS RULES:
   - A moment where Nest screwed up
   - An inside joke or reference that developed
   - A time they opened up about something personal
-- Keep max 10 key moments. Drop old "low" callback_potential ones when adding new ones.
+- Keep max 6 key moments. Drop old "low" callback_potential ones when adding new ones.
 - callback_potential: "high" = could become a natural callback. "low" = don't bring this up (negative memory)
 - Carry forward ALL existing key_moments unless dropping for space
 
@@ -310,7 +343,7 @@ Return ONLY valid JSON, no markdown fences.`;
 
   try {
     const _t0 = Date.now();
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -318,11 +351,9 @@ Return ONLY valid JSON, no markdown fences.`;
       },
       body: JSON.stringify({
         model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: `New messages to incorporate:\n${conversationText}` },
-        ],
-        max_tokens: 2500,
+        instructions: systemPrompt,
+        input: `New messages to incorporate:\n${conversationText}`,
+        max_output_tokens: 1200,
         temperature: 0.2,
       }),
     });
@@ -337,14 +368,14 @@ Return ONLY valid JSON, no markdown fences.`;
       await logApiUsage(supabase, {
         userId, model: "gpt-4.1-mini", endpoint: "memory-summary",
         description:     "Rolling conversation summary update",
-        tokensIn:        data.usage.prompt_tokens                              ?? 0,
-        tokensOut:       data.usage.completion_tokens                          ?? 0,
-        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
-        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        tokensIn:        data.usage.input_tokens                           ?? 0,
+        tokensOut:       data.usage.output_tokens                          ?? 0,
+        tokensInCached:  data.usage.input_tokens_details?.cached_tokens    ?? 0,
+        tokensReasoning: data.usage.output_tokens_details?.reasoning_tokens ?? 0,
         latencyMs: Date.now() - _t0,
       });
     }
-    const raw = data.choices?.[0]?.message?.content ?? "";
+    const raw = extractResponseText(data);
     const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     const parsed = JSON.parse(cleaned);
 
@@ -522,7 +553,7 @@ export async function extractLearnings(
 
   try {
     const _t0 = Date.now();
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -530,11 +561,9 @@ export async function extractLearnings(
       },
       body: JSON.stringify({
         model: "gpt-4.1-nano",
-        messages: [
-          { role: "system", content: `${LEARNING_SYSTEM}\n\nTODAY: ${today}` },
-          { role: "user", content: message },
-        ],
-        max_tokens: 500,
+        instructions: `${LEARNING_SYSTEM}\n\nTODAY: ${today}`,
+        input: message,
+        max_output_tokens: 500,
         temperature: 0,
       }),
     });
@@ -549,14 +578,14 @@ export async function extractLearnings(
       await logApiUsage(supabase, {
         userId, model: "gpt-4.1-nano", endpoint: "memory-learnings",
         description:     "User learning & preference extraction",
-        tokensIn:        data.usage.prompt_tokens                              ?? 0,
-        tokensOut:       data.usage.completion_tokens                          ?? 0,
-        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
-        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        tokensIn:        data.usage.input_tokens                           ?? 0,
+        tokensOut:       data.usage.output_tokens                          ?? 0,
+        tokensInCached:  data.usage.input_tokens_details?.cached_tokens    ?? 0,
+        tokensReasoning: data.usage.output_tokens_details?.reasoning_tokens ?? 0,
         latencyMs: Date.now() - _t0,
       });
     }
-    const raw = data.choices?.[0]?.message?.content ?? "[]";
+    const raw = extractResponseText(data) || "[]";
     const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     const learnings = JSON.parse(cleaned);
 
@@ -706,7 +735,7 @@ Return ONLY valid JSON, no markdown fences.`;
 
   try {
     const _t0 = Date.now();
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -714,11 +743,9 @@ Return ONLY valid JSON, no markdown fences.`;
       },
       body: JSON.stringify({
         model: "gpt-4.1-mini",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: "Build or update the identity model based on all available data." },
-        ],
-        max_tokens: 1500,
+        instructions: systemPrompt,
+        input: "Build or update the identity model based on all available data.",
+        max_output_tokens: 1500,
         temperature: 0.3,
       }),
     });
@@ -733,14 +760,14 @@ Return ONLY valid JSON, no markdown fences.`;
       await logApiUsage(supabase, {
         userId, model: "gpt-4.1-mini", endpoint: "memory-identity",
         description:     "Identity & personality model update",
-        tokensIn:        data.usage.prompt_tokens                              ?? 0,
-        tokensOut:       data.usage.completion_tokens                          ?? 0,
-        tokensInCached:  data.usage.prompt_tokens_details?.cached_tokens       ?? 0,
-        tokensReasoning: data.usage.completion_tokens_details?.reasoning_tokens ?? 0,
+        tokensIn:        data.usage.input_tokens                           ?? 0,
+        tokensOut:       data.usage.output_tokens                          ?? 0,
+        tokensInCached:  data.usage.input_tokens_details?.cached_tokens    ?? 0,
+        tokensReasoning: data.usage.output_tokens_details?.reasoning_tokens ?? 0,
         latencyMs: Date.now() - _t0,
       });
     }
-    const raw = data.choices?.[0]?.message?.content ?? "";
+    const raw = extractResponseText(data);
     const cleaned = raw.replace(/```json/g, "").replace(/```/g, "").trim();
     const parsed = JSON.parse(cleaned);
 

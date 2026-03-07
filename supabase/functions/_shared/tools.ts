@@ -161,12 +161,18 @@ export async function executeTool(
   userTimezone?: string,
   /** When provided, update_user_timezone will call this to update the timezone for subsequent tool calls in the same request. */
   onTimezoneChange?: (newTz: string) => void,
+  /** Source channel context — used by manage_reminder to persist delivery method */
+  sourceContext?: { source: "imessage" | "sms"; phone?: string },
 ): Promise<string> {
   try {
     const tz = userTimezone ?? DEFAULT_TZ;
     if (!args.time_zone) args.time_zone = tz;
     if (name === "weather_lookup" && !args.location) {
       args._userTimezone = tz;
+    }
+    if (name === "manage_reminder" && sourceContext) {
+      args._source_channel = sourceContext.source;
+      args._delivery_phone = sourceContext.phone;
     }
     const result = await dispatch(name, args, userId, supabase);
 
@@ -2182,31 +2188,58 @@ async function sendEmail(
 }
 
 // ══════════════════════════════════════════════════════════════
-// WEB SEARCH (OpenAI Responses API with web_search_preview)
+// WEB SEARCH (OpenAI Responses API with web_search — GA version)
+// Returns structured evidence: text + citations + sources + timestamp.
 // ══════════════════════════════════════════════════════════════
 
 async function webSearch(args: Record<string, unknown>): Promise<unknown> {
   const query = args.query as string;
+
+  const toolConfig: Record<string, unknown> = { type: "web_search" };
+  if (args._user_location) {
+    toolConfig.user_location = args._user_location;
+  }
+
   const resp = await retryFetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "gpt-4.1-mini",
-      tools: [{ type: "web_search_preview" }],
+      tools: [toolConfig],
       input: query,
     }),
-  });
+  }, 45_000);
   if (!resp.ok) throw new Error(`Web search failed (${resp.status})`);
 
   const data = await resp.json();
-  const text = data.output
-    ?.filter((item: any) => item.type === "message")
-    ?.flatMap((item: any) => item.content)
-    ?.filter((c: any) => c.type === "output_text")
-    ?.map((c: any) => c.text)
-    ?.join("\n") ?? "";
 
-  return { result: text, query };
+  const messageItems = data.output?.filter((item: any) => item.type === "message") ?? [];
+  const text = messageItems
+    .flatMap((item: any) => item.content)
+    .filter((c: any) => c.type === "output_text")
+    .map((c: any) => c.text)
+    .join("\n") ?? "";
+
+  const citations = messageItems
+    .flatMap((item: any) => item.content)
+    .filter((c: any) => c.type === "output_text")
+    .flatMap((c: any) => c.annotations ?? [])
+    .filter((a: any) => a.type === "url_citation")
+    .map((a: any) => ({ url: a.url, title: a.title }));
+
+  const sources = messageItems
+    .flatMap((item: any) => item.content)
+    .filter((c: any) => c.type === "output_text")
+    .flatMap((c: any) => c.sources ?? [])
+    .map((s: any) => ({ url: s.url, title: s.title }));
+
+  return {
+    result: text,
+    query,
+    citations: citations.length > 0 ? citations : undefined,
+    sources: sources.length > 0 ? sources : undefined,
+    searched_at: new Date().toISOString(),
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -2359,6 +2392,9 @@ async function manageReminder(
       let nextFireAt: string | null = parsedNextFire ?? null;
       if (!nextFireAt && cronExpression) nextFireAt = computeNextCronFire(cronExpression, tz);
 
+      const sourceChannel = (args._source_channel as string) ?? "imessage";
+      const deliveryPhone = (args._delivery_phone as string) ?? null;
+
       const { data, error } = await supabase
         .from("v2_triggers")
         .insert({
@@ -2370,6 +2406,8 @@ async function manageReminder(
           repeating: isRepeating(args.schedule as string),
           next_fire_at: nextFireAt,
           active: true,
+          source_channel: sourceChannel,
+          delivery_phone: deliveryPhone,
         })
         .select("id")
         .single();

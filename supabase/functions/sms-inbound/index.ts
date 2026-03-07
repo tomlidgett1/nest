@@ -343,6 +343,7 @@ async function processAndSend(
     activeCommitments: activeCommitments && activeCommitments.length > 0 ? activeCommitments : null,
     recallPitchStatus: memory?.recallPitchStatus ?? null,
     timezoneHolder,
+    source: "sms",
   };
 
   const quickRoute = tryFastRoute(message, nestUser, recentChat);

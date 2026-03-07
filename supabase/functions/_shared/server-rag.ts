@@ -25,6 +25,17 @@ import { logApiUsage } from "./cost-tracker.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 const MAX_EVIDENCE_BLOCKS = 12;
 const MAX_EVIDENCE_CHARS = 1200;
 const MIN_SEMANTIC_SCORE = 0.28;
@@ -527,7 +538,7 @@ Return ONLY valid JSON, no markdown, no explanation.
 User question: ${query}`;
 
     const _t0 = Date.now();
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -535,8 +546,8 @@ User question: ${query}`;
       },
       body: JSON.stringify({
         model: "gpt-4.1-mini",
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: 250,
+        input: prompt,
+        max_output_tokens: 250,
         temperature: 0,
       }),
     });
@@ -558,7 +569,7 @@ User question: ${query}`;
         latencyMs:       Date.now() - _t0,
       });
     }
-    const text = data.choices?.[0]?.message?.content ?? "";
+    const text = extractResponseText(data);
     return parseQueryPlan(text);
   } catch (e) {
     console.warn("[server-rag] Planner failed:", e);

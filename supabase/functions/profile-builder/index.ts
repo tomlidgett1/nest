@@ -34,6 +34,17 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 function json(body: Record<string, unknown>, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -887,7 +898,7 @@ DETECTIVE RULES:
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120_000);
 
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -895,13 +906,11 @@ DETECTIVE RULES:
       },
       body: JSON.stringify({
         model: "gpt-5.2",
-        max_completion_tokens: 10000,
+        max_output_tokens: 10000,
         temperature: 0.3,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: finalContext },
-        ],
+        text: { format: { type: "json_object" } },
+        instructions: systemPrompt,
+        input: finalContext,
       }),
       signal: controller.signal,
     });
@@ -915,13 +924,13 @@ DETECTIVE RULES:
     }
 
     const data = await resp.json();
-    const content = data.choices?.[0]?.message?.content ?? "{}";
-    const finishReason = data.choices?.[0]?.finish_reason ?? "unknown";
-    const usage = data.usage ?? {};
-    console.log(`[profile-builder] LLM: ${content.length} chars, finish=${finishReason}, tokens: in=${usage.prompt_tokens ?? "?"} out=${usage.completion_tokens ?? "?"}`);
+    const content = extractResponseText(data) || "{}";
+    const status = (data as Record<string, unknown>).status as string ?? "unknown";
+    const usage = (data as Record<string, unknown>).usage as Record<string, unknown> ?? {};
+    console.log(`[profile-builder] LLM: ${content.length} chars, status=${status}, tokens: in=${usage.input_tokens ?? "?"} out=${usage.output_tokens ?? "?"}`);
 
-    if (finishReason === "length") {
-      console.warn(`[profile-builder] Response truncated at max_completion_tokens`);
+    if (status === "incomplete") {
+      console.warn(`[profile-builder] Response truncated at max_output_tokens`);
     }
 
     try {

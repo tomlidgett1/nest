@@ -8,6 +8,17 @@
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
 
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
+
 const DECISION_PROMPT = `You are deciding whether "Nest" (an AI participant in a group iMessage chat) should respond to the latest message.
 
 Nest should respond when:
@@ -53,7 +64,7 @@ Deno.serve(async (req: Request) => {
       ? `Recent conversation:\n${recentContext}\n\nLatest message: ${current_message}\n\nShould Nest respond?`
       : `Latest message: ${current_message}\n\nShould Nest respond?`;
 
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -61,12 +72,10 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         model: "gpt-4.1-nano",
-        max_tokens: 3,
+        max_output_tokens: 3,
         temperature: 0,
-        messages: [
-          { role: "system", content: DECISION_PROMPT },
-          { role: "user", content: userPrompt },
-        ],
+        instructions: DECISION_PROMPT,
+        input: userPrompt,
       }),
     });
 
@@ -76,7 +85,7 @@ Deno.serve(async (req: Request) => {
     }
 
     const data = await response.json();
-    const answer = (data.choices?.[0]?.message?.content || "").trim().toLowerCase();
+    const answer = (extractResponseText(data) || "").trim().toLowerCase();
     const respond = answer.startsWith("yes");
 
     return Response.json({ respond });

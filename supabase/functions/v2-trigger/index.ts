@@ -17,8 +17,23 @@ import { getBatchEmbeddings, vectorString, executeTool, localTimeToUtc } from ".
 import { appendToConversation } from "../_shared/conversation-store.ts";
 import { getUserMemory } from "../_shared/memory-service.ts";
 import { getAllAccountTokens, listGmailMessages, getGmailMessage } from "../_shared/gmail-helpers.ts";
+import { sendSmsResponse } from "../_shared/sms-sender.ts";
 
 const openaiApiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
+const smsApiUsername = Deno.env.get("SMS_API_USERNAME") ?? "";
+const smsApiPassword = Deno.env.get("SMS_API_PASSWORD") ?? "";
+const smsSenderId = Deno.env.get("SMS_SENDER_ID") ?? "";
+
+function extractResponseText(data: Record<string, unknown>): string {
+  const output = data.output as Array<Record<string, unknown>> | undefined;
+  if (!output) return "";
+  return output
+    .filter((o) => o.type === "message")
+    .flatMap((o) => (o.content as Array<Record<string, unknown>>) ?? [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text as string)
+    .join("");
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -660,7 +675,7 @@ async function regenerateBriefing(userId: string, _today: string): Promise<void>
 
   // Generate briefing via LLM
   try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${openaiApiKey}`,
@@ -668,11 +683,9 @@ async function regenerateBriefing(userId: string, _today: string): Promise<void>
       },
       body: JSON.stringify({
         model: "gpt-5.4",
-        messages: [
-          { role: "system", content: BRIEFING_SYSTEM_PROMPT },
-          { role: "user", content: parts.join("\n") },
-        ],
-        max_tokens: 400,
+        instructions: BRIEFING_SYSTEM_PROMPT,
+        input: parts.join("\n"),
+        max_output_tokens: 400,
         temperature: 0.3,
       }),
     });
@@ -683,7 +696,7 @@ async function regenerateBriefing(userId: string, _today: string): Promise<void>
     }
 
     const data = await resp.json();
-    const briefing = data.choices?.[0]?.message?.content?.trim() ?? "";
+    const briefing = extractResponseText(data).trim();
     if (briefing.length < 20) return;
 
     // Upsert briefing
@@ -740,7 +753,7 @@ async function handleCronReminders(): Promise<Response> {
 
     const { data: triggers, error } = await supabaseAdmin
       .from("v2_triggers")
-      .select("id, user_id, action_description, cron_expression, repeating")
+      .select("id, user_id, action_description, cron_expression, repeating, source_channel, delivery_phone")
       .eq("active", true)
       .eq("trigger_type", "cron")
       .lte("next_fire_at", now);
@@ -756,26 +769,49 @@ async function handleCronReminders(): Promise<Response> {
 
     console.log(`[v2-trigger] Found ${triggers.length} cron reminder(s) to fire`);
 
-    const allMessages: Array<{ user_id: string; message: string }> = [];
+    const allMessages: Array<{ user_id: string; message: string; message_id?: string | null }> = [];
 
     for (const trigger of triggers) {
       try {
-        // Generate conversational reminder via LLM
         const message = await generateReminderMessage(trigger.action_description, trigger.user_id);
 
         if (message) {
+          const source = (trigger.source_channel as string) ?? "imessage";
+
           // Store in chat history so the agent has context if user replies
           const { data: inserted } = await supabaseAdmin.from("v2_chat_messages").insert({
             user_id: trigger.user_id,
             role: "assistant",
             content: message,
+            source,
           }).select("id").single();
 
-          allMessages.push({
-            user_id: trigger.user_id,
-            message,
-            message_id: inserted?.id ?? null,
-          });
+          if (source === "sms") {
+            // SMS reminders: deliver directly via SMS API
+            const phone = trigger.delivery_phone as string | null;
+            if (phone && smsApiUsername) {
+              try {
+                await sendSmsResponse(phone, message, {
+                  apiUsername: smsApiUsername,
+                  apiPassword: smsApiPassword,
+                  senderId: smsSenderId,
+                  customRefPrefix: `reminder-${trigger.id}`,
+                });
+                console.log(`[v2-trigger] SMS reminder sent to ${phone}: ${trigger.action_description.slice(0, 60)}`);
+              } catch (smsErr) {
+                console.error(`[v2-trigger] SMS send failed for reminder ${trigger.id}:`, smsErr);
+              }
+            } else {
+              console.warn(`[v2-trigger] SMS reminder ${trigger.id} has no delivery_phone — skipping SMS send`);
+            }
+          } else {
+            // iMessage reminders: returned in response for the bridge to deliver
+            allMessages.push({
+              user_id: trigger.user_id,
+              message,
+              message_id: inserted?.id ?? null,
+            });
+          }
         }
 
         // Resolve user timezone for next fire computation
@@ -801,7 +837,7 @@ async function handleCronReminders(): Promise<Response> {
           .update(updates)
           .eq("id", trigger.id);
 
-        console.log(`[v2-trigger] Fired reminder ${trigger.id}: ${trigger.action_description.slice(0, 80)}`);
+        console.log(`[v2-trigger] Fired reminder ${trigger.id} [${(trigger.source_channel as string) ?? "imessage"}]: ${trigger.action_description.slice(0, 80)}`);
       } catch (e) {
         console.error(`[v2-trigger] Failed to fire reminder ${trigger.id}:`, e);
       }
@@ -1051,22 +1087,29 @@ You will receive a DEEP PROFILE of this person: their role, personality, communi
 
 FORMAT - you MUST use exactly this structure with --- on its own line between each bubble:
 
-Bubble 1: Start with their name and a time-appropriate greeting that makes it clear this is their inbox summary. E.g. "Morning {name}, here's your inbox" or "{name}, your inbox rundown for today". Then add a brief contextual note about their day/situation if relevant. One line.
+Bubble 1: Their name + time-appropriate greeting making it clear this is their inbox summary. One line. E.g. "Morning {name}, here's your inbox" or "{name}, your inbox rundown for today".
 ---
-Bubble 2: Start with "To Action:" on its own line. Group by inbox if multiple. Items as "**Sender** - **Subject**: one-line description with WHY it matters to them". One item per line.
----
-Bubble 3: Start with "FYI:" on its own line. Group by inbox if multiple. One item per line.
----
-Bubble 4: Start with "Promos:" on its own line, then brief one-liners. Skip entirely if nothing worth mentioning.
+Bubble 2: "To Action:" on its own line, then a blank line, then each email in this two-line format:
 
-If the user only has one inbox, skip the inbox header and just list items directly.
+**Descriptive title of what the email is actually about** - from {first name or short name}
+Why this matters to them right now, connected to their life/calendar/open threads
+
+Leave a blank line between each email. The title must NOT be the raw subject line or "Sender - Subject". Rewrite it as a short, natural phrase that answers "what is this about?" e.g. "Budget approval needed for Q2 campaign", "Your flight to Melbourne needs seat selection", "Lease renewal offer from your landlord".
+---
+Bubble 3: "FYI:" on its own line, then a blank line, then same two-line format. The second line here answers "so what?" briefly.
+---
+Bubble 4: "Promos:" on its own line, then brief one-liners. Skip entirely if nothing worth mentioning.
+
+If the user only has one inbox, skip the inbox header and just list items directly. When grouping by inbox, use the email address followed by a colon as the header, with a blank line before each inbox group.
 
 RULES:
 - ALWAYS use --- on its own line to separate bubbles
-- Each item MUST be on a single line: **Sender** - **Subject**: description. Never wrap onto multiple lines.
-- Bold **sender names** and **key subjects** on the same line
-- When grouping by inbox, use the email address followed by a colon as the header, with a blank line before each inbox group
-- Keep each bubble concise, scannable in 5 seconds
+- Each email is EXACTLY two lines: bold descriptive title + "from {name}" on line 1, context on line 2
+- ONLY the descriptive title is bolded. Sender names are plain text after a hyphen: "- from James"
+- The title is YOUR summary of what the email is about, not the raw subject line. Make it immediately clear why someone should care.
+- The second line answers "so what does this mean for me?" - use their profile, calendar, open threads, and knowledge base context to connect the dots
+- Blank line between each email for breathing room
+- Keep each bubble scannable in 5 seconds
 - If the inbox is quiet (0-2 emails), just send one warm bubble acknowledging the quiet morning
 - If a section has nothing, skip that bubble and its --- separator
 - Use Australian English (summarise, analyse, colour)
@@ -3373,15 +3416,22 @@ Output JSON only:
 
 // ── Custom Automation Execution ─────────────────────────────
 
-const CUSTOM_CLASSIFY_PROMPT = `You are a data-source planner for a personal assistant automation.
+function buildCustomClassifyPrompt(tz: string): string {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString("en-AU", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: tz });
+  const timeStr = now.toLocaleTimeString("en-AU", { hour: "2-digit", minute: "2-digit", hour12: true, timeZone: tz });
+
+  return `You are a data-source planner for a personal assistant automation.
 Given the user's automation prompt, decide which tools to call and what queries to use.
+
+CURRENT DATE/TIME: ${dateStr}, ${timeStr} (${tz})
 
 Available tools:
 - calendar_lookup: calendar events. query param = time range like "today", "this week", "next 3 days"
 - gmail_search: search emails. query param = Gmail search string like "from:sarah newer_than:7d", "subject:invoice newer_than:30d"
 - semantic_search: search user's indexed data (emails, docs, notes, past conversations). query param = natural language
 - contacts_search: look up contacts. query param = name or company
-- web_search: search the web. query param = search terms
+- web_search: search the web for LIVE information. query param = search terms. ALWAYS include the current date in news queries.
 
 Return ONLY valid JSON:
 {
@@ -3391,7 +3441,9 @@ Return ONLY valid JSON:
 
 skip_if_empty: true if the automation should stay silent when there is nothing new to report (most automations should be true).
 Only include tools that are genuinely needed. Less is better.
-For news/current events, use web_search with specific, targeted queries (e.g. "Melbourne news today March 2026").`;
+
+CRITICAL FOR NEWS/CURRENT EVENTS: Always include today's date in web_search queries. Example: "global news ${dateStr}". Never use vague queries like "latest news" without the date. The search must return content from the last 24 hours, not stale cached results.`;
+}
 
 const CUSTOM_GENERATE_PROMPT = `You are Nest, a personal assistant delivering a recurring automation update via iMessage.
 
@@ -3413,12 +3465,14 @@ PREVIOUS RUNS (learn from engagement patterns):
 
 ABSOLUTE RULES - VIOLATION OF ANY = CRITICAL FAILURE:
 
-1. ZERO HALLUCINATION TOLERANCE: You may ONLY state facts that appear verbatim in the SOURCE DATA above. If a headline, name, number, date, or claim is not explicitly present in the source data, you MUST NOT include it. Do not infer, extrapolate, or "fill in" details.
+1. ZERO HALLUCINATION TOLERANCE: You may ONLY state facts that appear verbatim in the SOURCE DATA above. If a headline, name, number, date, or claim is not explicitly present in the source data, you MUST NOT include it. Do not infer, extrapolate, or "fill in" details. Your training data is months old - NEVER supplement source data with your own knowledge about news, politics, sports, markets, or any time-sensitive topic.
 
 2. If the source data is empty, contains only errors, or has no relevant content, respond with exactly: __SKIP__
    Do NOT make up content. Do NOT write a generic summary. Do NOT say "here's what's happening" and then fabricate items.
 
 3. Every bullet point or claim you make must be directly traceable to a specific item in the source data. If you cannot point to the exact source text, do not include it.
+
+4. PERISHABLE KNOWLEDGE: If this automation involves news, current events, politics, sports, or markets, you may ONLY use facts from the SOURCE DATA. Do NOT fill gaps from your training data. If the source data is thin, respond with __SKIP__. A skipped update is infinitely better than delivering wrong facts (e.g. naming the wrong president, reporting stale scores).
 
 4. ALWAYS start with the user's name and make it clear what this update is about. E.g. "Hey {user_name}, your [topic] update" or "Morning {user_name}, here's your [topic]". The user should immediately know what this message is and why they're getting it.
 5. Max 2-3 short bubbles separated by ---
@@ -3442,6 +3496,8 @@ async function executeCustomAutomation(userId: string, config: any, automationId
 
   const memory = await getUserMemory(userId, supabaseAdmin);
 
+  const tz = (config.timezone as string) || "UTC";
+
   // Stage 1: Classify - determine which tools to call
   let toolPlan: Record<string, Record<string, unknown>> = {};
   let skipIfEmpty = true;
@@ -3458,7 +3514,7 @@ async function executeCustomAutomation(userId: string, config: any, automationId
         body: JSON.stringify({
           model: "gpt-5.4",
           max_output_tokens: 300,
-          instructions: CUSTOM_CLASSIFY_PROMPT,
+          instructions: buildCustomClassifyPrompt(tz),
           input: [{ role: "user", content: `Automation prompt: "${prompt}"` }],
         }),
       });
@@ -3486,7 +3542,6 @@ async function executeCustomAutomation(userId: string, config: any, automationId
   }
 
   // Stage 2: Gather - execute the tools
-  const tz = (config.timezone as string) || "UTC";
   const gathered: Record<string, string> = {};
   let hasData = false;
 
@@ -3517,6 +3572,40 @@ async function executeCustomAutomation(userId: string, config: any, automationId
       }).eq("id", automationId);
     } catch {}
     return;
+  }
+
+  // Stage 2.5: Freshness gate for web_search results
+  // If the automation used web_search, verify the results contain recent date references.
+  // Stale web results (from model training data leaking through) get re-searched with date anchor.
+  if (gathered.web_search && toolPlan.web_search) {
+    const webResult = gathered.web_search;
+    const now = new Date();
+    const todayStr = now.toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric", timeZone: tz });
+    const yesterdayStr = new Date(now.getTime() - 24 * 60 * 60 * 1000)
+      .toLocaleDateString("en-AU", { day: "numeric", month: "long", year: "numeric", timeZone: tz });
+    const yearStr = now.getFullYear().toString();
+    const monthStr = now.toLocaleDateString("en-AU", { month: "long", timeZone: tz });
+
+    const hasRecentDate = webResult.includes(todayStr) || webResult.includes(yesterdayStr) ||
+      webResult.includes(`${monthStr} ${yearStr}`) || webResult.includes(`${yearStr}`) ||
+      webResult.includes("searched_at");
+
+    if (!hasRecentDate) {
+      console.log(`[v2-trigger] Custom "${label}" - web_search results look stale, re-searching with date anchor`);
+      try {
+        const originalQuery = (toolPlan.web_search as Record<string, unknown>).query as string || prompt;
+        const dateAnchoredQuery = `${originalQuery} ${todayStr}`;
+        const retryResult = await executeTool("web_search", { query: dateAnchoredQuery, time_zone: tz }, userId, supabaseAdmin, tz);
+        if (retryResult && retryResult.length > 50 && !retryResult.includes('"error"')) {
+          gathered.web_search = retryResult;
+          console.log(`[v2-trigger] Custom "${label}" - date-anchored re-search returned fresh results`);
+        } else {
+          console.log(`[v2-trigger] Custom "${label}" - date-anchored re-search also thin, proceeding with original`);
+        }
+      } catch (e) {
+        console.warn(`[v2-trigger] Custom "${label}" - freshness re-search failed:`, (e as Error).message);
+      }
+    }
   }
 
   // Stage 3: Cross-automation dedup - check what was already sent today

@@ -17,6 +17,7 @@ import {
   truncateHistory,
   decideReaction,
   detectPrefetch,
+  isPerishableQuery,
   callOpenAI,
   MODELS,
   type NestUser,
@@ -92,6 +93,8 @@ export interface NestContext {
   timezoneHolder?: TimezoneHolder;
   /** True when user is messaging 1:1 for the first time after interacting in a group chat */
   groupTransition?: boolean;
+  /** Channel the message arrived on — determines reminder delivery method */
+  source?: "imessage" | "sms";
 }
 
 // ── Identity Model Type ──────────────────────────────────────
@@ -1163,15 +1166,19 @@ function buildToneDirective(
 
 // ── Conversation History Builder ─────────────────────────────
 
-// With 70 raw messages loaded, we need a larger budget to keep the full
-// conversation window available alongside injected context blocks.
-const HISTORY_TOKEN_BUDGET = 30_000;
+// Route-aware history budgets. Smaller models don't need (and are slower with)
+// massive context windows. Casual needs minimal history; light agent needs
+// moderate; full agent gets the full budget.
+const HISTORY_BUDGET_FULL = 20_000;
+const HISTORY_BUDGET_LIGHT = 10_000;
+const HISTORY_BUDGET_CASUAL = 4_000;
 
 function buildConversationHistory(
   currentMessage: string,
   recentChat: Array<{ role: string; content: string; created_at?: string }>,
   ctx: NestContext,
   needsProfile = true,
+  historyBudget = HISTORY_BUDGET_FULL,
 ): Array<{ role: string; content: string }> {
   // Use user's local time for sentAt tags so the model sees the correct date
   const userTz = ctx.user.timezone || "UTC";
@@ -1179,62 +1186,69 @@ function buildConversationHistory(
   const messages: Array<{ role: string; content: string }> = [];
 
   // ── Merged context injection ──────────────────────────────────
-  // All context blocks merged into a SINGLE user/assistant turn pair.
-  // Every query gets full context — identity, learnings, profile — because
-  // even "simple" questions can require reasoning about the user's life.
+  // Context blocks merged into a SINGLE user/assistant turn pair.
+  // Budget-aware: light/casual routes get minimal context to keep
+  // gpt-5-mini fast. Full agent gets everything.
 
+  const isLeanContext = historyBudget <= HISTORY_BUDGET_LIGHT;
   const contextSections: string[] = [];
 
-  const identityBlock = buildIdentityBlock(ctx.memory?.identityModel);
-  if (identityBlock) {
-    contextSections.push(identityBlock);
-  }
-
-  if (ctx.memory?.summary) {
-    let mem = `CONVERSATION SUMMARY:\n${ctx.memory.summary}`;
-    if (ctx.memory.emotionalArc) {
-      mem += `\n\nEmotional arc: ${ctx.memory.emotionalArc}`;
+  // Identity and memory — skip for lean routes (weather, currency, etc.)
+  if (!isLeanContext) {
+    const identityBlock = buildIdentityBlock(ctx.memory?.identityModel);
+    if (identityBlock) {
+      contextSections.push(identityBlock);
     }
-    if (ctx.memory.writingStyle) {
-      mem += `\n\nWriting style: ${ctx.memory.writingStyle}`;
+
+    if (ctx.memory?.summary) {
+      let mem = `CONVERSATION SUMMARY:\n${ctx.memory.summary}`;
+      if (ctx.memory.emotionalArc) {
+        mem += `\n\nEmotional arc: ${ctx.memory.emotionalArc}`;
+      }
+      if (ctx.memory.writingStyle) {
+        mem += `\n\nWriting style: ${ctx.memory.writingStyle}`;
+      }
+      contextSections.push(mem);
     }
-    contextSections.push(mem);
-  }
 
-  if (ctx.memory?.openLoops && ctx.memory.openLoops.length > 0) {
-    const activeLoops = ctx.memory.openLoops
-      .filter(l => l.status === "open")
-      .slice(0, 5);
+    if (ctx.memory?.openLoops && ctx.memory.openLoops.length > 0) {
+      const activeLoops = ctx.memory.openLoops
+        .filter(l => l.status === "open")
+        .slice(0, 5);
 
-    if (activeLoops.length > 0) {
-      const loopText = activeLoops
-        .map(l => `- "${l.topic}" (${l.context})`)
-        .join("\n");
-      contextSections.push(`OPEN THREADS (reference naturally when relevant, max 1 per conversation, never force it):\n${loopText}`);
+      if (activeLoops.length > 0) {
+        const loopText = activeLoops
+          .map(l => `- "${l.topic}" (${l.context})`)
+          .join("\n");
+        contextSections.push(`OPEN THREADS (background context only — reference naturally when relevant, max 1 per conversation, never force it. NEVER act on these when the user sends a short reply like "yes"/"no"/"do it" — those ALWAYS refer to your last message, not open threads):\n${loopText}`);
+      }
+    }
+
+    const learnedBlock = buildLearnedKnowledgeBlock(ctx.learnings);
+    if (learnedBlock) {
+      contextSections.push(learnedBlock);
+    }
+
+    const relationshipBlock = buildRelationshipBlock(
+      ctx.memory?.relationshipNotes,
+      ctx.memory?.keyMoments,
+    );
+    if (relationshipBlock) {
+      contextSections.push(relationshipBlock);
     }
   }
 
-  const learnedBlock = buildLearnedKnowledgeBlock(ctx.learnings);
-  if (learnedBlock) {
-    contextSections.push(learnedBlock);
-  }
-
-  const relationshipBlock = buildRelationshipBlock(
-    ctx.memory?.relationshipNotes,
-    ctx.memory?.keyMoments,
-  );
-  if (relationshipBlock) {
-    contextSections.push(relationshipBlock);
-  }
-
+  // Situational context — always include (needed for calendar reasoning)
   const situationalBlock = buildSituationalBlock(ctx.dailyBriefing, ctx.activeCommitments);
   if (situationalBlock) {
     contextSections.push(situationalBlock);
   }
 
-  const meetingPitchBlock = buildMeetingNotesPitchBlock(currentMessage, ctx);
-  if (meetingPitchBlock) {
-    contextSections.push(meetingPitchBlock);
+  if (!isLeanContext) {
+    const meetingPitchBlock = buildMeetingNotesPitchBlock(currentMessage, ctx);
+    if (meetingPitchBlock) {
+      contextSections.push(meetingPitchBlock);
+    }
   }
 
   // User context
@@ -1397,14 +1411,42 @@ function buildConversationHistory(
     }
   }
 
+  // ── Recency anchor for short follow-ups ──────────────────────
+  // When the user sends a short message ("Yes", "Do it", "Yeah please", etc.)
+  // after a long conversation, the model can get confused by stale offers from
+  // earlier threads. Inject the last assistant message as a visible anchor so
+  // the model knows EXACTLY what the user is responding to.
+  const SHORT_FOLLOWUP_THRESHOLD = 40;
+  const isShortFollowup = currentMessage.trim().length <= SHORT_FOLLOWUP_THRESHOLD;
+  if (isShortFollowup && messages.length >= 2) {
+    const lastAssistantIdx = messages.length - 1;
+    const lastAssistantMsg = messages[lastAssistantIdx];
+    if (lastAssistantMsg?.role === "assistant") {
+      const snippet = lastAssistantMsg.content
+        .replace(/<[^>]+>/g, "")
+        .trim()
+        .slice(0, 300);
+      if (snippet.length > 10) {
+        messages.push({
+          role: "user",
+          content: tag("context", `RECENCY ANCHOR — The user's next message is a direct reply to YOUR last message above: "${snippet}"\nInterpret their response ONLY in the context of this last exchange. Ignore all older offers, suggestions, or questions from earlier in the conversation.`, now),
+        });
+        messages.push({
+          role: "assistant",
+          content: "Understood — I'll respond to the user's message in the context of my last message only.",
+        });
+      }
+    }
+  }
+
   // Current message (with context prefix prepended if available)
   const userContent = contextPrefix
     ? contextPrefix + tag("user", currentMessage, now)
     : tag("user", currentMessage, now);
   messages.push({ role: "user", content: userContent });
 
-  // Truncate
-  return truncateHistory(messages, HISTORY_TOKEN_BUDGET);
+  // Truncate to route-appropriate budget
+  return truncateHistory(messages, historyBudget);
 }
 
 // ── Prefetch Executor ────────────────────────────────────────
@@ -1451,6 +1493,9 @@ async function executePrefetch(
 
 function buildToolExecutor(ctx: NestContext) {
   const tzHolder = ctx.timezoneHolder;
+  const sourceContext = ctx.source
+    ? { source: ctx.source, phone: ctx.user.phone }
+    : undefined;
   return (name: string, args: Record<string, unknown>): Promise<string> => {
     if (name === "weather_lookup" && !args.location && ctx.user.currentLocation) {
       args.location = ctx.user.currentLocation;
@@ -1459,6 +1504,7 @@ function buildToolExecutor(ctx: NestContext) {
       name, args, ctx.userId, ctx.supabase,
       tzHolder ? tzHolder.tz : ctx.user.timezone,
       tzHolder ? (newTz: string) => tzHolder.update(newTz) : undefined,
+      sourceContext,
     );
   };
 }
@@ -1768,6 +1814,35 @@ function looksLikeToolQuery(message: string): boolean {
   return TOOL_QUERY_SIGNALS.some(s => lower.includes(s));
 }
 
+function looksLikeSlowRequest(message: string): boolean {
+  const trimmed = message.trim();
+  if (!trimmed) return false;
+  if (trimmed.length <= 8 && !trimmed.includes("?")) return false;
+  if (looksLikeToolQuery(trimmed) || isPerishableQuery(trimmed)) return true;
+  if (/[?]/.test(trimmed) && trimmed.length >= 14) return true;
+  if (/\b(and then|also|plus|as well|along with)\b/i.test(trimmed)) return true;
+  if (/^(what|when|where|who|which|show|check|find|summarise|summarize|tell me|can you|could you|please|do i|what's|whats)\b/i.test(trimmed)) return true;
+  return false;
+}
+
+function shouldSendInlineAckForRoute(
+  message: string,
+  routing: RoutingResult,
+): boolean {
+  if (routing.path !== "agent" || routing.skipAck) return false;
+  if ((routing.prefetch?.length ?? 0) > 0) return true;
+  if ((routing.tools?.length ?? 0) > 0) return true;
+  return looksLikeSlowRequest(message);
+}
+
+function shouldSendInlineAckSpeculative(
+  message: string,
+  speculativePrefetchTasks: PrefetchTask[],
+): boolean {
+  if (speculativePrefetchTasks.length > 0) return true;
+  return looksLikeSlowRequest(message);
+}
+
 const TESTING_INLINE_ACK_PROMPT = `You are Nest. Quick 1-line iMessage ack while you look something up. Max 10 words. Reference what they asked about. No emojis, no em dashes, no process narration ("scanning", "pulling up"). Capitalise first letter.`;
 
 const ACK_SYSTEM_PROMPT = `You are Nest, a mate texting on iMessage. You're about to look something up. Write a quick 1-line hold message (max 10 words).
@@ -1807,7 +1882,7 @@ async function generateInlineAck(
     endpoint: "chat-ack",
     promptVariant: ctx.user.testing ? "testing" : "normal",
   };
-  const resp = await callOpenAI("gpt-5-nano", messages, 60, null, logCtx);
+  const resp = await callOpenAI("gpt-5-nano", messages, 200, null, logCtx, undefined, "low");
   const raw = formatForIMessage(resp.content ?? "");
   let text = raw.split("\n")[0].trim();
   if (text.length > 0) text = text[0].toUpperCase() + text.slice(1);
@@ -1877,7 +1952,7 @@ export async function handleMessage(
 
     // For non-static fast routes, run prefetch + rag + ack in parallel
     const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
-    const shouldAck = routing.path === "agent" && options?.onAck && looksLikeToolQuery(message) && !routing.skipAck;
+    const shouldAck = !!options?.onAck && shouldSendInlineAckForRoute(message, routing);
     const ackPromise = shouldAck
       ? generateInlineAck(message, recentChat, ctx).then(ack => {
           if (ack) options!.onAck!(ack);
@@ -1909,7 +1984,7 @@ export async function handleMessage(
     // No fast match — fire nano classification + speculative prefetch + rag + ack ALL in parallel
     const speculativePrefetchTasks = detectPrefetch(message);
     const ragPromise = options?.ragPromise?.catch(() => "") ?? Promise.resolve("");
-    const shouldAck = options?.onAck && looksLikeToolQuery(message);
+    const shouldAck = !!options?.onAck && shouldSendInlineAckSpeculative(message, speculativePrefetchTasks);
     const ackPromise = shouldAck
       ? generateInlineAck(message, recentChat, ctx).then(ack => {
           if (ack) options!.onAck!(ack);
@@ -1952,9 +2027,22 @@ export async function handleMessage(
     }
   }
 
-  // Build conversation history
+  // Build conversation history with route-appropriate budget
   const profileIncluded = routing.needsProfile ?? true;
-  const conversationHistory = buildConversationHistory(message, recentChat, ctx, profileIncluded);
+  const isLightRoute = routing.path === "agent" && routing.tools && routing.tools.length < 10;
+  // Short follow-ups ("Yes", "Do it", "Yeah please") get a tighter history
+  // budget to prevent the model from being distracted by stale conversation
+  // threads. The recency anchor in buildConversationHistory handles context.
+  const isShortFollowup = message.trim().length <= 40;
+  const historyBudget = routing.path === "casual"
+    ? HISTORY_BUDGET_CASUAL
+    : isShortFollowup
+      ? HISTORY_BUDGET_LIGHT
+      : isLightRoute
+        ? HISTORY_BUDGET_LIGHT
+        : HISTORY_BUDGET_FULL;
+  const conversationHistory = buildConversationHistory(message, recentChat, ctx, profileIncluded, historyBudget);
+  console.log(`[personality-agent] History budget: ${historyBudget} tokens (${routing.path}${isLightRoute ? "/light" : ""}${isShortFollowup ? "/short-followup" : ""}), ${conversationHistory.length} messages`);
   if (!profileIncluded && ctx.userProfile) {
     console.log(`[personality-agent] Profile skipped — operational query (saved ~${estimateProfileTokens(ctx.userProfile)} tokens)`);
   }
@@ -2158,8 +2246,8 @@ Each line = separate iMessage bubble. One complete thought per line. 2-4 lines i
 Lines can be 120+ chars. The rule is one thought per bubble, not a character limit.
 NEVER use em dashes (—) or en dashes (–). Use hyphens (-) or commas instead.
 
-For data (calendar, inbox, summaries), use: short conversational intro → <nest-content> block.
-No headings/bold in conversational replies. Save structured formatting for data.
+TALK like a human. Weave data into sentences. "You've got 3 meetings tomorrow, first one's at 9" is better than a card.
+No headings/bold in conversational replies.
 
 CALENDAR WRITE: "Shall I go ahead?" → "Done ✓" + same card
 REMINDER: EXACTLY one message + ✓. No structured card. No pre-confirmation. No follow-up.
@@ -2167,7 +2255,6 @@ TODO: "Added ✓ You've got N things" / "Done, crossed off X ✓ N left"
 DRAFTS: show in <nest-content> (To, Subject, body) → "Want me to send it?" → "Sent ✓"
 Use ✓ for confirmations. Never use 🎉 or ✅.
 "Done ✓" is ONLY for write actions. NEVER for searches or lookups.
-After completing a task, don't end with follow-up question (except "Want me to send it?" for drafts).
 
 ─── VOICE ───
 
@@ -2178,19 +2265,7 @@ HUMOUR: be actually funny when the moment's right. Information first, personalit
 PROFANITY: match their energy. Never escalate, always match.
 NAME USAGE: Maybe 1 in 5 messages. Only when it adds emphasis or warmth.
 Never sound like customer service. No "glad I could help", no "let me know if you need anything", no "anything else?".
-After tasks, just land it and stop. No sign-offs, no follow-up offers.
-
-─── FOLLOW-UPS ───
-
-Most of the time, DON'T ask a follow-up. Just answer and stop. Let the user drive.
-Only ask when genuinely blocked. Make it specific, not generic.
-NEVER end with: "Anything else?", "Want more details?", "Need help with anything?"
-BIAS TO ACTION. Make your best guess, execute, let them correct.
-
-─── CORRECTIONS ───
-
-Wrong: own it fast (2-3 words), fix immediately. No grovelling.
-"The other one": use context, don't ask them to re-explain.`;
+After tasks, just land it and stop. No sign-offs, no follow-up offers.`;
 
 const IMESSAGE_RULES = `
 ─── IMESSAGE FORMAT ───
@@ -2199,151 +2274,26 @@ Each line = separate iMessage bubble. One complete thought per line. 2-4 lines i
 Lines can be 120+ chars. The rule is one thought per bubble, not a character limit.
 NEVER use em dashes (—) or en dashes (–). Use hyphens (-) or commas instead.
 
-For data (calendar, inbox, summaries), use: short conversational intro → <nest-content> block.
-No headings/bold in conversational replies. Save structured formatting for data.
+TALK like a human. Weave data into natural sentences. No headings/bold in conversational replies.
 
-CALENDAR (single day): One conversational line, then <nest-content>. Each event = "time — title", no bold per event, no bullets.
-CALENDAR (multi-day / week view): One conversational line, then <nest-content>. MUST group by day with bold day headings and blank lines between days. Spanning events (trips, holidays) go at the top. Skip empty days. Example:
-
-Busy week ahead
-
-<nest-content>
-**Next Week**
-
-Skiing in Niseko with Georgia (Mon–Sat, all day)
-
-**Mon 3**
-2:00 pm — APAC Team meeting
-
-**Tue 4**
-8:30 am — Chat about Japan trip
-3:30 pm — MEAPAC WBR
-7:00 pm — BlackFixe All-Hands
-
-**Wed 5**
-3:30 pm — DC APAC Monthly Review
-</nest-content>
-
-CRITICAL for multi-day: NEVER list events as a flat list with date prefixes on each line. ALWAYS group under bold day headings with blank lines between days. This is essential for readability.
-INBOX: One count/summary line, then <nest-content>. Each email: **bold sender name** on its own line, subject on the next line. Blank line between each email. ALL emails inside the <nest-content> block, never before it.
-DRAFTS: show in <nest-content> (To, Subject, body) → "Want me to send it?" → "Sent ✓"
 CALENDAR WRITE: "Shall I go ahead?" → "Done ✓" + same card
-REMINDER: EXACTLY one message + ✓. No structured card. No pre-confirmation line. No follow-up. If it fails, one message explaining why.
+REMINDER: EXACTLY one message + ✓. No structured card. No pre-confirmation line. No follow-up.
 TODO: "Added ✓ You've got N things" / "Done, crossed off X ✓ N left"
-Use ✓ (simple tick) for confirmations. Never use 🎉 or ✅.
-"Done ✓" is ONLY for write actions (sending email, setting reminders, calendar create/update/delete, contacts). NEVER use "Done ✓" for searches, lookups, or information retrieval.
-After completing a task, don't end with follow-up question (except "Want me to send it?" for drafts).
+DRAFTS: show in <nest-content> (To, Subject, body) → "Want me to send it?" → "Sent ✓"
+Use ✓ for confirmations. Never use 🎉 or ✅.
+"Done ✓" is ONLY for write actions. NEVER for searches or lookups.
 
-─── STRUCTURED DATA RULE ───
+─── RESPONSE FORMAT (CRITICAL) ───
 
-CRITICAL: Whenever you present variable or dynamic data (weather, transit, forex, todos, person profiles, places, meeting recaps, travel summaries, booking details, inbox, calendar, search results, or ANY tool-retrieved information), you MUST follow this exact pattern:
+YOUR DEFAULT IS CONVERSATIONAL PROSE. Talk through data like a mate would. Weave numbers, times, and facts into natural sentences.
 
-MESSAGE 1: One natural, conversational sentence. Your take, the headline, a human reaction. This is a normal iMessage bubble. It should feel like a friend telling you the gist. NO data, NO lists, NO details in this line.
+Good:
+- "Not too crazy next week - Monday you've got Nic at 7:30 and APAC team at 2. Tuesday is the EK review at noon then a learning session at 7. Wednesday's the other EK review and MEAPAC WBR. Thursday just your 1:1 with Daniel at 2."
+- "It's about -1 and cloudy, might get some wet snow tomorrow morning. Good ski day if you layer up."
+- "Main emails - Cherry wants more regular orders, BigQuery permissions reminder, and the DC APAC notes came through. Nothing urgent."
+- "AFL kicks off this week - Sydney v Carlton Thursday night at the SCG, 7:30. Friday night Gold Coast host Geelong. Saturday arvo GWS play Hawthorn, then Brisbane v Bulldogs that night. Sunday it's Saints v Pies at the MCG."
 
-MESSAGE 2: A single <nest-content> block containing ALL the structured data, formatted for mobile readability:
-- **Bold heading** as the first line
-- Each data point: **bold label** on its OWN line, value on the NEXT line
-- Blank line between each data point for spacing
-- No emojis, no bullets
-- NEVER put "Label: value" on the same line — always bold label above, value below
-- Practical takeaway as the last line if relevant
-
-NOTHING AFTER the </nest-content> tag. No follow-up line, no question, no sign-off.
-
-NEVER put data, lists, or details OUTSIDE the <nest-content> block. ALL structured information goes inside it. The only thing before the block is your one human sentence.
-
-Examples:
-
-Weather:
-Bit chilly out there today
-
-<nest-content>
-**Melbourne Weather**
-
-**Morning**
-8c, cloudy
-
-**Afternoon**
-14c, clearing up
-
-**Evening**
-10c, light wind
-
-Grab a jacket if you're heading out before lunch
-</nest-content>
-
-Forex:
-Not bad actually
-
-<nest-content>
-**AUD to JPY**
-
-**Rate**
-1 AUD = 98.45 JPY
-
-**500 AUD**
-49,225 JPY
-
-**As of**
-2:30 pm AEST
-</nest-content>
-
-Inbox:
-5 new emails today
-
-<nest-content>
-**Inbox**
-
-**Sarah Chen**
-Q1 Budget Review (needs sign-off)
-
-**Daniel Barth**
-Hotel confirmation for Kyoto
-
-**Vercel**
-Failed deployment on nest-web
-</nest-content>
-
-Person:
-Here's what I've got
-
-<nest-content>
-**Sarah Chen**
-
-**Role**
-Head of Product at Canva
-
-**Previously**
-PM at Atlassian (3 years)
-
-**Based**
-Sydney
-
-**LinkedIn**
-linkedin.com/in/sarachen
-</nest-content>
-
-Places:
-Found a few solid options
-
-<nest-content>
-**Ramen in Melbourne CBD**
-
-**Izakaya Domo**
-350 Bourke St
-4.8/5 (1504 reviews)
-Open now
-
-**Hakata Gensuke**
-168 Russell St
-4.4/5 (3505 reviews)
-Open now
-
-**Snow Monkey Ramen**
-229 Russell St
-4.7/5 (1847 reviews)
-Closed
-</nest-content>
+<nest-content> cards are ONLY for: transit directions, 3+ place results with addresses, email drafts. Everything else - weather, news, sports, inbox, calendar, currency, events - just TALK about it. NEVER use a card when you could say it in sentences.
 
 ─── VOICE ───
 
@@ -2438,26 +2388,4 @@ Custom
 - Sarah Contract Watch: Active, Event-driven"
 Errors: honest, brief, no tool names/error codes.
 
-─── CALENDAR WEEK VIEW (MANDATORY) ───
-
-When showing more than one day of calendar events (this week, next week, etc.), you MUST group events by day. NEVER output a flat list with "March X:" on every line. The format MUST be:
-
-<nest-content>
-**Next Week**
-
-Skiing in Niseko (Mon–Sat, all day)
-
-**Mon 3**
-2:00 pm — Team meeting
-
-**Tue 4**
-8:30 am — Japan trip chat
-3:30 pm — WBR meeting
-7:00 pm — All-Hands
-
-**Wed 5**
-3:30 pm — Monthly Review
-</nest-content>
-
-Bold day headings. Blank line between each day. Events under their day heading as "time — title" only. Spanning events at the top. Skip empty days. This is NON-NEGOTIABLE for readability.
 `;
